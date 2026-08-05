@@ -1,4 +1,4 @@
-/* Quản Lý ChatGPT Local Coder — frontend logic */
+/* Quản Lý ChatGPT Local Coder — frontend logic (multi-instance) */
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -23,12 +23,23 @@ const toast = (msg, kind = "ok") => {
 };
 
 let busy = false;
+const ACTION_IDS = [
+  "btn-install", "btn-server", "btn-tunnel", "btn-save", "btn-check",
+  "btn-profile-save", "btn-profile-del", "btn-tunnel-dl", "btn-del-inst", "add-create",
+];
 const setBusy = (b) => {
   busy = b;
-  ["btn-install", "btn-server", "btn-tunnel", "btn-save", "btn-check", "btn-profile-save", "btn-profile-del", "btn-tunnel-dl"].forEach(
-    (id) => ($(id).disabled = b)
-  );
+  ACTION_IDS.forEach((id) => {
+    const el = $(id);
+    if (el) el.disabled = b;
+  });
 };
+
+/* ---------------- state ---------------- */
+const state = { instances: [], current: null, lastBundle: null };
+
+const instUrl = (name, sub) => `/api/instances/${encodeURIComponent(name)}${sub}`;
+const curUrl = (sub) => (state.current ? instUrl(state.current, sub) : null);
 
 /* ---------------- field mapping ---------------- */
 const FIELD_ENV = {
@@ -73,56 +84,108 @@ function setDot(id, ok, label) {
   }
 }
 
-let lastStatus = null;
+function renderServerTunnel(s) {
+  // install (global)
+  const installed = s.installed.dist && s.installed.nodeModules;
+  $("install-status").textContent = installed ? "Trạng thái: Đã cài đặt OK" : "Trạng thái: Chưa cài đặt";
+  setDot("install-dot", installed, null);
+  $("btn-install").disabled = busy;
 
-async function refreshStatus(initial) {
+  // server
+  const srv = s.server;
+  setDot("server-dot", srv.running, srv.running ? "Đang chạy" : "Dừng");
+  $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
+  $("btn-server").disabled = busy;
+  $("server-detail").textContent = srv.running
+    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${(srv.health && srv.health.defaultCwd) || s.env.WORKSPACE_PATH || "—"}`
+    : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
+
+  // tunnel
+  const tun = s.tunnel;
+  setDot("tunnel-dot", tun.running, tun.running ? "Đang chạy" : "Dừng");
+  $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
+  $("btn-tunnel").disabled = busy;
+  const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
+  if (tun.running && tun.url) {
+    $("tunnel-detail").innerHTML = `${mode} • URL: <b class="mono">${tun.url}</b>`;
+    $("btn-copy-url").classList.remove("hidden");
+  } else if (tun.running && tun.mode === "openai") {
+    $("tunnel-detail").textContent = `${mode} đang chạy (Tunnel ID: ${tun.tunnelId || "?"}) — URL cố định dùng trong connector.`;
+    $("btn-copy-url").classList.add("hidden");
+  } else if (tun.running) {
+    $("tunnel-detail").textContent = `${mode} đang chạy (khởi động ngoài manager) — tắt rồi bật lại để lấy URL.`;
+    $("btn-copy-url").classList.add("hidden");
+  } else {
+    $("tunnel-detail").textContent =
+      tun.mode === "openai"
+        ? `Chưa chạy — dùng OpenAI Tunnel (ID: ${tun.tunnelId || "(thiếu)"}).`
+        : tun.cloudflaredExists
+          ? "Chưa chạy — Cloudflare quick tunnel. URL đổi mỗi lần khởi động."
+          : "Chưa có cloudflared.exe — bấm 'Tải cloudflared'.";
+    $("btn-copy-url").classList.add("hidden");
+  }
+  $("btn-tunnel-dl").classList.toggle("hidden", tun.cloudflaredExists !== false || tun.running);
+
+  $("mgr-version").textContent = `Manager 127.0.0.1:${location.port} • Node ${s.node}`;
+}
+
+/* ---------------- instance list / selection ---------------- */
+function shortPath(p) {
+  if (!p) return "—";
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.slice(-2).join("/") || p;
+}
+
+function getInstance(name) {
+  return state.instances.find((i) => i.name === name) || null;
+}
+
+async function loadInstances(initial) {
   try {
-    const s = await api("/api/status");
-    lastStatus = s;
+    const r = await api("/api/instances");
+    state.instances = r.instances || [];
+    const list = $("inst-list");
+    list.innerHTML = state.instances
+      .map((i) => {
+        const srv = i.server.running;
+        const tun = i.tunnel.running;
+        const ws = i.env.WORKSPACE_PATH || "—";
+        const active = state.current === i.name ? " active" : "";
+        return (
+          `<li class="inst-item${active}" data-name="${i.name.replace(/"/g, "&quot;")}">` +
+          `<div class="inst-main">` +
+          `<span class="inst-name mono">${i.name}</span>` +
+          `<span class="inst-ws" title="${ws.replace(/"/g, "&quot;")}">${shortPath(ws)}</span>` +
+          `</div>` +
+          `<span class="inst-dots">` +
+          `<span class="status-dot ${srv ? "ok" : "bad"}" title="Server ${srv ? "chạy" : "dừng"}"></span>` +
+          `<span class="status-dot ${tun ? "ok" : "bad"}" title="Tunnel ${tun ? "chạy" : "dừng"}"></span>` +
+          `</span></li>`
+        );
+      })
+      .join("");
+    list.querySelectorAll(".inst-item").forEach((el) =>
+      el.addEventListener("click", () => selectInstance(el.dataset.name))
+    );
 
-    // 1. install
-    const installed = s.installed.dist && s.installed.nodeModules;
-    $("install-status").textContent = installed ? "Trạng thái: Đã cài đặt OK" : "Trạng thái: Chưa cài đặt";
-    setDot("install-dot", installed, null);
-    $("btn-install").disabled = busy;
+    const any = state.instances.length > 0;
+    $("empty-state").classList.toggle("hidden", any);
+    $("inst-panel-wrap").classList.toggle("hidden", !any);
 
-    // 2. server
-    const srv = s.server;
-    setDot("server-dot", srv.running, srv.running ? "Đang chạy" : "Dừng");
-    $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
-    $("btn-server").disabled = busy;
-    $("server-detail").textContent = srv.running
-      ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${(srv.health && srv.health.defaultCwd) || s.env.WORKSPACE_PATH || "—"}`
-      : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
-
-    // 3. tunnel
-    const tun = s.tunnel;
-    const tunLabel = tun.running ? "Đang chạy" : "Dừng";
-    setDot("tunnel-dot", tun.running, tunLabel);
-    $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
-    $("btn-tunnel").disabled = busy;
-    const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
-    if (tun.running && tun.url) {
-      $("tunnel-detail").innerHTML = `${mode} • URL: <b class="mono">${tun.url}</b>`;
-      $("btn-copy-url").classList.remove("hidden");
-    } else if (tun.running && tun.mode === "openai") {
-      $("tunnel-detail").textContent = `${mode} đang chạy (Tunnel ID: ${tun.tunnelId || "?"}) — URL cố định dùng trong connector.`;
-      $("btn-copy-url").classList.add("hidden");
-    } else if (tun.running) {
-      $("tunnel-detail").textContent = `${mode} đang chạy (khởi động ngoài manager) — tắt rồi bật lại để lấy URL.`;
-      $("btn-copy-url").classList.add("hidden");
-    } else {
-      $("tunnel-detail").textContent =
-        tun.mode === "openai"
-          ? `Chưa chạy — dùng OpenAI Tunnel (ID: ${tun.tunnelId || "(thiếu)"}).`
-          : tun.cloudflaredExists
-            ? "Chưa chạy — Cloudflare quick tunnel. URL đổi mỗi lần khởi động."
-            : "Chưa có cloudflared.exe — bấm 'Tải cloudflared'.";
-      $("btn-copy-url").classList.add("hidden");
+    if (state.current && !state.instances.some((i) => i.name === state.current)) {
+      state.current = null;
     }
-    $("btn-tunnel-dl").classList.toggle("hidden", tun.cloudflaredExists !== false || tun.running);
-
-    $("mgr-version").textContent = `Manager 127.0.0.1:${location.port} • Node ${s.node}`;
+    if (!state.current && state.instances.length > 0) {
+      await selectInstance(state.instances[0].name, true);
+      return;
+    }
+    if (state.current) {
+      const b = getInstance(state.current);
+      if (b) {
+        state.lastBundle = b;
+        renderServerTunnel({ installed: { dist: true, nodeModules: true }, server: b.server, tunnel: b.tunnel, env: b.env, node: state.node });
+      }
+    }
     if (initial) setBusy(false);
   } catch (err) {
     setDot("server-dot", false, "Mất kết nối manager");
@@ -131,6 +194,44 @@ async function refreshStatus(initial) {
     if (initial) setBusy(false);
     console.error(err);
   }
+}
+
+async function selectInstance(name, initial) {
+  state.current = name;
+  const b = getInstance(name);
+  if (!b) return;
+  state.lastBundle = b;
+  const env = b.env;
+  const cfg = b.config;
+
+  // form
+  fillForm(env, env.OPENAI_TUNNEL_API_KEY_SET ? { set: true, last4: "••••" } : null);
+  $("f-connector").value = cfg.connectorName || "";
+  $("f-autostart").checked = cfg.autoStart !== false;
+  $("cfg-inst-name").textContent = name;
+  $("foot-admin").href = `http://127.0.0.1:${env.ADMIN_PORT || "3001"}/ui`;
+  $("foot-admin").textContent = `Admin UI của ${name} (cổng ${env.ADMIN_PORT || "3001"}) ↗`;
+
+  // raw env
+  try {
+    const r = await api(instUrl(name, "/env"));
+    $("f-raw").value = r.raw || "";
+  } catch {}
+
+  // status
+  renderServerTunnel({ installed: { dist: true, nodeModules: true }, server: b.server, tunnel: b.tunnel, env, node: state.node });
+  $("check-result").classList.add("hidden");
+
+  // sidebar active highlight
+  document.querySelectorAll(".inst-item").forEach((el) => el.classList.toggle("active", el.dataset.name === name));
+
+  // refresh statuses + installed state
+  const s = await api("/api/status").catch(() => null);
+  if (s) {
+    state.node = s.node;
+    renderServerTunnel(s);
+  }
+  if (initial) setBusy(false);
 }
 
 /* ---------------- install ---------------- */
@@ -147,14 +248,15 @@ async function doInstall() {
     toast("Cài đặt lỗi", "err");
   }
   setBusy(false);
-  refreshStatus(false);
+  loadInstances(false);
 }
 
 /* ---------------- check / save ---------------- */
 async function doCheck() {
+  if (!state.current) return;
   setBusy(true);
   try {
-    const r = await api("/api/check", "POST");
+    const r = await api(curUrl("/check"), "POST");
     const box = $("check-result");
     box.classList.remove("hidden");
     box.innerHTML =
@@ -171,27 +273,32 @@ async function doCheck() {
 let rawDirty = false;
 
 async function doSave() {
+  if (!state.current) return;
+  const name = state.current;
   setBusy(true);
   try {
     const body = rawDirty ? { raw: $("f-raw").value } : { values: collectValues() };
-    await api("/api/env", "PUT", body);
-    await api("/api/config", "PUT", { connectorName: $("f-connector").value.trim() });
+    await api(instUrl(name, "/env"), "PUT", body);
+    await api(instUrl(name, "/config"), "PUT", {
+      connectorName: $("f-connector").value.trim(),
+      autoStart: $("f-autostart").checked,
+    });
     rawDirty = false;
-    toast("Đã lưu .env ✓");
+    toast("Đã lưu cấu hình workspace " + name + " ✓");
 
     if ($("chk-restart").checked) {
-      const s = lastStatus;
-      if (s && s.server.running) {
-        await api("/api/server/stop", "POST");
-        await api("/api/server/start", "POST");
+      const b = state.lastBundle;
+      if (b && b.server.running) {
+        await api(instUrl(name, "/server/stop"), "POST");
+        await api(instUrl(name, "/server/start"), "POST");
       }
-      if (s && s.tunnel.running) {
-        await api("/api/tunnel/stop", "POST");
-        await api("/api/tunnel/start", "POST");
+      if (b && b.tunnel.running) {
+        await api(instUrl(name, "/tunnel/stop"), "POST");
+        await api(instUrl(name, "/tunnel/start"), "POST");
       }
     }
-    await loadEnv();
-    await refreshStatus(false);
+    await loadInstances(false);
+    await selectInstance(name);
   } catch (err) {
     toast("Lưu lỗi: " + err.message, "err");
   }
@@ -254,28 +361,34 @@ async function onProfileSelect() {
 
 /* ---------------- server / tunnel toggles ---------------- */
 async function toggleServer() {
+  if (!state.current) return;
+  const name = state.current;
   setBusy(true);
   try {
-    const s = lastStatus;
-    const r = s && s.server.running ? await api("/api/server/stop", "POST") : await api("/api/server/start", "POST");
+    const b = state.lastBundle;
+    const r = b && b.server.running
+      ? await api(instUrl(name, "/server/stop"), "POST")
+      : await api(instUrl(name, "/server/start"), "POST");
     toast(r.ok ? (r.alreadyRunning ? "Server đã chạy" : r.alreadyStopped ? "Server đã dừng" : "OK") : "Lỗi: " + (r.error || ""), r.ok ? "ok" : "err");
     if (!r.ok && r.error) toast(r.error, "err");
   } catch (err) {
     toast("Lỗi: " + err.message, "err");
   }
   setBusy(false);
-  refreshStatus(false);
+  loadInstances(false);
 }
 
 async function toggleTunnel() {
+  if (!state.current) return;
+  const name = state.current;
   setBusy(true);
   try {
-    const s = lastStatus;
+    const b = state.lastBundle;
     let r;
-    if (s && s.tunnel.running) {
-      r = await api("/api/tunnel/stop", "POST");
+    if (b && b.tunnel.running) {
+      r = await api(instUrl(name, "/tunnel/stop"), "POST");
     } else {
-      r = await api("/api/tunnel/start", "POST");
+      r = await api(instUrl(name, "/tunnel/start"), "POST");
       if (!r.ok && r.error === "NO_CLOUDFLARED") {
         toast("Chưa có cloudflared — bấm 'Tải cloudflared'", "err");
       }
@@ -285,7 +398,7 @@ async function toggleTunnel() {
     toast("Lỗi: " + err.message, "err");
   }
   setBusy(false);
-  refreshStatus(false);
+  loadInstances(false);
 }
 
 async function doTunnelDownload() {
@@ -298,28 +411,72 @@ async function doTunnelDownload() {
     toast("Lỗi: " + err.message, "err");
   }
   setBusy(false);
-  refreshStatus(false);
+  loadInstances(false);
 }
 
-/* ---------------- env loading ---------------- */
-async function loadEnv() {
-  const r = await api("/api/env");
-  const v = r.values;
-  fillForm(v, v.OPENAI_TUNNEL_API_KEY || null);
-  $("f-raw").value = r.raw || "";
-  const cfg = await api("/api/config");
-  $("f-connector").value = cfg.connectorName || "";
+/* ---------------- add / delete workspace ---------------- */
+async function doAddInstance() {
+  const name = $("add-name").value.trim().toLowerCase();
+  const workspacePath = $("add-workspace").value.trim();
+  const port = $("add-port").value.trim();
+  const adminPort = $("add-admin-port").value.trim();
+  if (!name) {
+    toast("Nhập tên workspace", "err");
+    return;
+  }
+  setBusy(true);
+  try {
+    const r = await api("/api/instances", "POST", {
+      name,
+      workspacePath,
+      port: port ? parseInt(port, 10) : undefined,
+      adminPort: adminPort ? parseInt(adminPort, 10) : undefined,
+      autoStart: $("add-autostart").checked,
+    });
+    if (!r.ok) {
+      toast("Lỗi: " + (r.error || ""), "err");
+      return;
+    }
+    toast(`Đã tạo workspace ${r.name} — cổng ${r.port} (admin ${r.adminPort})`);
+    $("add-modal").close();
+    $("add-name").value = "";
+    $("add-workspace").value = "";
+    $("add-port").value = "";
+    $("add-admin-port").value = "";
+    await loadInstances(false);
+    await selectInstance(r.name);
+  } catch (err) {
+    toast("Lỗi: " + err.message, "err");
+  }
+  setBusy(false);
+}
+
+async function doDeleteInstance() {
+  if (!state.current) return;
+  const name = state.current;
+  if (!confirm(`Xóa workspace "${name}"?\n\nServer + tunnel của workspace này sẽ bị dừng, file cấu hình bị xóa. (Không ảnh hưởng workspace khác.)`)) return;
+  setBusy(true);
+  try {
+    const r = await api(instUrl(name, ""), "DELETE");
+    toast(r.ok ? `Đã xóa workspace ${name}` : "Lỗi: " + (r.error || ""), r.ok ? "ok" : "err");
+    state.current = null;
+    state.lastBundle = null;
+    await loadInstances(false);
+  } catch (err) {
+    toast("Lỗi: " + err.message, "err");
+  }
+  setBusy(false);
 }
 
 /* ---------------- misc ---------------- */
 async function copyUrl() {
-  const s = lastStatus;
-  if (s && s.tunnel.url) {
+  const b = state.lastBundle;
+  if (b && b.tunnel.url) {
     try {
-      await navigator.clipboard.writeText(s.tunnel.url);
-      toast("Đã sao chép URL: " + s.tunnel.url);
+      await navigator.clipboard.writeText(b.tunnel.url);
+      toast("Đã sao chép URL: " + b.tunnel.url);
     } catch {
-      toast(s.tunnel.url, "ok");
+      toast(b.tunnel.url, "ok");
     }
   }
 }
@@ -343,6 +500,40 @@ function init() {
   $("btn-profile-del").addEventListener("click", doProfileDelete);
   $("profile-select").addEventListener("change", onProfileSelect);
   $("f-raw").addEventListener("input", () => (rawDirty = true));
+  $("btn-del-inst").addEventListener("click", doDeleteInstance);
+
+  // add workspace modal
+  const addModal = $("add-modal");
+  $("btn-add-inst").addEventListener("click", () => addModal.showModal());
+  $("add-close").addEventListener("click", () => addModal.close());
+  $("add-create").addEventListener("click", doAddInstance);
+  addModal.addEventListener("click", (e) => {
+    if (e.target === addModal) addModal.close();
+  });
+  $("add-pick").addEventListener("click", async () => {
+    const btn = $("add-pick");
+    const old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Đang chọn...";
+    try {
+      const res = await fetch("/api/pick-folder", { method: "POST" });
+      const data = await res.json();
+      if (!data.ok) {
+        toast("Lỗi mở hộp thoại: " + (data.error || "không rõ"), "err");
+        return;
+      }
+      if (!data.cancelled) {
+        $("add-workspace").value = data.path;
+        toast("Đã chọn: " + data.path, "ok");
+      }
+    } catch (err) {
+      toast("Không mở được hộp thoại chọn thư mục — gõ tay đường dẫn (VD: D:\\Coding\\my-app)", "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  });
+
   $("btn-connector").addEventListener("click", async () => {
     try {
       await api("/api/open/connector", "POST");
@@ -351,14 +542,15 @@ function init() {
     }
   });
 
-  // folder picker: native dialog qua manager server (trả đường dẫn ĐẦY ĐỦ)
+  // folder picker (per current instance): native dialog qua manager server
   $("btn-workspace-pick").addEventListener("click", async () => {
+    if (!state.current) return;
     const btn = $("btn-workspace-pick");
     const old = btn.textContent;
     btn.disabled = true;
     btn.textContent = "Đang chọn...";
     try {
-      const res = await fetch("/api/pick-folder", { method: "POST" });
+      const res = await fetch(instUrl(state.current, "/pick-folder"), { method: "POST" });
       const data = await res.json();
       if (!data.ok) {
         toast("Lỗi mở hộp thoại: " + (data.error || "không rõ"), "err");
@@ -383,11 +575,10 @@ function init() {
     if (e.target === modal) modal.close();
   });
 
-  // periodic refresh
-  refreshStatus(true);
-  setInterval(() => !busy && refreshStatus(false), 3000);
-
-  Promise.all([loadEnv(), loadProfiles()]).then(() => refreshStatus(false));
+  // periodic refresh (không đụng form — chỉ sidebar + trạng thái)
+  loadInstances(true);
+  loadProfiles().catch(() => {});
+  setInterval(() => !busy && loadInstances(false), 3000);
 }
 
 document.addEventListener("DOMContentLoaded", init);

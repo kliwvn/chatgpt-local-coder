@@ -18,4 +18,4 @@ mcps/
 log_console.txt
 *.log
 .DS_Store
-Thumbs.db
+manager/instances/

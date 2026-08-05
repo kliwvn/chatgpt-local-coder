@@ -3,8 +3,15 @@
  * Quản Lý ChatGPT Local Coder — management window (standalone launcher).
  *
  * Zero-dependency Node HTTP server bound to 127.0.0.1:<MANAGER_PORT> (default 3300).
- * Controls: install/build, .env editing (PORT, tunnel, profiles...), focus server,
- * focus tunnel (Cloudflare quick tunnel hoac OpenAI Secure MCP Tunnel), ChatGPT links.
+ * Controls: install/build, multi-instance workspaces (mỗi instance có .env,
+ * server port, tunnel + profile riêng), focus server, focus tunnel
+ * (Cloudflare quick tunnel hoac OpenAI Secure MCP Tunnel), ChatGPT links.
+ *
+ * Instance layout:
+ *   manager/instances/<name>/
+ *     .env          # PORT, ADMIN_PORT, WORKSPACE_PATH, OPENAI_TUNNEL_ID/KEY...
+ *     config.json   # connectorName, lastTunnelUrl, healthPort, autoStart
+ *     server.pid / tunnel.pid / profile.yaml / server.log / tunnel.log
  *
  * Usage:
  *   node manager/server.mjs            # start + auto-open browser
@@ -31,6 +38,12 @@ const TUNNEL_PID_FILE = path.join(STATE_DIR, "tunnel.pid");
 const SERVER_LOG = path.join(LOG_DIR, "server.log");
 const TUNNEL_LOG = path.join(LOG_DIR, "tunnel.log");
 const INSTALL_LOG = path.join(LOG_DIR, "install.log");
+/* Mỗi instance là một thư mục con của INSTANCES_DIR. Có thể ghi đè bằng
+ * MANAGER_INSTANCES_DIR (dùng cho test mà không đụng instance thật). */
+const INSTANCES_DIR = path.resolve(
+  process.env.MANAGER_INSTANCES_DIR || path.join(__dirname, "instances")
+);
+const INSTANCE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 
 const IS_WIN = process.platform === "win32";
 const NPM_CMD = IS_WIN ? "npm.cmd" : "npm";
@@ -97,6 +110,8 @@ function pidOnPort(port) {
   return null;
 }
 
+/* LEGACY single-instance .env tại ROOT/.env — chỉ còn dùng để đọc
+ * MANAGER_PORT và migrate sang instance "default" lần đầu. */
 async function readEnvRaw() {
   try {
     return await fsp.readFile(ENV_PATH, "utf-8");
@@ -116,6 +131,7 @@ async function readEnv() {
 async function ensureStateDirs() {
   await fsp.mkdir(STATE_DIR, { recursive: true });
   await fsp.mkdir(LOG_DIR, { recursive: true });
+  await fsp.mkdir(INSTANCES_DIR, { recursive: true });
 }
 
 async function readJson(p, fallback) {
@@ -169,15 +185,6 @@ function isPortOpen(port, host = "127.0.0.1") {
   });
 }
 
-function tasklistHas(name) {
-  try {
-    const out = spawnSync("tasklist", ["/FI", `IMAGENAME eq ${name}`], { encoding: "utf8", windowsHide: true }).stdout || "";
-    return out.toLowerCase().includes(name.toLowerCase());
-  } catch {
-    return false;
-  }
-}
-
 function killPidTree(pid) {
   if (!pid || pid === process.pid) return false;
   try {
@@ -187,16 +194,6 @@ function killPidTree(pid) {
   } catch {
     return false;
   }
-}
-
-async function killProcessesByName(name) {
-  try {
-    const out = spawnSync("tasklist", ["/FI", `IMAGENAME eq ${name}`], { encoding: "utf8", windowsHide: true }).stdout || "";
-    for (const line of out.split(/\r?\n/)) {
-      const m = line.match(/^(\S+)\s+(\d+)\s/);
-      if (m) killPidTree(parseInt(m[2], 10));
-    }
-  } catch {}
 }
 
 async function waitFor(predicate, timeoutMs, intervalMs = 300) {
@@ -236,6 +233,22 @@ async function pidOf(name) {
   } catch {}
   return null;
 }
+
+
+/** PID còn sống không? (tasklist /FI "PID eq n") */
+function pidAlive(pid) {
+  if (!pid || !Number.isInteger(pid)) return false;
+  try {
+    const out = spawnSync("tasklist", ["/FI", `PID eq ${pid}`], { encoding: "utf8", windowsHide: true }).stdout || "";
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.match(/^(\S+)\s+(\d+)\s/);
+      if (m && parseInt(m[2], 10) === pid) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
 function spawnHiddenDetached(cmd, args, logFile, extraEnv = null) {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
   const batPath = path.join(STATE_DIR, "spawn-hidden.cmd");
@@ -273,8 +286,128 @@ async function tailFile(file, maxBytes = 8000) {
   }
 }
 
-async function serverHealth() {
-  const port = (await readEnv()).PORT || "3000";
+/* ------------------------------------------------------------------ */
+/* instance paths / helpers                                            */
+/* ------------------------------------------------------------------ */
+
+function instPaths(name) {
+  const dir = path.join(INSTANCES_DIR, name);
+  return {
+    dir,
+    env: path.join(dir, ".env"),
+    config: path.join(dir, "config.json"),
+    serverPid: path.join(dir, "server.pid"),
+    tunnelPid: path.join(dir, "tunnel.pid"),
+    profile: path.join(dir, "profile.yaml"),
+    serverLog: path.join(dir, "server.log"),
+    tunnelLog: path.join(dir, "tunnel.log"),
+  };
+}
+
+async function listInstances() {
+  try {
+    const names = (await fsp.readdir(INSTANCES_DIR, { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .filter((n) => INSTANCE_NAME_RE.test(n))
+      .sort();
+    return names;
+  } catch {
+    return [];
+  }
+}
+
+async function readInstanceEnvRaw(name) {
+  try {
+    return await fsp.readFile(instPaths(name).env, "utf-8");
+  } catch {
+    return "";
+  }
+}
+
+async function readInstanceEnv(name) {
+  return parseDotEnv(await readInstanceEnvRaw(name));
+}
+
+async function readInstanceConfig(name) {
+  return readJson(instPaths(name).config, {
+    connectorName: "",
+    lastTunnelUrl: "",
+    healthPort: 8080,
+    autoStart: true,
+  });
+}
+
+async function writeInstanceConfig(name, config) {
+  await writeJson(instPaths(name).config, config);
+}
+
+/** Tất cả cổng đang được các instance khác dùng (PORT/ADMIN_PORT/healthPort). */
+async function allUsedPorts(excludeName = null) {
+  const ports = new Set();
+  for (const n of await listInstances()) {
+    if (n === excludeName) continue;
+    const env = await readInstanceEnv(n);
+    const p = parseInt(env.PORT, 10);
+    if (p) ports.add(p);
+    const a = parseInt(env.ADMIN_PORT, 10);
+    if (a) ports.add(a);
+    const cfg = await readInstanceConfig(n);
+    ports.add(cfg.healthPort || parseInt(env.OPENAI_TUNNEL_HEALTH_PORT || "8080", 10));
+  }
+  return ports;
+}
+
+/** Migrate trạng thái đơn-instance (ROOT/.env + manager/state) sang instance "default". */
+async function ensureInstances() {
+  await fsp.mkdir(INSTANCES_DIR, { recursive: true });
+  if ((await listInstances()).length > 0) return;
+  const legacyEnv = await readEnvRaw();
+  if (!legacyEnv) return;
+  const inst = instPaths("default");
+  await fsp.mkdir(inst.dir, { recursive: true });
+  await fsp.writeFile(inst.env, legacyEnv, "utf-8");
+  const legacyConfig = await readConfig();
+  const legacyParsed = parseDotEnv(legacyEnv);
+  await writeInstanceConfig("default", {
+    connectorName: legacyConfig.connectorName || "",
+    lastTunnelUrl: legacyConfig.lastTunnelUrl || "",
+    healthPort: parseInt(legacyParsed.OPENAI_TUNNEL_HEALTH_PORT || "8080", 10),
+    autoStart: true,
+  });
+  // Nhận nuôi process/log đang chạy (server/tunnel sống sót qua migration)
+  for (const [old, dest] of [
+    [SERVER_PID_FILE, inst.serverPid],
+    [TUNNEL_PID_FILE, inst.tunnelPid],
+    [SERVER_LOG, inst.serverLog],
+    [TUNNEL_LOG, inst.tunnelLog],
+  ]) {
+    try {
+      await fsp.copyFile(old, dest);
+    } catch {}
+  }
+}
+
+/** PIDs của process imageName mà command line chứa substring (phân biệt instance). */
+function pidsWithCmdLine(imageName, substring) {
+  try {
+    const needle = String(substring).replace(/'/g, "''");
+    const ps = [
+      "-NoProfile",
+      "-Command",
+      `Get-CimInstance Win32_Process -Filter "Name='${imageName}'" | Where-Object { $_.CommandLine -like '*${needle}*' } | Select-Object -ExpandProperty ProcessId`,
+    ];
+    const out = spawnSync("powershell.exe", ps, { encoding: "utf8", windowsHide: true, timeout: 15000 }).stdout || "";
+    return out
+      .split(/\r?\n/)
+      .map((l) => parseInt(l.trim(), 10))
+      .filter((p) => Number.isInteger(p) && p > 0);
+  } catch {
+    return [];
+  }
+}
+
+async function serverHealth(port) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2500) });
     if (!res.ok) return null;
@@ -309,12 +442,14 @@ async function runInstall() {
   return { ok, steps: log.map((l) => ({ step: l.step, code: l.code })), output: log.map((l) => l.output).join("\n").slice(-6000) };
 }
 
-async function serverStatus() {
-  const port = parseInt((await readEnv()).PORT || "3000", 10);
+async function serverStatus(name) {
+  const env = await readInstanceEnv(name);
+  const inst = instPaths(name);
+  const port = parseInt(env.PORT || "3000", 10);
   const running = await isPortOpen(port);
-  const pid = running ? pidOnPort(port) : (await readPidFile(SERVER_PID_FILE)) || null;
+  const pid = running ? pidOnPort(port) : (await readPidFile(inst.serverPid)) || null;
   let health = null;
-  if (running) health = await serverHealth();
+  if (running) health = await serverHealth(port);
   return { running, port, pid, health };
 }
 
@@ -366,48 +501,54 @@ async function warmUpMcp(port) {
   }
 }
 
-async function startServer() {
-  const st = await serverStatus();
+async function startServer(name) {
+  const st = await serverStatus(name);
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
   if (!fs.existsSync(SERVER_ENTRY)) {
     return { ok: false, error: "dist/index.js chưa tồn tại — bấm 'Cài Đặt Lần Đầu' trước." };
   }
-  const pid = spawnDetached(process.execPath, [SERVER_ENTRY], SERVER_LOG);
-  await writePidFile(SERVER_PID_FILE, pid);
+  const inst = instPaths(name);
+  const env = await readInstanceEnv(name);
+  const pid = spawnDetached(process.execPath, [SERVER_ENTRY], inst.serverLog, env);
+  await writePidFile(inst.serverPid, pid);
   const up = await waitFor(() => isPortOpen(st.port), 20000);
   if (!up) {
-    const tail = await tailFile(SERVER_LOG);
+    const tail = await tailFile(inst.serverLog);
     return { ok: false, error: "Server không khởi động được. Log cuối:\n" + tail.slice(-1500) };
   }
   await warmUpMcp(st.port); // làm ấm trước khi tunnel probe (timeout 2s)
-  return { ok: true, running: true, port: st.port, pid, health: await serverHealth() };
+  return { ok: true, running: true, port: st.port, pid, health: await serverHealth(st.port) };
 }
 
-async function stopServer() {
-  const st = await serverStatus();
+async function stopServer(name) {
+  const st = await serverStatus(name);
   if (!st.running) return { ok: true, alreadyStopped: true, port: st.port };
+  const inst = instPaths(name);
   let killed = false;
-  const pidFile = await readPidFile(SERVER_PID_FILE);
+  const pidFile = await readPidFile(inst.serverPid);
   if (pidFile) killed = killPidTree(pidFile);
   if (!killed && st.pid) killed = killPidTree(st.pid);
-  await writePidFile(SERVER_PID_FILE, null);
+  await writePidFile(inst.serverPid, null);
   await waitFor(() => !isPortOpen(st.port), 10000);
   return { ok: true, port: st.port, stopped: true };
 }
 
 
-async function tunnelStatus() {
-  const env = await readEnv();
+async function tunnelStatus(name) {
+  const env = await readInstanceEnv(name);
+  const config = await readInstanceConfig(name);
+  const inst = instPaths(name);
   const tunnelId = env.OPENAI_TUNNEL_ID || "";
   const apiKey = env.OPENAI_TUNNEL_API_KEY || "";
   const mode = tunnelId && apiKey ? "openai" : "cloudflare";
-  const config = await readConfig();
-  const healthPort = parseInt(env.OPENAI_TUNNEL_HEALTH_PORT || "8080", 10);
+  const healthPort = config.healthPort || parseInt(env.OPENAI_TUNNEL_HEALTH_PORT || "8080", 10);
   const controlPlaneUrl = tunnelId ? `https://api.openai.com/v1/tunnel/${tunnelId}` : null;
 
-  const cfRunning = tasklistHas(CLOUDFLARED_PROC);
-  const oaRunning = tasklistHas(OPENAI_TUNNEL_CLIENT) || (await isPortOpen(healthPort));
-  const running = cfRunning || oaRunning;
+  // Detection theo instance — KHÔNG dùng tasklist toàn cục (tunnel-client.exe của
+  // instance khác gây false-positive): openai = health port mở; cloudflare = pid file.
+  const oaRunning = await isPortOpen(healthPort);
+  const cfRunning = pidAlive(await readPidFile(inst.tunnelPid));
+  const running = mode === "openai" ? oaRunning : cfRunning;
   const cloudflaredExists = fs.existsSync(CLOUDFLARED);
 
   if (mode === "openai") {
@@ -415,7 +556,7 @@ async function tunnelStatus() {
       running,
       mode,
       tunnelId,
-      kind: oaRunning ? "openai" : cfRunning ? "cloudflare" : null,
+      kind: oaRunning ? "openai" : null,
       url: oaRunning ? controlPlaneUrl : null,
       healthPort,
       cloudflaredExists,
@@ -424,7 +565,7 @@ async function tunnelStatus() {
   return {
     running,
     mode: "cloudflare",
-    kind: cfRunning ? "cloudflare" : oaRunning ? "openai" : null,
+    kind: cfRunning ? "cloudflare" : null,
     url: cfRunning ? config.lastTunnelUrl : null,
     cloudflaredExists,
     healthPort,
@@ -474,29 +615,27 @@ async function ensureTunnelClient() {
   }
 }
 
-async function startTunnel() {
-  const env = await readEnv();
-  const st = await tunnelStatus();
+async function startTunnel(name) {
+  const env = await readInstanceEnv(name);
+  const st = await tunnelStatus(name);
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
+  const inst = instPaths(name);
 
   const port = parseInt(env.PORT || "3000", 10);
   const serverUp = await isPortOpen(port);
   if (!serverUp) return { ok: false, error: `Server chưa chạy (cổng ${port}) — bật 'Focus Server' trước.` };
 
-  // dọn process tunnel thuộc loại còn lại (nếu có) trước khi chuyển mode
-  if (st.mode === "openai") {
-    if (tasklistHas(CLOUDFLARED_PROC)) await killProcessesByName(CLOUDFLARED_PROC);
-  } else if (tasklistHas(OPENAI_TUNNEL_CLIENT)) {
-    await killProcessesByName(OPENAI_TUNNEL_CLIENT);
-  }
+  // Dọn tunnel còn sót của CHÍNH instance này (theo profile / cổng) trước khi spawn mới
+  // — không đụng tới tunnel của instance khác
+  for (const p of pidsWithCmdLine("tunnel-client.exe", inst.profile)) killPidTree(p);
+  for (const p of pidsWithCmdLine("cloudflared.exe", `localhost:${port}`)) killPidTree(p);
 
   if (st.mode === "openai") {
-    const healthPort = parseInt(env.OPENAI_TUNNEL_HEALTH_PORT || "8080", 10);
+    const healthPort = st.healthPort;
     const client = await ensureTunnelClient();
     if (!client.ok) return client;
 
-    const profileDir = path.join(ROOT, "profiles");
-    const profileFile = path.join(profileDir, "codex-local.yaml");
+    const profileFile = inst.profile;
     const mcpUrl = `http://127.0.0.1:${port}/mcp`;
     const yaml = [
       "config_version: 1",
@@ -514,26 +653,25 @@ async function startTunnel() {
       `      url: ${mcpUrl}`,
       "",
     ].join("\n");
-    await fsp.mkdir(profileDir, { recursive: true });
+    await fsp.mkdir(inst.dir, { recursive: true });
     await fsp.writeFile(profileFile, yaml, "utf-8");
 
-    await fsp.writeFile(TUNNEL_LOG, "");
-    spawnHiddenDetached(client.path, ["run", "--profile-file", profileFile], TUNNEL_LOG, {
+    await fsp.writeFile(inst.tunnelLog, "");
+    spawnHiddenDetached(client.path, ["run", "--profile-file", profileFile], inst.tunnelLog, {
       OPENAI_TUNNEL_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_TUNNEL_ID: env.OPENAI_TUNNEL_ID,
     });
     const up = await waitFor(() => isPortOpen(healthPort), 45000);
     if (!up) {
-      const tunPid = await pidOf(OPENAI_TUNNEL_CLIENT);
-      if (tunPid) killPidTree(tunPid); // tree-kill: cả codex worker nữa
-      await writePidFile(TUNNEL_PID_FILE, null);
-      const tail = await tailFile(TUNNEL_LOG);
+      for (const p of pidsWithCmdLine(profileFile)) killPidTree(p); // tree-kill: cả codex worker nữa
+      await writePidFile(inst.tunnelPid, null);
+      const tail = await tailFile(inst.tunnelLog);
       return { ok: false, error: "OpenAI tunnel không khởi động được. Log cuối:\n" + tail.slice(-1500) };
     }
-    const config = await readConfig();
+    const config = await readInstanceConfig(name);
     config.lastTunnelUrl = `https://api.openai.com/v1/tunnel/${env.OPENAI_TUNNEL_ID}`;
-    await writeJson(CONFIG_PATH, config);
+    await writeInstanceConfig(name, config);
     return { ok: true, mode: "openai", tunnelId: env.OPENAI_TUNNEL_ID, healthPort, url: config.lastTunnelUrl };
   }
 
@@ -541,39 +679,58 @@ async function startTunnel() {
   if (!fs.existsSync(CLOUDFLARED)) {
     return { ok: false, error: "NO_CLOUDFLARED", hint: "Chưa có cloudflared — bấm 'Tải cloudflared' trong thẻ Tunnel." };
   }
-  await fsp.writeFile(TUNNEL_LOG, "");
-  const pid = spawnDetached(CLOUDFLARED, ["tunnel", "--url", `http://localhost:${port}`], TUNNEL_LOG);
-  await writePidFile(TUNNEL_PID_FILE, pid);
+  await fsp.writeFile(inst.tunnelLog, "");
+  const pid = spawnDetached(CLOUDFLARED, ["tunnel", "--url", `http://localhost:${port}`], inst.tunnelLog);
+  await writePidFile(inst.tunnelPid, pid);
 
   let url = null;
   const deadline = Date.now() + 25000;
   while (Date.now() < deadline && !url) {
-    const tail = await tailFile(TUNNEL_LOG, 40000);
+    const tail = await tailFile(inst.tunnelLog, 40000);
     const m = tail.match(TUNNEL_URL_RE);
     if (m) url = m[0];
     if (!url) await new Promise((r) => setTimeout(r, 400));
   }
   if (!url) {
     killPidTree(pid);
-    await writePidFile(TUNNEL_PID_FILE, null);
-    const tail = await tailFile(TUNNEL_LOG);
+    await writePidFile(inst.tunnelPid, null);
+    const tail = await tailFile(inst.tunnelLog);
     return { ok: false, error: "Không nhận được URL tunnel. Log cuối:\n" + tail.slice(-1500) };
   }
-  const config = await readConfig();
+  const config = await readInstanceConfig(name);
   config.lastTunnelUrl = url;
-  await writeJson(CONFIG_PATH, config);
+  await writeInstanceConfig(name, config);
   return { ok: true, mode: "cloudflare", url };
 }
 
-async function stopTunnel() {
-  const st = await tunnelStatus();
+async function stopTunnel(name) {
+  const st = await tunnelStatus(name);
   if (!st.running) return { ok: true, alreadyStopped: true, mode: st.mode };
-  // tree-kill theo pid thật (bắt qua tasklist) để giết luôn codex worker con
-  const tunPid = await pidOf(OPENAI_TUNNEL_CLIENT);
-  if (tunPid) killPidTree(tunPid);
-  const cfPid = await pidOf(CLOUDFLARED_PROC);
-  if (cfPid) killPidTree(cfPid);
-  await writePidFile(TUNNEL_PID_FILE, null);
+  const inst = instPaths(name);
+  const env = await readInstanceEnv(name);
+  const port = parseInt(env.PORT || "3000", 10);
+  // Chỉ giết tunnel của CHÍNH instance này (lọc theo profile / cổng) — tree-kill cả codex worker con
+  let killed = false;
+  for (const p of pidsWithCmdLine("tunnel-client.exe", inst.profile)) {
+    killPidTree(p);
+    killed = true;
+  }
+  for (const p of pidsWithCmdLine("cloudflared.exe", `localhost:${port}`)) {
+    killPidTree(p);
+    killed = true;
+  }
+  if (!killed) {
+    // Legacy adoption (tunnel sinh bởi manager cũ, profile ở profiles/): chỉ an toàn
+    // khi có đúng 1 instance — không thể nhầm sang instance khác
+    const names = await listInstances();
+    if (names.length === 1) {
+      const all = await pidOf(OPENAI_TUNNEL_CLIENT);
+      if (all) killPidTree(all);
+      const cf = await pidOf(CLOUDFLARED_PROC);
+      if (cf) killPidTree(cf);
+    }
+  }
+  await writePidFile(inst.tunnelPid, null);
   return { ok: true, mode: st.mode, stopped: true };
 }
 
@@ -607,18 +764,17 @@ async function ensureFolderPicker() {
   }
 }
 
-async function pickFolder() {
+async function pickFolder(initialDir = "") {
   // Native MODERN Windows folder dialog via a tiny compiled .NET helper
   // (IFileDialog style — nhanh ~200ms, đẹp như dialog Explorer). No PowerShell.
   const prep = await ensureFolderPicker();
   if (!prep.ok) return { ok: false, cancelled: false, error: prep.error };
-  const env = await readEnv();
   try {
     const res = await new Promise((resolve, reject) => {
       const child = spawn(FOLDER_PICKER_EXE, [], {
         windowsHide: true, // ẩn cửa sổ console, chỉ hiện dialog
         stdio: ["ignore", "pipe", "pipe"],
-        env: { ...process.env, FOLDER_PICKER_INITIAL: env.WORKSPACE_PATH || "" },
+        env: { ...process.env, FOLDER_PICKER_INITIAL: initialDir || "" },
       });
       let stdout = "";
       let stderr = "";
@@ -650,8 +806,8 @@ async function pickFolder() {
   }
 }
 
-async function checkConfig() {
-  const env = await readEnv();
+async function checkConfig(name) {
+  const env = await readInstanceEnv(name);
   const items = [];
   const push = (ok, label, detail) => items.push({ ok, label, detail });
 
@@ -689,10 +845,150 @@ async function checkConfig() {
 
   push(fs.existsSync(SERVER_ENTRY), "Build", fs.existsSync(SERVER_ENTRY) ? "dist/index.js tồn tại" : "Chưa build — bấm 'Cài Đặt Lần Đầu'");
 
-  const st = await serverStatus();
+  const st = await serverStatus(name);
   push(true, "Server", st.running ? `Đang chạy trên cổng ${st.port}` : `Chưa chạy (cổng ${st.port})`);
 
   return { ok: items.every((i) => i.ok), items };
+}
+
+/** Bundle đầy đủ trạng thái một instance (cho UI). */
+async function instanceBundle(name) {
+  const [env, config, srv, tun, chk] = await Promise.all([
+    readInstanceEnv(name),
+    readInstanceConfig(name),
+    serverStatus(name),
+    tunnelStatus(name),
+    checkConfig(name).catch((e) => ({ ok: false, items: [], error: String((e && e.message) || e) })),
+  ]);
+  return {
+    name,
+    env: {
+      PORT: env.PORT || "3000",
+      ADMIN_PORT: env.ADMIN_PORT || "3001",
+      WORKSPACE_PATH: env.WORKSPACE_PATH || "",
+      CHATGPT_TOOL_PROFILE: env.CHATGPT_TOOL_PROFILE || "slim",
+      CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
+      SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
+      MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
+      OPENAI_TUNNEL_ID: env.OPENAI_TUNNEL_ID || "",
+      OPENAI_TUNNEL_API_KEY_SET: Boolean(env.OPENAI_TUNNEL_API_KEY),
+      OPENAI_TUNNEL_HEALTH_PORT: String(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || "8080"),
+    },
+    config: {
+      connectorName: config.connectorName || "",
+      autoStart: config.autoStart !== false,
+      lastTunnelUrl: config.lastTunnelUrl || "",
+    },
+    server: srv,
+    tunnel: tun,
+    check: chk,
+  };
+}
+
+async function createInstance(body) {
+  const name = String(body.name || "").trim().toLowerCase();
+  if (!INSTANCE_NAME_RE.test(name)) {
+    return { ok: false, error: "Tên instance: 2–32 ký tự, chỉ chữ thường/số/gạch ngang, bắt đầu bằng chữ hoặc số." };
+  }
+  if ((await listInstances()).includes(name)) {
+    return { ok: false, error: `Instance '${name}' đã tồn tại.` };
+  }
+  const used = await allUsedPorts();
+  used.add(managerPortNum);
+  let port = parseInt(body.port, 10) || 0;
+  if (!port) {
+    for (let p = 3000; p < 4000; p++) if (!used.has(p)) { port = p; break; }
+  }
+  let adminPort = parseInt(body.adminPort, 10) || 0;
+  if (!adminPort) {
+    for (let p = 3000; p < 4000; p++) if (p !== port && !used.has(p)) { adminPort = p; break; }
+  }
+  if (!port || !adminPort) return { ok: false, error: "Không tìm được cổng trống trong 3000–3999." };
+  if (port === adminPort) return { ok: false, error: "PORT và ADMIN_PORT không được giống nhau." };
+  if (used.has(port)) return { ok: false, error: `Cổng ${port} đã được instance khác (hoặc manager) dùng.` };
+  if (used.has(adminPort)) return { ok: false, error: `Cổng ${adminPort} đã được instance khác (hoặc manager) dùng.` };
+  let healthPort = 8080;
+  for (let h = 8080; h < 8200; h++) if (!used.has(h)) { healthPort = h; break; }
+  const inst = instPaths(name);
+  await fsp.mkdir(inst.dir, { recursive: true });
+  const ws = String(body.workspacePath || "").trim();
+  const envText = [
+    `PORT=${port}`,
+    `ADMIN_PORT=${adminPort}`,
+    `WORKSPACE_PATH=${ws}`,
+    "OPENAI_TUNNEL_ID=",
+    "OPENAI_TUNNEL_API_KEY=",
+    `OPENAI_TUNNEL_HEALTH_PORT=${healthPort}`,
+    "CHATGPT_TOOL_PROFILE=slim",
+    "CHATGPT_AUTO_APPROVE=true",
+    "SHELL_TIMEOUT=120",
+    "MCP_SESSION_RECOVERY=true",
+    "",
+  ].join("\n");
+  await fsp.writeFile(inst.env, envText, "utf-8");
+  await writeInstanceConfig(name, {
+    connectorName: body.connectorName ? String(body.connectorName).slice(0, 80) : "",
+    lastTunnelUrl: "",
+    healthPort,
+    autoStart: body.autoStart !== false,
+  });
+  return { ok: true, name, port, adminPort, healthPort, workspace: ws };
+}
+
+async function deleteInstance(name) {
+  if (!INSTANCE_NAME_RE.test(name)) return { ok: false, error: "Tên không hợp lệ." };
+  const inst = instPaths(name);
+  try {
+    await stopServer(name);
+  } catch {}
+  try {
+    await stopTunnel(name);
+} catch {}
+  // Windows có thể giữ file vài trăm ms sau taskkill — retry ngắn trước khi báo lỗi
+  for (let i = 0; i < 5; i++) {
+    try {
+      await fsp.rm(inst.dir, { recursive: true, force: true });
+      break;
+    } catch {
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  return { ok: true, name };
+}
+
+async function saveInstanceEnv(name, body) {
+  const inst = instPaths(name);
+  const original = await readInstanceEnvRaw(name);
+  let next;
+  if (typeof body.raw === "string") {
+    next = body.raw;
+  } else {
+    const values = { ...(body.values || {}) };
+    for (const [k, v] of Object.entries(values)) {
+      if (v === undefined) values[k] = null;
+    }
+    next = serializeDotEnv(values, original);
+  }
+  const parsed = parseDotEnv(next);
+  const port = parseInt(parsed.PORT || "", 10);
+  const adminPort = parseInt(parsed.ADMIN_PORT || "", 10);
+  if (!Number.isInteger(port) || !Number.isInteger(adminPort) || port <= 0 || adminPort <= 0) {
+    return { ok: false, error: "PORT và ADMIN_PORT phải là số nguyên dương." };
+  }
+  if (port === adminPort) return { ok: false, error: "PORT và ADMIN_PORT không được giống nhau." };
+  const used = await allUsedPorts(name);
+  used.add(managerPortNum);
+  if (used.has(port)) return { ok: false, error: `Cổng ${port} đã được instance khác (hoặc manager) dùng.` };
+  if (used.has(adminPort)) return { ok: false, error: `Cổng ${adminPort} đã được instance khác (hoặc manager) dùng.` };
+  const hp = parseInt(parsed.OPENAI_TUNNEL_HEALTH_PORT || "", 10);
+  if (hp && used.has(hp)) return { ok: false, error: `Cổng ${hp} (health tunnel) đã được instance khác dùng.` };
+  await fsp.writeFile(inst.env, next, "utf-8");
+  const config = await readInstanceConfig(name);
+  if (hp && hp !== config.healthPort) {
+    config.healthPort = hp;
+    await writeInstanceConfig(name, config);
+  }
+  return { ok: true, path: inst.env };
 }
 
 /* ------------------------------------------------------------------ */
@@ -739,15 +1035,105 @@ function serveStatic(res, filePath) {
   });
 }
 
+/** Instance mặc định cho các route cũ (alias) — ưu tiên "default", nếu đã xóa thì lấy instance đầu tiên. */
+async function defaultInstanceName() {
+  const names = await listInstances();
+  return names.includes("default") ? "default" : names[0] || null;
+}
+
 async function handleApi(req, res, url, body) {
   const p = url.pathname;
 
+  /* -------------------- multi-instance routes -------------------- */
+  if (req.method === "GET" && p === "/api/instances") {
+    const instances = [];
+    for (const n of await listInstances()) instances.push(await instanceBundle(n));
+    return json(res, 200, { ok: true, instances });
+  }
+
+  if (req.method === "POST" && p === "/api/instances") {
+    return json(res, 200, await createInstance(body));
+  }
+
+  const instMatch = /^\/api\/instances\/([^/]+)(\/.*)?$/.exec(p);
+  if (instMatch) {
+    const name = decodeURIComponent(instMatch[1]);
+    const sub = instMatch[2] || "";
+    const exists = (await listInstances()).includes(name);
+    if (!INSTANCE_NAME_RE.test(name) || !exists) {
+      return json(res, 404, { ok: false, error: `Instance '${name}' không tồn tại` });
+    }
+    const inst = instPaths(name);
+
+    if (req.method === "POST" && sub === "") return json(res, 200, await instanceBundle(name));
+    if (req.method === "DELETE" && sub === "") return json(res, 200, await deleteInstance(name));
+
+    if (req.method === "GET" && sub === "/env") {
+      const raw = await readInstanceEnvRaw(name);
+      const values = parseDotEnv(raw);
+      const masked = {};
+      for (const [k, v] of Object.entries(values)) {
+        if (k === "OPENAI_TUNNEL_API_KEY" && v) masked[k] = { set: true, last4: v.slice(-4) };
+        else masked[k] = v;
+      }
+      return json(res, 200, { ok: true, path: inst.env, values: masked, raw });
+    }
+    if (req.method === "PUT" && sub === "/env") return json(res, 200, await saveInstanceEnv(name, body));
+
+    if (req.method === "GET" && sub === "/config") return json(res, 200, { ok: true, ...(await readInstanceConfig(name)) });
+    if (req.method === "PUT" && sub === "/config") {
+      const config = await readInstanceConfig(name);
+      if (typeof body.connectorName === "string") config.connectorName = body.connectorName.slice(0, 80);
+      if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
+      if (typeof body.autoStart === "boolean") config.autoStart = body.autoStart;
+      await writeInstanceConfig(name, config);
+      return json(res, 200, { ok: true, config });
+    }
+
+    if (req.method === "POST" && sub === "/check") return json(res, 200, await checkConfig(name));
+
+    if (req.method === "POST" && sub === "/server/start") return json(res, 200, await startServer(name));
+    if (req.method === "POST" && sub === "/server/stop") return json(res, 200, await stopServer(name));
+
+    if (req.method === "POST" && sub === "/tunnel/start") return json(res, 200, await startTunnel(name));
+    if (req.method === "POST" && sub === "/tunnel/stop") return json(res, 200, await stopTunnel(name));
+
+    if (req.method === "POST" && sub === "/pick-folder") {
+      const env = await readInstanceEnv(name);
+      return json(res, 200, await pickFolder(env.WORKSPACE_PATH || ""));
+    }
+
+    if (req.method === "GET" && sub.startsWith("/log")) {
+      const kind = url.searchParams.get("kind") === "tunnel" ? "tunnel" : "server";
+      return json(res, 200, {
+        ok: true,
+        kind,
+        log: await tailFile(kind === "tunnel" ? inst.tunnelLog : inst.serverLog),
+      });
+    }
+    return json(res, 404, { ok: false, error: "Not found" });
+  }
+
+  /* ---------------- legacy single-instance routes (alias → default) ---------------- */
+  const dname = await defaultInstanceName();
+  if (!dname) {
+    return json(res, 200, {
+      ok: true,
+      migrated: false,
+      error: "Chưa có instance nào — tạo qua POST /api/instances",
+      env: {},
+      config: { connectorName: "" },
+      server: { running: false, port: 3000, pid: null, health: null },
+      tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
+    });
+  }
+
   if (req.method === "GET" && p === "/api/status") {
     const [env, config, srv, tun, installed] = await Promise.all([
-      readEnv(),
-      readConfig(),
-      serverStatus(),
-      tunnelStatus(),
+      readInstanceEnv(dname),
+      readInstanceConfig(dname),
+      serverStatus(dname),
+      tunnelStatus(dname),
       Promise.resolve({ dist: fs.existsSync(SERVER_ENTRY), nodeModules: fs.existsSync(path.join(ROOT, "node_modules")) }),
     ]);
     return json(res, 200, {
@@ -767,14 +1153,14 @@ async function handleApi(req, res, url, body) {
         MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
         OPENAI_TUNNEL_ID: env.OPENAI_TUNNEL_ID || "",
         OPENAI_TUNNEL_API_KEY_SET: Boolean(env.OPENAI_TUNNEL_API_KEY),
-        OPENAI_TUNNEL_HEALTH_PORT: env.OPENAI_TUNNEL_HEALTH_PORT || "8080",
+        OPENAI_TUNNEL_HEALTH_PORT: String(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || "8080"),
       },
       config: { connectorName: config.connectorName || "" },
     });
   }
 
   if (req.method === "GET" && p === "/api/env") {
-    const raw = await readEnvRaw();
+    const raw = await readInstanceEnvRaw(dname);
     const values = parseDotEnv(raw);
     const masked = {};
     for (const [k, v] of Object.entries(values)) {
@@ -784,34 +1170,22 @@ async function handleApi(req, res, url, body) {
         masked[k] = v;
       }
     }
-    return json(res, 200, { ok: true, path: ENV_PATH, values: masked, raw });
+    return json(res, 200, { ok: true, path: instPaths(dname).env, values: masked, raw });
   }
 
   if (req.method === "PUT" && p === "/api/env") {
-    const original = await readEnvRaw();
-    let next;
-    if (typeof body.raw === "string") {
-      next = body.raw;
-    } else {
-      const values = body.values || {};
-      for (const [k, v] of Object.entries(values)) {
-        if (v === undefined) values[k] = null;
-      }
-      next = serializeDotEnv(values, original);
-    }
-    await fsp.writeFile(ENV_PATH, next, "utf-8");
-    return json(res, 200, { ok: true, path: ENV_PATH });
+    return json(res, 200, await saveInstanceEnv(dname, body));
   }
 
   if (req.method === "GET" && p === "/api/config") {
-    return json(res, 200, { ok: true, ...(await readConfig()) });
+    return json(res, 200, { ok: true, ...(await readInstanceConfig(dname)) });
   }
 
   if (req.method === "PUT" && p === "/api/config") {
-    const config = await readConfig();
-    if (typeof body.connectorName === "string") config.connectorName = body.connectorName;
+    const config = await readInstanceConfig(dname);
+    if (typeof body.connectorName === "string") config.connectorName = body.connectorName.slice(0, 80);
     if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
-    await writeJson(CONFIG_PATH, config);
+    await writeInstanceConfig(dname, config);
     return json(res, 200, { ok: true, config });
   }
 
@@ -845,23 +1219,23 @@ async function handleApi(req, res, url, body) {
   }
 
   if (req.method === "POST" && p === "/api/check") {
-    return json(res, 200, await checkConfig());
+    return json(res, 200, await checkConfig(dname));
   }
 
   if (req.method === "POST" && p === "/api/server/start") {
-    return json(res, 200, await startServer());
+    return json(res, 200, await startServer(dname));
   }
 
   if (req.method === "POST" && p === "/api/server/stop") {
-    return json(res, 200, await stopServer());
+    return json(res, 200, await stopServer(dname));
   }
 
   if (req.method === "POST" && p === "/api/tunnel/start") {
-    return json(res, 200, await startTunnel());
+    return json(res, 200, await startTunnel(dname));
   }
 
   if (req.method === "POST" && p === "/api/tunnel/stop") {
-    return json(res, 200, await stopTunnel());
+    return json(res, 200, await stopTunnel(dname));
   }
 
   if (req.method === "POST" && p === "/api/tunnel/download") {
@@ -869,7 +1243,8 @@ async function handleApi(req, res, url, body) {
   }
 
   if (req.method === "POST" && p === "/api/pick-folder") {
-    return json(res, 200, await pickFolder());
+    const env = await readInstanceEnv(dname);
+    return json(res, 200, await pickFolder(env.WORKSPACE_PATH || ""));
   }
 
   if (req.method === "POST" && p === "/api/open/connector") {
@@ -878,7 +1253,7 @@ async function handleApi(req, res, url, body) {
   }
 
   if (req.method === "GET" && p === "/api/health") {
-    return json(res, 200, { ok: true, name: "chatgpt-local-coder-manager", version: "1.0.0" });
+    return json(res, 200, { ok: true, name: "chatgpt-local-coder-manager", version: "2.0.0", multiInstance: true });
   }
 
   return json(res, 404, { ok: false, error: "Not found" });
@@ -892,10 +1267,15 @@ function openExternal(url) {
   } catch {}
 }
 
+/* Port của manager (dùng để chặn instance chiếm cổng này) — set trước khi listen. */
+let managerPortNum = 3300;
+
 async function main() {
   await ensureStateDirs();
+  await ensureInstances();
   const env = await readEnv();
-  const port = parseInt(process.env.MANAGER_PORT || env.MANAGER_PORT || "3300", 10);
+  managerPortNum = parseInt(process.env.MANAGER_PORT || env.MANAGER_PORT || "3300", 10);
+  const port = managerPortNum;
   const noOpen = process.argv.includes("--no-open");
 
   const server = http.createServer(async (req, res) => {
@@ -925,33 +1305,40 @@ async function main() {
 
   server.listen(port, "127.0.0.1", async () => {
     console.log("");
-    console.log("=== Quản Lý ChatGPT Local Coder ===");
+    console.log("=== Quản Lý ChatGPT Local Coder (multi-instance) ===");
     console.log(`Manager UI:  http://127.0.0.1:${port}`);
     console.log(`Repo root:   ${ROOT}`);
-    console.log(`Server:      ${SERVER_ENTRY}  (PORT=${env.PORT || "3000"})`);
+    console.log(`Instances:   ${INSTANCES_DIR}`);
     console.log("");
     if (!noOpen) openExternal(`http://127.0.0.1:${port}`);
 
-    try {
-    // Tự động bật Focus Server + Focus Tunnel khi mở app
-    const srv = await startServer();
-    console.log(
-      srv.alreadyRunning
-        ? `[Auto] Server đã chạy (cổng ${srv.port})`
-        : srv.ok
-          ? `[Auto] Server đã bật (pid ${srv.pid})`
-          : `[Auto] Server lỗi: ${String(srv.error || "").slice(0, 200)}`
-    );
-    const tun = await startTunnel();
-    console.log(
-      tun.alreadyRunning
-        ? `[Auto] Tunnel đã chạy (${tun.mode})`
-        : tun.ok
-          ? `[Auto] Tunnel đã bật (${tun.mode}${tun.url ? " — " + tun.url : ""})`
-          : `[Auto] Tunnel lỗi: ${String(tun.error || "").slice(0, 200)}`
-    );
-    } catch (err) {
-      console.log(`[Auto] Lỗi không mong đợi: ${String((err && err.message) || err).slice(0, 300)}`);
+    // Tự động bật Focus Server + Focus Tunnel cho từng instance có autoStart
+    for (const name of await listInstances()) {
+      const config = await readInstanceConfig(name);
+      if (config.autoStart === false) {
+        console.log(`[Auto] ${name}: bỏ qua (autoStart tắt)`);
+        continue;
+      }
+      try {
+        const srv = await startServer(name);
+        console.log(
+          srv.alreadyRunning
+            ? `[Auto] ${name}: Server đã chạy (cổng ${srv.port})`
+            : srv.ok
+              ? `[Auto] ${name}: Server đã bật (pid ${srv.pid})`
+              : `[Auto] ${name}: Server lỗi: ${String(srv.error || "").slice(0, 160)}`
+        );
+        const tun = await startTunnel(name);
+        console.log(
+          tun.alreadyRunning
+            ? `[Auto] ${name}: Tunnel đã chạy (${tun.mode})`
+            : tun.ok
+              ? `[Auto] ${name}: Tunnel đã bật (${tun.mode}${tun.url ? " — " + tun.url : ""})`
+              : `[Auto] ${name}: Tunnel lỗi: ${String(tun.error || "").slice(0, 160)}`
+        );
+      } catch (err) {
+        console.log(`[Auto] ${name}: Lỗi không mong đợi: ${String((err && err.message) || err).slice(0, 200)}`);
+      }
     }
   });
 }

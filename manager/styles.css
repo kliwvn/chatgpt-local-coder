@@ -202,3 +202,79 @@ textarea.raw { resize: vertical; line-height: 1.45; }
 .toast.ok { border-color: var(--green); }
 
 .hidden { display: none !important; }
+
+/* multi-instance layout */
+.layout {
+  max-width: 1080px;
+  margin: 0 auto;
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+  padding: 0 16px 24px;
+}
+.sidebar {
+  width: 248px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 16px;
+  background: linear-gradient(180deg, var(--card), var(--card-2));
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
+}
+.sidebar-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .4px;
+  text-transform: uppercase;
+}
+.inst-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.inst-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.inst-item:hover { background: #1b2233; }
+.inst-item.active { background: #1c2335; border-color: var(--accent); }
+.inst-main { min-width: 0; }
+.inst-name { font-weight: 700; font-size: 13px; display: block; }
+.inst-ws {
+  color: var(--muted);
+  font-size: 11px;
+  display: block;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inst-dots { display: flex; gap: 4px; }
+.inst-dots .status-dot { width: 8px; height: 8px; }
+.sidebar-hint { color: var(--muted); font-size: 11px; margin-top: 12px; line-height: 1.5; }
+.main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+.global-tag {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  padding: 1px 8px;
+  vertical-align: 2px;
+}
+.empty { text-align: center; padding: 40px 20px; }
+@media (max-width: 860px) {
+  .layout { flex-direction: column; }
+  .sidebar { width: 100%; position: static; }
+}
