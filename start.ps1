@@ -1,4 +1,4 @@
-# Script khởi động Codex MCP Server trên Windows (foreground, xem log trực tiếp)
+﻿# Script khởi động Codex MCP Server trên Windows (foreground, xem log trực tiếp)
 param(
     [string]$Workspace = $env:WORKSPACE_PATH,
     [int]$Port = 3000,

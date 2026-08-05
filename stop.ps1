@@ -1,4 +1,4 @@
-param([int]$Port = 3000)
+﻿param([int]$Port = 3000)
 
 $lines = netstat -ano | Select-String ":$Port\s" | Select-String "LISTENING"
 $pids = @()

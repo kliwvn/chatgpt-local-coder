@@ -1,4 +1,4 @@
-# Expose MCP server qua Cloudflare Tunnel (thay ngrok)
+﻿# Expose MCP server qua Cloudflare Tunnel (thay ngrok)
 param(
     [int]$Port = 3000
 )

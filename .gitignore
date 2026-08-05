@@ -4,11 +4,13 @@ dist/
 .mcp-checkpoints/
 .tool-test-tmp/
 bin/
+cloudflared.exe
 profiles/*
 !profiles/mcp-upstream.json
 !profiles/post-edit-hooks.json
 !profiles/chatgpt-connector-description.txt
 .mcp-state/
+manager/state/
 .env
 terminals/
 agent-tools/

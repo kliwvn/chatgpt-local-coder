@@ -1,4 +1,4 @@
-# OpenAI Secure MCP Tunnel — URL on dinh, khong doi moi lan chay (thay cloudflared)
+﻿# OpenAI Secure MCP Tunnel — URL on dinh, khong doi moi lan chay (thay cloudflared)
 param(
     [int]$Port = 0,
     [int]$HealthPort = 0,

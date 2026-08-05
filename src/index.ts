@@ -155,6 +155,22 @@ app.get("/health", (_req, res) => {
   });
 });
 
+// OAuth protected-resource metadata (RFC 9728) — tunnel-client dùng cho OAuth
+// discovery khi kết nối MCP qua OpenAI Secure MCP Tunnel. authorization_servers
+// rỗng = server local không yêu cầu OAuth.
+app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+  res.json({
+    resource: `http://127.0.0.1:${PORT}/mcp`,
+    authorization_servers: [],
+  });
+});
+app.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => {
+  res.json({
+    resource: `http://127.0.0.1:${PORT}/mcp`,
+    authorization_servers: [],
+  });
+});
+
 async function handleMcpPost(req: express.Request, res: express.Response): Promise<void> {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
