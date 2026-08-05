@@ -173,6 +173,17 @@ app.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => {
 
 async function handleMcpPost(req: express.Request, res: express.Response): Promise<void> {
   try {
+    // SEP-2575: server/discover (stateless discovery) — trả JSON-RPC error 200
+    // để SDK client fallback về initialize ngay (tránh HTTP 400 → retry → tunnel-client probe timeout)
+    const rpcBody = req.body as { method?: unknown; id?: unknown } | undefined;
+    if (rpcBody && typeof rpcBody === "object" && rpcBody.method === "server/discover") {
+      res.status(200).json({
+        jsonrpc: "2.0",
+        error: { code: -32601, message: "Method not found: server/discover" },
+        id: rpcBody.id ?? null,
+      });
+      return;
+    }
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     const requestId = extractRequestId(req.body);
 
