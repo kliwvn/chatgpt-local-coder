@@ -209,8 +209,8 @@ async function selectInstance(name, initial) {
   $("f-connector").value = cfg.connectorName || "";
   $("f-autostart").checked = cfg.autoStart !== false;
   $("cfg-inst-name").textContent = name;
-  $("foot-admin").href = `http://127.0.0.1:${env.ADMIN_PORT || "3001"}/ui`;
-  $("foot-admin").textContent = `Admin UI của ${name} (cổng ${env.ADMIN_PORT || "3001"}) ↗`;
+  $("foot-admin").href = `/admin/ui/?instance=${encodeURIComponent(name)}`;
+  $("foot-admin").textContent = `Admin UI của ${name} (qua manager) ↗`;
 
   // raw env
   try {
@@ -467,13 +467,39 @@ async function doDeleteInstance() {
   }
   setBusy(false);
 }
+async function doRenameInstance() {
+  if (!state.current) return;
+  const oldName = state.current;
+  const newName = $("rename-name").value.trim().toLowerCase();
+  if (!newName) {
+    toast("Nhập tên mới", "err");
+    return;
+  }
+  setBusy(true);
+  try {
+    const r = await api(instUrl(oldName, "/rename"), "POST", { name: newName });
+    if (!r.ok) {
+      toast("Lỗi: " + (r.error || ""), "err");
+      return;
+    }
+    toast(r.renamed ? `Đã đổi tên ${oldName} → ${r.name}` : "Không có gì thay đổi");
+    $("rename-modal").close();
+    $("rename-name").value = "";
+    state.current = r.name;
+    state.lastBundle = null;
+    await loadInstances(false);
+    await selectInstance(r.name);
+  } catch (err) {
+    toast("Lỗi: " + err.message, "err");
+  }
+  setBusy(false);
+}
 
 /* ---------------- misc ---------------- */
 async function copyUrl() {
   const b = state.lastBundle;
   if (b && b.tunnel.url) {
     try {
-      await navigator.clipboard.writeText(b.tunnel.url);
       toast("Đã sao chép URL: " + b.tunnel.url);
     } catch {
       toast(b.tunnel.url, "ok");
@@ -501,6 +527,17 @@ function init() {
   $("profile-select").addEventListener("change", onProfileSelect);
   $("f-raw").addEventListener("input", () => (rawDirty = true));
   $("btn-del-inst").addEventListener("click", doDeleteInstance);
+  const renameModal = $("rename-modal");
+  $("btn-rename-inst").addEventListener("click", () => {
+    if (!state.current) return;
+    $("rename-name").value = state.current;
+    renameModal.showModal();
+  });
+  $("rename-close").addEventListener("click", () => renameModal.close());
+  $("rename-save").addEventListener("click", doRenameInstance);
+  renameModal.addEventListener("click", (e) => {
+    if (e.target === renameModal) renameModal.close();
+  });
 
   // add workspace modal
   const addModal = $("add-modal");

@@ -358,6 +358,25 @@ async function allUsedPorts(excludeName = null) {
   return ports;
 }
 
+/** Tìm instance khác đang dùng cùng tunnel ID hoặc API key (tránh xung đột). */
+async function findTunnelConflicts(name, tunnelId, apiKey) {
+  const conflicts = [];
+  const tid = String(tunnelId || "").trim();
+  const akey = String(apiKey || "").trim();
+  if (!tid && !akey) return conflicts;
+  for (const n of await listInstances()) {
+    if (n === name) continue;
+    const env = await readInstanceEnv(n);
+    if (tid && env.OPENAI_TUNNEL_ID === tid) {
+      conflicts.push({ instance: n, field: "OPENAI_TUNNEL_ID", value: tid });
+    }
+    if (akey && env.OPENAI_TUNNEL_API_KEY === akey) {
+      conflicts.push({ instance: n, field: "OPENAI_TUNNEL_API_KEY", value: akey.slice(-4) });
+    }
+  }
+  return conflicts;
+}
+
 /** Migrate trạng thái đơn-instance (ROOT/.env + manager/state) sang instance "default". */
 async function ensureInstances() {
   await fsp.mkdir(INSTANCES_DIR, { recursive: true });
@@ -745,7 +764,12 @@ async function downloadCloudflared() {
 
 /* ------------------------------------------------------------------ */
 async function ensureFolderPicker() {
-  if (fs.existsSync(FOLDER_PICKER_EXE)) return { ok: true };
+  if (fs.existsSync(FOLDER_PICKER_EXE) && fs.existsSync(FOLDER_PICKER_CS)) {
+    // Rebuild khi source mới hơn exe (>1s tránh sai lệch mtime).
+    const stExe = fs.statSync(FOLDER_PICKER_EXE).mtimeMs;
+    const stCs = fs.statSync(FOLDER_PICKER_CS).mtimeMs;
+    if (stCs <= stExe + 1000) return { ok: true };
+  }
   if (!CSC_PATH || !fs.existsSync(FOLDER_PICKER_CS)) {
     return { ok: false, error: "Thiếu csc.exe hoặc folder-picker.cs" };
   }
@@ -838,6 +862,11 @@ async function checkConfig(name) {
     push(Boolean(tunnelId && apiKey), "OpenAI Tunnel", tunnelId && apiKey ? "Đã đủ ID + API key" : "Thiếu ID hoặc API key");
     if (tunnelId && !/^tunnel_[0-9a-f]{32}$/.test(tunnelId)) {
       push(false, "OpenAI Tunnel ID", "Định dạng phải là tunnel_ + 32 ký tự hex");
+    }
+    const conflicts = await findTunnelConflicts(name, tunnelId, apiKey);
+    if (conflicts.length) {
+      const first = conflicts[0];
+      push(false, "Tunnel trùng", `ID/API key đã được instance '${first.instance}' dùng`);
     }
   } else {
     push(fs.existsSync(CLOUDFLARED), "Tunnel Cloudflare", fs.existsSync(CLOUDFLARED) ? "cloudflared.exe sẵn sàng" : "Chưa có cloudflared.exe — sẽ tải khi bật Tunnel");
@@ -955,6 +984,32 @@ async function deleteInstance(name) {
   }
   return { ok: true, name };
 }
+async function renameInstance(name, body) {
+  if (!INSTANCE_NAME_RE.test(name)) return { ok: false, error: "Tên không hợp lệ." };
+  if (name === "default") return { ok: false, error: "Instance 'default' là instance mặc định, không đổi tên được." };
+  const newName = String(body.name || "").trim().toLowerCase();
+  if (!INSTANCE_NAME_RE.test(newName)) {
+    return { ok: false, error: "Tên mới: 2–32 ký tự, chỉ chữ thường/số/gạch ngang, bắt đầu bằng chữ hoặc số." };
+  }
+  if (newName === name) return { ok: true, name, renamed: false };
+  if ((await listInstances()).includes(newName)) {
+    return { ok: false, error: `Instance '${newName}' đã tồn tại.` };
+  }
+  // Chặn đổi tên khi server/tunnel đang chạy (pid files theo tên thư mục — đổi lúc chạy sẽ mất dấu process)
+  const [srv, tun] = await Promise.all([serverStatus(name), tunnelStatus(name)]);
+  if (srv.running || tun.running) {
+    return { ok: false, error: "Phải dừng Server và Tunnel trước khi đổi tên workspace." };
+  }
+  const src = instPaths(name);
+  const dst = instPaths(newName);
+  await fsp.mkdir(INSTANCES_DIR, { recursive: true });
+  try {
+    await fsp.rename(src.dir, dst.dir);
+  } catch (err) {
+    return { ok: false, error: "Đổi tên thất bại: " + String((err && err.message) || err) };
+  }
+  return { ok: true, name: newName, renamed: true };
+}
 
 async function saveInstanceEnv(name, body) {
   const inst = instPaths(name);
@@ -981,7 +1036,15 @@ async function saveInstanceEnv(name, body) {
   if (used.has(port)) return { ok: false, error: `Cổng ${port} đã được instance khác (hoặc manager) dùng.` };
   if (used.has(adminPort)) return { ok: false, error: `Cổng ${adminPort} đã được instance khác (hoặc manager) dùng.` };
   const hp = parseInt(parsed.OPENAI_TUNNEL_HEALTH_PORT || "", 10);
-  if (hp && used.has(hp)) return { ok: false, error: `Cổng ${hp} (health tunnel) đã được instance khác dùng.` };
+  // Mỗi workspace phải có tunnel riêng — chặn trùng ID/API key với instance khác
+  const conflicts = await findTunnelConflicts(name, parsed.OPENAI_TUNNEL_ID, parsed.OPENAI_TUNNEL_API_KEY);
+  if (conflicts.length) {
+    const first = conflicts[0];
+    return {
+      ok: false,
+      error: `Tunnel ${first.field === "OPENAI_TUNNEL_ID" ? "ID" : "API key"} '${first.value}' đã được instance '${first.instance}' dùng — mỗi workspace phải có tunnel riêng.`,
+    };
+  }
   await fsp.writeFile(inst.env, next, "utf-8");
   const config = await readInstanceConfig(name);
   if (hp && hp !== config.healthPort) {
@@ -1034,6 +1097,24 @@ function serveStatic(res, filePath) {
     res.end(buf);
   });
 }
+/** Proxy /admin/* → 127.0.0.1:<ADMIN_PORT> của instance (gộp admin UI vào cổng manager). */
+function proxyAdmin(req, res, targetPort, pathname) {
+  const options = {
+    hostname: "127.0.0.1",
+    port: targetPort,
+    path: pathname + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""),
+    method: req.method,
+    headers: { ...req.headers, host: `127.0.0.1:${targetPort}` },
+  };
+  const proxyReq = http.request(options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+  proxyReq.on("error", (err) => {
+    json(res, 502, { ok: false, error: `Admin server của instance chưa chạy (${targetPort}): ${err.message}` });
+  });
+  req.pipe(proxyReq);
+}
 
 /** Instance mặc định cho các route cũ (alias) — ưu tiên "default", nếu đã xóa thì lấy instance đầu tiên. */
 async function defaultInstanceName() {
@@ -1067,6 +1148,7 @@ async function handleApi(req, res, url, body) {
 
     if (req.method === "POST" && sub === "") return json(res, 200, await instanceBundle(name));
     if (req.method === "DELETE" && sub === "") return json(res, 200, await deleteInstance(name));
+    if (req.method === "POST" && sub === "/rename") return json(res, 200, await renameInstance(name, body));
 
     if (req.method === "GET" && sub === "/env") {
       const raw = await readInstanceEnvRaw(name);
@@ -1284,6 +1366,24 @@ async function main() {
       if (url.pathname.startsWith("/api/")) {
         const body = ["POST", "PUT", "DELETE", "PATCH"].includes(req.method) ? await readBody(req) : {};
         await handleApi(req, res, url, body);
+        return;
+      }
+      if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
+        const qInst = url.searchParams.get("instance");
+        const instName = req.headers["x-instance-name"] || qInst;
+        const name = instName && INSTANCE_NAME_RE.test(String(instName)) ? String(instName) : await defaultInstanceName();
+        if (!name) {
+          json(res, 404, { ok: false, error: "Chưa có instance nào" });
+          return;
+        }
+        const env = await readInstanceEnv(name);
+        const adminPort = parseInt(env.ADMIN_PORT || "", 10);
+        if (!adminPort) {
+          json(res, 400, { ok: false, error: `Instance '${name}' chưa có ADMIN_PORT` });
+          return;
+        }
+        const adminPath = url.pathname.replace(/^\/admin/, "") || "/";
+        proxyAdmin(req, res, adminPort, adminPath);
         return;
       }
       const file = url.pathname === "/" ? "index.html" : path.basename(url.pathname);

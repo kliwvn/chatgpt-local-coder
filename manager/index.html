@@ -59,7 +59,7 @@
           <span class="step-badge">2</span>
           <h2>Cấu Hình — <span id="cfg-inst-name" class="mono">…</span></h2>
           <span class="spacer"></span>
-          <button id="btn-del-inst" class="btn btn-ghost danger btn-sm">Xóa Workspace</button>
+          <button id="btn-rename-inst" class="btn btn-ghost btn-sm">Đổi tên</button>
         </div>
 
         <div class="row profile-row">
@@ -235,6 +235,21 @@
     <div class="actions">
       <label class="chk"><input id="add-autostart" type="checkbox" checked /> Tự khởi động khi mở app</label>
       <button id="add-create" class="btn btn-primary">Tạo Workspace</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- Rename workspace modal -->
+<dialog id="rename-modal" class="modal">
+  <div class="modal-box">
+    <div class="modal-head"><h3>Đổi Tên Workspace</h3><button id="rename-close" class="btn btn-ghost">✕</button></div>
+    <p class="hint">Phải dừng Server + Tunnel trước khi đổi tên. Instance <b class="mono">default</b> không đổi tên được.</p>
+    <div class="field">
+      <label for="rename-name">Tên mới (chữ thường / số / gạch ngang)</label>
+      <input id="rename-name" class="input mono" spellcheck="false" />
+    </div>
+    <div class="actions">
+      <button id="rename-save" class="btn btn-primary">Đổi Tên</button>
     </div>
   </div>
 </dialog>
