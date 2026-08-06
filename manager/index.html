@@ -48,6 +48,7 @@
           <span class="spacer"></span>
           <span id="install-status" class="status-label">Trạng thái: đang kiểm tra…</span>
           <span id="install-dot" class="status-dot"></span>
+          <button id="btn-autostart" class="btn btn-ghost btn-sm" title="Tự chạy manager khi bạn đăng nhập Windows">⚡ Tự chạy khi đăng nhập: đang kiểm tra…</button>
           <button id="btn-install" class="btn btn-ghost" disabled>Install_Build</button>
         </div>
         <div id="install-progress" class="progress hidden"><div class="bar"></div><pre id="install-log"></pre></div>
@@ -59,6 +60,7 @@
           <span class="step-badge">2</span>
           <h2>Cấu Hình — <span id="cfg-inst-name" class="mono">…</span></h2>
           <span class="spacer"></span>
+          <button id="btn-del-inst" class="btn btn-ghost danger btn-sm hidden">Xóa</button>
           <button id="btn-rename-inst" class="btn btn-ghost btn-sm">Đổi tên</button>
         </div>
 
@@ -80,9 +82,30 @@
 
         <div class="grid2">
           <div class="field">
+            <label for="f-connector">Tên Connector (từ khóa @)</label>
+            <input id="f-connector" class="input" placeholder="VD: Local Coder" />
+            <p class="hint">Tên để gõ @ trên ChatGPT.</p>
+          </div>
+          <div class="field">
             <label for="f-port">PORT</label>
             <input id="f-port" class="input mono" inputmode="numeric" placeholder="3000" />
-            <p class="hint">Cổng MCP server của workspace này (phải khác các workspace khác).</p>
+            <p class="hint">Cổng MCP server — khác các workspace khác.</p>
+          </div>
+          <div class="field">
+            <label for="f-tunnel-id">OPENAI_TUNNEL_ID</label>
+            <div class="inline">
+              <input id="f-tunnel-id" class="input grow mono" placeholder="tunnel_…" spellcheck="false" />
+              <button class="btn btn-link" data-open="https://platform.openai.com/settings/organization/tunnels">Lấy ID</button>
+            </div>
+            <p class="hint">ID tunnel của connector này.</p>
+          </div>
+          <div class="field">
+            <label for="f-tunnel-key">TUNNEL_API_KEY</label>
+            <div class="inline">
+              <input id="f-tunnel-key" type="password" class="input grow mono" placeholder="sk-… (Runtime key)" spellcheck="false" />
+              <button class="btn btn-link" data-open="https://platform.openai.com/settings/organization/api-keys">Tạo Key</button>
+            </div>
+            <p class="hint" id="key-hint">Runtime key của connector.</p>
           </div>
           <div class="field">
             <label for="f-profile">CHATGPT_TOOL_PROFILE</label>
@@ -109,28 +132,6 @@
               <option value="false">false</option>
             </select>
           </div>
-          <div class="field">
-            <label for="f-tunnel-id">OPENAI_TUNNEL_ID</label>
-            <div class="inline">
-              <input id="f-tunnel-id" class="input grow mono" placeholder="tunnel_…" spellcheck="false" />
-              <button class="btn btn-link" data-open="https://platform.openai.com/settings/organization/tunnels">Lấy ID tại đây</button>
-            </div>
-            <p class="hint">Mỗi workspace cần một tunnel riêng — tạo connector mới trên ChatGPT rồi dán ID + key vào đây.</p>
-          </div>
-          <div class="field">
-            <label for="f-tunnel-key">TUNNEL_API_KEY</label>
-            <div class="inline">
-              <input id="f-tunnel-key" type="password" class="input grow mono" placeholder="sk-… (Runtime key)" spellcheck="false" />
-              <button class="btn btn-link" data-open="https://platform.openai.com/settings/organization/api-keys">Tạo Key tại đây</button>
-            </div>
-            <p class="hint" id="key-hint"></p>
-          </div>
-        </div>
-
-        <div class="field">
-          <label for="f-connector">Tên Connector (từ khóa @)</label>
-          <input id="f-connector" class="input" placeholder="VD: Local Coder (Đây là từ khóa để gõ @)" />
-          <p class="hint">Lưu tên để nhớ — mỗi tin nhắn ChatGPT phải tag <b>@TênConnector</b> thì tool mới chạy.</p>
         </div>
 
         <details class="advanced">
@@ -142,7 +143,7 @@
         <div class="actions">
           <button id="btn-check" class="btn btn-ghost">Kiểm Tra Cấu Hình</button>
           <label class="chk"><input id="chk-restart" type="checkbox" checked /> Khởi động lại server + tunnel sau khi lưu</label>
-          <label class="chk"><input id="f-autostart" type="checkbox" /> Tự khởi động khi mở app</label>
+          <label class="chk"><input id="f-autostart" type="checkbox" /> Tự bật server + tunnel khi mở app</label>
           <button id="btn-save" class="btn btn-primary">Lưu Cấu Hình (Áp dụng)</button>
         </div>
         <div id="check-result" class="check-result hidden"></div>
@@ -156,6 +157,7 @@
           <span class="spacer"></span>
           <span id="server-status" class="status-label">Đang kiểm tra…</span>
           <span id="server-dot" class="status-dot"></span>
+          <a id="foot-admin" class="foot-link" href="#" target="_blank">Admin UI (nâng cao) ↗</a>
           <button id="btn-server" class="btn btn-primary" disabled>Bật</button>
         </div>
         <p class="hint" id="server-detail"></p>
@@ -185,8 +187,6 @@
 <footer class="app-footer">
   <button id="btn-guide" class="btn btn-ghost wide">📖 Hướng Dẫn Sử Dụng ChatGPT Web</button>
   <button id="btn-connector" class="btn btn-green wide">🔗 Mở trang Cài Đặt Connector ChatGPT</button>
-  <button id="btn-autostart" class="btn btn-ghost wide" title="Tự chạy manager khi bạn đăng nhập Windows">⚡ Autostart: đang kiểm tra…</button>
-  <a id="foot-admin" class="foot-link" href="#" target="_blank">Admin UI (nâng cao) ↗</a>
 </footer>
 
 <!-- Guide modal -->

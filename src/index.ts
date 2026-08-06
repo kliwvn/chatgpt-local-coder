@@ -18,7 +18,7 @@ import {
 } from "./lib/mcp-session-manager.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { startAdminServer } from "./admin/server.js";
-import { logMcpHttpEvent, logMcpRequest } from "./lib/activity-log.js";
+import { formatLogTime, logMcpHttpEvent, logMcpRequest } from "./lib/activity-log.js";
 import {
   buildInstructionContext,
   summarizeInstructionContext,
@@ -67,20 +67,20 @@ const instructionContext: InstructionContext = await buildInstructionContext({
 
 if (instructionContext.projectMemory.sections.length > 0) {
   console.log(
-    `[MCP] Project memory: ${instructionContext.projectMemory.sections.length} file(s) from ${workspaceRoot} (${instructionContext.projectMemory.total_bytes} bytes)`
+    `${formatLogTime()} [MCP] Project memory: ${instructionContext.projectMemory.sections.length} file(s) from ${workspaceRoot} (${instructionContext.projectMemory.total_bytes} bytes)`
   );
 } else {
   console.log(
-    `[MCP] Project memory: no CLAUDE.md/AGENTS.md at ${workspaceRoot} — set WORKSPACE_PATH to your project root`
+    `${formatLogTime()} [MCP] Project memory: no CLAUDE.md/AGENTS.md at ${workspaceRoot} — set WORKSPACE_PATH to your project root`
   );
 }
 if (instructionContext.git.is_repo) {
-  console.log(`[MCP] Git: branch ${instructionContext.git.branch}`);
+  console.log(`${formatLogTime()} [MCP] Git: branch ${instructionContext.git.branch}`);
 }
 console.log(
-  `[MCP] MCP instructions: ${Math.round(instructionContext.instructionBytes / 1024)}KB (agent prompt + env + git + memory)`
+  `${formatLogTime()} [MCP] MCP instructions: ${Math.round(instructionContext.instructionBytes / 1024)}KB (agent prompt + env + git + memory)`
 );
-console.log(`[MCP] Tool profile: ${getChatGptToolProfile()} (CHATGPT_TOOL_PROFILE)`);
+console.log(`${formatLogTime()} [MCP] Tool profile: ${getChatGptToolProfile()} (CHATGPT_TOOL_PROFILE)`);
 
 const sessionManager = createSessionManager({
   workspaceRoot,
@@ -131,7 +131,7 @@ app.use((req, res, next) => {
     }
 
     if (!isMcpRoute) {
-      console.log(`[HTTP] ${req.method} ${req.path} ${res.statusCode} ${duration}ms${sessionInfo}`);
+      console.log(`${formatLogTime()} [HTTP] ${req.method} ${req.path} ${res.statusCode} ${duration}ms${sessionInfo}`);
     }
   });
   next();
@@ -195,7 +195,7 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
 
     if (isInitializeRequest(req.body)) {
       if (sessionId) {
-        console.log(`[MCP] Re-initialize with stale session header: ${sessionId}`);
+        console.log(`${formatLogTime()} [MCP] Re-initialize with stale session header: ${sessionId}`);
       }
       await sessionManager.createNew(req, res, req.body);
       return;
@@ -221,7 +221,7 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
       requestId
     );
   } catch (error) {
-    console.log("[MCP] Error:", error);
+    console.log(`${formatLogTime()} [MCP] Error:`, error);
     if (!res.headersSent) {
       res.status(500).json({
         jsonrpc: "2.0",
@@ -300,19 +300,20 @@ const adminServer = startAdminServer({
 });
 
 const server = app.listen(PORT, () => {
+  const ts = formatLogTime();
   console.log("");
   console.log("========================================");
   console.log("  Codex MCP Server");
   console.log("========================================");
-  console.log(`  Local:     http://localhost:${PORT}`);
-  console.log(`  MCP:       http://localhost:${PORT}/`);
-  console.log(`  MCP alt:   http://localhost:${PORT}/mcp`);
-  console.log(`  Health:    http://localhost:${PORT}/health`);
-  console.log(`  Admin UI:  http://127.0.0.1:${ADMIN_PORT}/ui`);
-  console.log(`  Default cwd: ${workspaceRoot}`);
-  console.log(`  Full machine access: ON (no path restrictions)`);
-  console.log(`  Session recovery: ${SESSION_RECOVERY ? "ON" : "OFF"}`);
-  console.log(`  PID:       ${process.pid}`);
+  console.log(`  ${ts} Local:     http://localhost:${PORT}`);
+  console.log(`  ${ts} MCP:       http://localhost:${PORT}/`);
+  console.log(`  ${ts} MCP alt:   http://localhost:${PORT}/mcp`);
+  console.log(`  ${ts} Health:    http://localhost:${PORT}/health`);
+  console.log(`  ${ts} Admin UI:  http://127.0.0.1:${ADMIN_PORT}/ui`);
+  console.log(`  ${ts} Default cwd: ${workspaceRoot}`);
+  console.log(`  ${ts} Full machine access: ON (no path restrictions)`);
+  console.log(`  ${ts} Session recovery: ${SESSION_RECOVERY ? "ON" : "OFF"}`);
+  console.log(`  ${ts} PID:       ${process.pid}`);
   console.log("========================================");
   console.log("  Dang chay... (Ctrl+C de dung)");
   console.log("========================================");

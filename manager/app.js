@@ -13,6 +13,7 @@ const api = async (path, method = "GET", body) => {
   return data;
 };
 
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const toast = (msg, kind = "ok") => {
   const el = $("toast");
   el.textContent = msg;
@@ -68,6 +69,8 @@ function fillForm(values, keySet) {
     $("key-hint").textContent = `API key đã đặt (…${keySet.last4}) — để nguyên để giữ, gõ giá trị mới để thay thế.`;
     $("f-tunnel-key").placeholder = "•••••••••••• (đã đặt)";
   } else {
+    // instance mới không có key — xóa giá trị cũ để không lưu nhầm secret của workspace khác
+    $("f-tunnel-key").value = "";
     $("key-hint").textContent = "";
     $("f-tunnel-key").placeholder = "sk-… (Runtime key)";
   }
@@ -106,7 +109,7 @@ function renderServerTunnel(s) {
   $("btn-tunnel").disabled = busy;
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
   if (tun.running && tun.url) {
-    $("tunnel-detail").innerHTML = `${mode} • URL: <b class="mono">${tun.url}</b>`;
+    $("tunnel-detail").innerHTML = `${esc(mode)} • URL: <b class="mono">${esc(tun.url)}</b>`;
     $("btn-copy-url").classList.remove("hidden");
   } else if (tun.running && tun.mode === "openai") {
     $("tunnel-detail").textContent = `${mode} đang chạy (Tunnel ID: ${tun.tunnelId || "?"}) — URL cố định dùng trong connector.`;
@@ -151,10 +154,10 @@ async function loadInstances(initial) {
         const ws = i.env.WORKSPACE_PATH || "—";
         const active = state.current === i.name ? " active" : "";
         return (
-          `<li class="inst-item${active}" data-name="${i.name.replace(/"/g, "&quot;")}">` +
+          `<li class="inst-item${active}" data-name="${esc(i.name)}">` +
           `<div class="inst-main">` +
-          `<span class="inst-name mono">${i.name}</span>` +
-          `<span class="inst-ws" title="${ws.replace(/"/g, "&quot;")}">${shortPath(ws)}</span>` +
+          `<span class="inst-name mono">${esc(i.name)}</span>` +
+          `<span class="inst-ws" title="${esc(ws)}">${esc(shortPath(ws))}</span>` +
           `</div>` +
           `<span class="inst-dots">` +
           `<span class="status-dot ${srv ? "ok" : "bad"}" title="Server ${srv ? "chạy" : "dừng"}"></span>` +
@@ -224,12 +227,9 @@ async function selectInstance(name, initial) {
   // sidebar active highlight
   document.querySelectorAll(".inst-item").forEach((el) => el.classList.toggle("active", el.dataset.name === name));
 
-  // refresh statuses + installed state
-  const s = await api("/api/status").catch(() => null);
-  if (s) {
-    state.node = s.node;
-    renderServerTunnel(s);
-  }
+  // nút Xóa chỉ hiện với workspace không phải default (server cũng chặn)
+  $("btn-del-inst").classList.toggle("hidden", name === "default");
+
   if (initial) setBusy(false);
 }
 
@@ -261,7 +261,7 @@ async function doCheck() {
     box.innerHTML =
       `<div style="font-weight:700;margin-bottom:6px;color:${r.ok ? "var(--green)" : "var(--red)"}">` +
       (r.ok ? "✅ Cấu hình hợp lệ" : "⚠ Có mục cần sửa") + "</div>" +
-      r.items.map((i) => `<div class="row-item"><span class="${i.ok ? "ok" : "bad"}">${i.ok ? "✔" : "✘"}</span><b>${i.label}:</b>&nbsp;${i.detail}</div>`).join("");
+      r.items.map((i) => `<div class="row-item"><span class="${i.ok ? "ok" : "bad"}">${i.ok ? "✔" : "✘"}</span><b>${esc(i.label)}:</b>&nbsp;${esc(i.detail)}</div>`).join("");
     toast(r.ok ? "Cấu hình hợp lệ" : "Có mục chưa đạt", r.ok ? "ok" : "err");
   } catch (err) {
     toast("Kiểm tra lỗi: " + err.message, "err");
@@ -277,11 +277,13 @@ async function doSave() {
   setBusy(true);
   try {
     const body = rawDirty ? { raw: $("f-raw").value } : { values: collectValues() };
-    await api(instUrl(name, "/env"), "PUT", body);
-    await api(instUrl(name, "/config"), "PUT", {
+    const envRes = await api(instUrl(name, "/env"), "PUT", body);
+    if (!envRes.ok) throw new Error(envRes.error || "Lưu .env thất bại");
+    const cfgRes = await api(instUrl(name, "/config"), "PUT", {
       connectorName: $("f-connector").value.trim(),
       autoStart: $("f-autostart").checked,
     });
+    if (!cfgRes.ok) throw new Error(cfgRes.error || "Lưu cấu hình thất bại");
     rawDirty = false;
     toast("Đã lưu cấu hình workspace " + name + " ✓");
 
@@ -494,11 +496,25 @@ async function doRenameInstance() {
 /* ---------------- misc ---------------- */
 async function copyUrl() {
   const b = state.lastBundle;
-  if (b && b.tunnel.url) {
+  if (!b || !b.tunnel.url) return;
+  const url = b.tunnel.url;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast("Đã sao chép URL: " + url, "ok");
+  } catch {
+    // fallback cho trình duyệt không cho clipboard API (http non-secure context)
     try {
-      toast("Đã sao chép URL: " + b.tunnel.url);
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      toast("Đã sao chép URL: " + url, "ok");
     } catch {
-      toast(b.tunnel.url, "ok");
+      toast("Không copy được — URL: " + url, "err");
     }
   }
 }
@@ -617,12 +633,12 @@ function init() {
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || "lỗi");
       btnAuto.textContent = data.enabled
-        ? "⚡ Autostart: BẬT (chạy khi đăng nhập)"
-        : "⚡ Autostart: TẮT";
+        ? "⚡ Tự chạy khi đăng nhập: BẬT"
+        : "⚡ Tự chạy khi đăng nhập: TẮT";
       btnAuto.dataset.on = data.enabled ? "1" : "0";
       btnAuto.classList.toggle("btn-green", data.enabled);
     } catch (err) {
-      btnAuto.textContent = "⚡ Autostart: lỗi kiểm tra";
+      btnAuto.textContent = "⚡ Tự chạy khi đăng nhập: lỗi kiểm tra";
     }
   }
   btnAuto.addEventListener("click", async () => {

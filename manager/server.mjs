@@ -261,7 +261,7 @@ function spawnHiddenDetached(cmd, args, logFile, extraEnv = null) {
   const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
   const batPath = path.join(STATE_DIR, "spawn-hidden.cmd");
   const vbsPath = path.join(STATE_DIR, "spawn-hidden.vbs");
-  const bat = `@echo off\r\n${q(cmd)} ${args.map(q).join(" ")} >> ${q(logFile)} 2>&1\r\n`;
+  const bat = `@echo off\r\ncd /d ${q(STATE_DIR)}\r\n${q(cmd)} ${args.map(q).join(" ")} >> ${q(logFile)} 2>&1\r\n`;
   // VBS dùng Chr(34) cho dấu nháy — tránh lỗi escaping chuỗi VBS
   const vbs = [
     'Set sh = CreateObject("WScript.Shell")',
@@ -288,7 +288,10 @@ async function tailFile(file, maxBytes = 8000) {
     const buf = Buffer.alloc(size);
     await fh.read(buf, 0, size, st.size - size);
     await fh.close();
-    return buf.toString("utf8");
+    // Cắt ở biên UTF-8 (không cắt nửa ký tự đa byte)
+    let end = buf.length;
+    while (end > 0 && (buf[end - 1] & 0xc0) === 0x80) end--;
+    return buf.slice(0, end).toString("utf8");
   } catch {
     return "";
   }
@@ -808,6 +811,7 @@ async function pickFolder(initialDir = "") {
         // windowsHide:false — dialog Show() cần console process có desktop
         // hiển thị (ẩn đi sẽ khiến Show trả lỗi); console đen hiện ~1s rồi tắt.
         windowsHide: false,
+        shell: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, FOLDER_PICKER_INITIAL: initialDir || "" },
       });
@@ -935,11 +939,20 @@ async function createInstance(body) {
   }
   const used = await allUsedPorts();
   used.add(managerPortNum);
-  let port = parseInt(body.port, 10) || 0;
+  // Nếu client gửi port/adminPort: phải là số nguyên trong 3000–3999 (không tự cấp thay cho giá trị lỗi)
+  const reqPort = body.port === undefined || body.port === null || body.port === "" ? 0 : parseInt(body.port, 10);
+  const reqAdmin = body.adminPort === undefined || body.adminPort === null || body.adminPort === "" ? 0 : parseInt(body.adminPort, 10);
+  if (reqPort !== 0 && (!Number.isInteger(reqPort) || reqPort < 3000 || reqPort > 3999)) {
+    return { ok: false, error: `PORT '${body.port}' không hợp lệ — phải là số nguyên 3000–3999 (để trống = tự chọn).` };
+  }
+  if (reqAdmin !== 0 && (!Number.isInteger(reqAdmin) || reqAdmin < 3000 || reqAdmin > 3999)) {
+    return { ok: false, error: `ADMIN_PORT '${body.adminPort}' không hợp lệ — phải là số nguyên 3000–3999 (để trống = tự chọn).` };
+  }
+  let port = reqPort;
   if (!port) {
     for (let p = 3000; p < 4000; p++) if (!used.has(p)) { port = p; break; }
   }
-  let adminPort = parseInt(body.adminPort, 10) || 0;
+  let adminPort = reqAdmin;
   if (!adminPort) {
     for (let p = 3000; p < 4000; p++) if (p !== port && !used.has(p)) { adminPort = p; break; }
   }
@@ -1085,7 +1098,14 @@ const MIME = {
 
 async function readBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > 1024 * 1024) {
+      throw Object.assign(new Error("Request body quá lớn (tối đa 1MB)."), { status: 413 });
+    }
+    chunks.push(chunk);
+  }
   const text = Buffer.concat(chunks).toString("utf8");
   if (!text) return {};
   try {
@@ -1117,6 +1137,12 @@ function serveStatic(res, filePath) {
 }
 /** Proxy /admin/* → 127.0.0.1:<ADMIN_PORT> của instance (gộp admin UI vào cổng manager). */
 function proxyAdmin(req, res, targetPort, pathname) {
+  let done = false;
+  const finish = (fn) => (...args) => {
+    if (done) return;
+    done = true;
+    fn(...args);
+  };
   const options = {
     hostname: "127.0.0.1",
     port: targetPort,
@@ -1124,13 +1150,20 @@ function proxyAdmin(req, res, targetPort, pathname) {
     method: req.method,
     headers: { ...req.headers, host: `127.0.0.1:${targetPort}` },
   };
-  const proxyReq = http.request(options, (proxyRes) => {
+  const proxyReq = http.request(options, finish((proxyRes) => {
     res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
     proxyRes.pipe(res);
+  }));
+  proxyReq.setTimeout(30000, () => {
+    proxyReq.destroy(new Error("Admin server timeout"));
   });
-  proxyReq.on("error", (err) => {
-    json(res, 502, { ok: false, error: `Admin server của instance chưa chạy (${targetPort}): ${err.message}` });
-  });
+  proxyReq.on("error", finish((err) => {
+    if (!res.headersSent) {
+      json(res, 502, { ok: false, error: `Admin server của instance chưa chạy (${targetPort}): ${err.message}` });
+    } else {
+      res.end();
+    }
+  }));
   req.pipe(proxyReq);
 }
 
@@ -1144,6 +1177,29 @@ async function handleApi(req, res, url, body) {
   const p = url.pathname;
 
   /* -------------------- multi-instance routes -------------------- */
+  // Nếu chưa có instance nào: các route instance trả lỗi rõ ràng thay vì rơi vào 404 "Not found"
+  // (app.js coi 404 = mất kết nối manager → hiểu nhầm server chết).
+  if (!(await listInstances()).length) {
+    const noInst = {
+      ok: false,
+      error: "Chưa có instance nào — tạo workspace trước.",
+      instances: [],
+      env: {},
+      config: { connectorName: "" },
+      server: { running: false, port: 3000, pid: null, health: null },
+      tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
+    };
+    if (req.method === "GET" && p === "/api/instances") return json(res, 200, { ok: true, instances: [] });
+    if (req.method === "POST" && p === "/api/instances") return json(res, 200, await createInstance(body));
+    if (
+      p.startsWith("/api/instances/") || p === "/api/status" || p === "/api/env" ||
+      p === "/api/config" || p === "/api/server" || p === "/api/tunnel" ||
+      p === "/api/check" || p === "/api/pick-folder"
+    ) {
+      return json(res, 404, noInst);
+    }
+  }
+
   if (req.method === "GET" && p === "/api/instances") {
     const instances = [];
     for (const n of await listInstances()) instances.push(await instanceBundle(n));
@@ -1298,6 +1354,9 @@ async function handleApi(req, res, url, body) {
     const profiles = await readJson(PROFILES_PATH, {});
     const name = String(body.name || "").trim();
     if (!name) return json(res, 400, { ok: false, error: "Tên profile trống" });
+    if (!/^[a-zA-Z0-9._-]{1,40}$/.test(name)) {
+      return json(res, 400, { ok: false, error: "Tên profile: 1–40 ký tự, chỉ chữ/số/dấu chấm/gạch ngang/gạch dưới." });
+    }
     profiles[name] = { savedAt: new Date().toISOString(), values: body.values || {} };
     await writeJson(PROFILES_PATH, profiles);
     return json(res, 200, { ok: true, profiles });
@@ -1446,7 +1505,8 @@ async function main() {
       const file = url.pathname === "/" ? "index.html" : path.basename(url.pathname);
       serveStatic(res, path.join(__dirname, file));
     } catch (err) {
-      json(res, 500, { ok: false, error: String(err && err.message || err) });
+      const status = Number.isInteger(err && err.status) ? err.status : 500;
+      json(res, status, { ok: false, error: String((err && err.message) || err) });
     }
   });
 

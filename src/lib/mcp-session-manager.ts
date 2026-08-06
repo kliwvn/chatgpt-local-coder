@@ -5,6 +5,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpServer } from "../server-factory.js";
 import { getUpstreamManager } from "./mcp-upstream-manager.js";
+import { formatLogTime } from "./activity-log.js";
 
 
 const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
@@ -133,7 +134,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   function scheduleDeleteGrace(sessionId: string): void {
     cancelDeleteGrace(sessionId);
     console.log(
-      `[MCP] Session DELETE — giữ ${SESSION_DELETE_GRACE_MS / 1000}s để tool call đang chạy: ${sessionId}`
+      `${formatLogTime()} [MCP] Session DELETE — giữ ${SESSION_DELETE_GRACE_MS / 1000}s để tool call đang chạy: ${sessionId}`
     );
     deleteGraceTimers[sessionId] = setTimeout(() => {
       delete deleteGraceTimers[sessionId];
@@ -150,7 +151,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     delete sessions[sessionId];
     delete lastTransportErrors[sessionId];
     sessionOpChains.delete(sessionId);
-    console.log(`[MCP] Session removed (${reason}): ${sessionId}`);
+    console.log(`${formatLogTime()} [MCP] Session removed (${reason}): ${sessionId}`);
   }
 
   function clearPendingRecovery(sessionId: string): void {
@@ -181,7 +182,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
           createdAt: existing?.createdAt ?? Date.now(),
         };
         clearPendingRecovery(sid);
-        console.log(`[MCP] Session initialized: ${sid}`);
+        console.log(`${formatLogTime()} [MCP] Session initialized: ${sid}`);
       },
       onsessionclosed: (sid) => {
         if (sid) scheduleDeleteGrace(sid);
@@ -198,7 +199,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     transport.onclose = () => {
       const sid = transport.sessionId;
       if (!sid || !sessions[sid]) return;
-      console.log(`[MCP] Transport closed for ${sid} (session kept for recovery)`);
+      console.log(`${formatLogTime()} [MCP] Transport closed for ${sid} (session kept for recovery)`);
     };
 
     await mcpServer.connect(transport);
@@ -237,7 +238,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
 
     if (!initResult.ok) {
       console.log(
-        `[MCP] Recovery initialize failed: HTTP ${initResult.status} for ${staleSessionId}`
+        `${formatLogTime()} [MCP] Recovery initialize failed: HTTP ${initResult.status} for ${staleSessionId}`
       );
       return false;
     }
@@ -252,7 +253,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
 
     if (!notifyResult.ok && notifyResult.status !== 202) {
       console.log(
-        `[MCP] Recovery initialized notification failed: HTTP ${notifyResult.status}`
+        `${formatLogTime()} [MCP] Recovery initialized notification failed: HTTP ${notifyResult.status}`
       );
       return false;
     }
@@ -298,7 +299,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       if (headerSessionId && pendingRecoveries[headerSessionId]) {
         session = pendingRecoveries[headerSessionId];
         clearPendingRecovery(headerSessionId);
-        console.log(`[MCP] Using pending recovery transport for ${headerSessionId}`);
+        console.log(`${formatLogTime()} [MCP] Using pending recovery transport for ${headerSessionId}`);
       } else {
         session = await buildSession();
       }
@@ -345,8 +346,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       if (isInitializeRequest(body)) {
         return false;
       }
-
-      console.log(`[MCP] Attempting session recovery for stale ID: ${staleSessionId}`);
+      console.log(`${formatLogTime()} [MCP] Attempting session recovery for stale ID: ${staleSessionId}`);
 
       const protocolVersion =
         (req.headers["mcp-protocol-version"] as string | undefined) ??
@@ -369,8 +369,8 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         return false;
       }
 
+      console.log(`${formatLogTime()} [MCP] Session recovered: ${staleSessionId}`);
       touch(staleSessionId);
-      console.log(`[MCP] Session recovered: ${staleSessionId}`);
 
       const headers = { ...req.headers, "mcp-session-id": staleSessionId };
       const patchedReq = Object.assign(req, { headers });

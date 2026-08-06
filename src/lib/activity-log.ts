@@ -2,6 +2,14 @@ import { randomUUID } from "node:crypto";
 import fs from "fs/promises";
 import { getAuditPath } from "./audit.js";
 
+export function formatLogTime(d: Date | string = new Date()): string {
+  const dt = typeof d === "string" ? new Date(d) : d;
+  const hh = String(dt.getHours()).padStart(2, "0");
+  const mm = String(dt.getMinutes()).padStart(2, "0");
+  const ss = String(dt.getSeconds()).padStart(2, "0");
+  return `[${hh}:${mm}:${ss}]`;
+}
+
 export type ActivityKind = "tool" | "mcp" | "session" | "system";
 
 export interface ActivityEntry {
@@ -81,6 +89,7 @@ export function getRecentActivity(limit = 100, sinceId?: string): ActivityEntry[
 }
 
 function writeConsole(entry: ActivityEntry): void {
+  const ts = formatLogTime(entry.time);
   const sid = entry.session_id ? ` session=${entry.session_id.slice(0, 8)}` : "";
   const dur = entry.duration_ms != null ? ` ${entry.duration_ms}ms` : "";
   const isError = entry.status === "error" || entry.status === "blocked";
@@ -91,7 +100,7 @@ function writeConsole(entry: ActivityEntry): void {
     const detail = entry.summary || entry.target || "";
     const http = entry.details?.http_status != null ? ` HTTP ${entry.details.http_status}` : "";
     console.warn(
-      `[MCP ERROR]${http} ${label}${detail ? ` — ${detail}` : ""}${dur}${sid}`
+      `${ts} [MCP ERROR]${http} ${label}${detail ? ` — ${detail}` : ""}${dur}${sid}`
     );
     return;
   }
@@ -100,7 +109,7 @@ function writeConsole(entry: ActivityEntry): void {
 
   if (entry.kind === "tool" && entry.tool) {
     const extra = entry.summary || entry.target || "";
-    console.log(`[TOOL]${status} ${entry.tool}${extra ? ` — ${extra}` : ""}${dur}${sid}`);
+    console.log(`${ts} [TOOL]${status} ${entry.tool}${extra ? ` — ${extra}` : ""}${dur}${sid}`);
     return;
   }
 
@@ -111,13 +120,13 @@ function writeConsole(entry: ActivityEntry): void {
       entry.action === "tools/list" && entry.details?.tool_count != null
         ? ` (${entry.details.tool_count} tools)`
         : "";
-    console.log(`[MCP]${status} ${label}${discovery}${extra}${dur}${sid}`);
+    console.log(`${ts} [MCP]${status} ${label}${discovery}${extra}${dur}${sid}`);
     return;
   }
 
   if (entry.kind === "session") {
     const extra = entry.summary ? ` — ${entry.summary}` : "";
-    console.log(`[MCP] session ${entry.action || "event"}${extra}${sid}`);
+    console.log(`${ts} [MCP] session ${entry.action || "event"}${extra}${sid}`);
     return;
   }
 }
