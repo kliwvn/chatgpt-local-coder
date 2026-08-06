@@ -45,7 +45,6 @@ const curUrl = (sub) => (state.current ? instUrl(state.current, sub) : null);
 const FIELD_ENV = {
   "f-workspace": "WORKSPACE_PATH",
   "f-port": "PORT",
-  "f-admin-port": "ADMIN_PORT",
   "f-profile": "CHATGPT_TOOL_PROFILE",
   "f-auto-approve": "CHATGPT_AUTO_APPROVE",
   "f-timeout": "SHELL_TIMEOUT",
@@ -419,7 +418,6 @@ async function doAddInstance() {
   const name = $("add-name").value.trim().toLowerCase();
   const workspacePath = $("add-workspace").value.trim();
   const port = $("add-port").value.trim();
-  const adminPort = $("add-admin-port").value.trim();
   if (!name) {
     toast("Nhập tên workspace", "err");
     return;
@@ -430,19 +428,17 @@ async function doAddInstance() {
       name,
       workspacePath,
       port: port ? parseInt(port, 10) : undefined,
-      adminPort: adminPort ? parseInt(adminPort, 10) : undefined,
       autoStart: $("add-autostart").checked,
     });
     if (!r.ok) {
       toast("Lỗi: " + (r.error || ""), "err");
       return;
     }
-    toast(`Đã tạo workspace ${r.name} — cổng ${r.port} (admin ${r.adminPort})`);
+    toast(`Đã tạo workspace ${r.name} — MCP cổng ${r.port} (admin tự cấp)`);
     $("add-modal").close();
     $("add-name").value = "";
     $("add-workspace").value = "";
     $("add-port").value = "";
-    $("add-admin-port").value = "";
     await loadInstances(false);
     await selectInstance(r.name);
   } catch (err) {
@@ -612,6 +608,43 @@ function init() {
     if (e.target === modal) modal.close();
   });
 
+
+  // autostart (manager chạy khi đăng nhập Windows) — bật/tắt qua Startup folder
+  const btnAuto = $("btn-autostart");
+  async function refreshAutostart() {
+    try {
+      const res = await fetch("/api/autostart");
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "lỗi");
+      btnAuto.textContent = data.enabled
+        ? "⚡ Autostart: BẬT (chạy khi đăng nhập)"
+        : "⚡ Autostart: TẮT";
+      btnAuto.dataset.on = data.enabled ? "1" : "0";
+      btnAuto.classList.toggle("btn-green", data.enabled);
+    } catch (err) {
+      btnAuto.textContent = "⚡ Autostart: lỗi kiểm tra";
+    }
+  }
+  btnAuto.addEventListener("click", async () => {
+    const enable = btnAuto.dataset.on !== "1";
+    btnAuto.disabled = true;
+    try {
+      const res = await fetch("/api/autostart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: enable }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "lỗi");
+      toast(enable ? "Đã bật autostart — manager sẽ tự chạy khi bạn đăng nhập" : "Đã tắt autostart", "ok");
+      await refreshAutostart();
+    } catch (err) {
+      toast("Lỗi đổi autostart: " + err.message, "err");
+    } finally {
+      btnAuto.disabled = false;
+    }
+  });
+  refreshAutostart().catch(() => {});
   // periodic refresh (không đụng form — chỉ sidebar + trạng thái)
   loadInstances(true);
   loadProfiles().catch(() => {});

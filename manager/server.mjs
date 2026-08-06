@@ -44,8 +44,16 @@ const INSTANCES_DIR = path.resolve(
   process.env.MANAGER_INSTANCES_DIR || path.join(__dirname, "instances")
 );
 const INSTANCE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
-
 const IS_WIN = process.platform === "win32";
+const REPO_ROOT = ROOT; // thư mục repo (manager.bat nằm ở đây)
+const MANAGER_BAT = path.join(ROOT, "manager.bat");
+const STARTUP_LNK = IS_WIN
+  ? path.join(
+      process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"),
+      "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+      "ChatGPT Local Coder Manager.lnk"
+    )
+  : path.join(ROOT, ".autostart");
 const NPM_CMD = IS_WIN ? "npm.cmd" : "npm";
 const CLOUDFLARED = IS_WIN ? path.join(ROOT, "cloudflared.exe") : "cloudflared";
 const CLOUDFLARED_PROC = IS_WIN ? "cloudflared.exe" : "cloudflared";
@@ -794,9 +802,12 @@ async function pickFolder(initialDir = "") {
   const prep = await ensureFolderPicker();
   if (!prep.ok) return { ok: false, cancelled: false, error: prep.error };
   try {
+    console.log("[picker] launching " + FOLDER_PICKER_EXE + " initial=" + JSON.stringify(initialDir));
     const res = await new Promise((resolve, reject) => {
       const child = spawn(FOLDER_PICKER_EXE, [], {
-        windowsHide: true, // ẩn cửa sổ console, chỉ hiện dialog
+        // windowsHide:false — dialog Show() cần console process có desktop
+        // hiển thị (ẩn đi sẽ khiến Show trả lỗi); console đen hiện ~1s rồi tắt.
+        windowsHide: false,
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env, FOLDER_PICKER_INITIAL: initialDir || "" },
       });
@@ -1019,6 +1030,12 @@ async function saveInstanceEnv(name, body) {
     next = body.raw;
   } else {
     const values = { ...(body.values || {}) };
+    // ADMIN_PORT giờ tự cấp + ẩn khỏi UI — nếu không gửi thì giữ giá trị cũ
+    // (vẫn theo workspace, mỗi MCP server có admin riêng, truy cập qua manager proxy).
+    if (!(body.values && Object.prototype.hasOwnProperty.call(body.values, "ADMIN_PORT"))) {
+      const old = parseDotEnv(original);
+      if (old.ADMIN_PORT) values.ADMIN_PORT = old.ADMIN_PORT;
+    }
     for (const [k, v] of Object.entries(values)) {
       if (v === undefined) values[k] = null;
     }
@@ -1332,6 +1349,45 @@ async function handleApi(req, res, url, body) {
   if (req.method === "POST" && p === "/api/open/connector") {
     openExternal(CONNECTOR_SETTINGS_URL);
     return json(res, 200, { ok: true, url: CONNECTOR_SETTINGS_URL });
+  }
+
+  // --- Autostart manager khi đăng nhập Windows (Startup folder .lnk) ---
+  if (p === "/api/autostart") {
+    if (req.method === "GET") {
+      const on = fs.existsSync(STARTUP_LNK);
+      return json(res, 200, { ok: true, enabled: on, lnk: STARTUP_LNK });
+    }
+    if (req.method === "POST") {
+      const enable = Boolean(body && body.enabled);
+      if (enable) {
+        if (!fs.existsSync(STARTUP_LNK)) {
+          // Tạo shortcut .lnk trỏ manager.bat (ẩn cửa sổ, chạy khi login)
+          const vbs = [
+            'Set ws = CreateObject("WScript.Shell")',
+            'Set lnk = ws.CreateShortcut("' + STARTUP_LNK.replace(/\\/g, "\\\\") + '")',
+            'lnk.TargetPath = "' + MANAGER_BAT.replace(/\\/g, "\\\\") + '"',
+            'lnk.WorkingDirectory = "' + REPO_ROOT.replace(/\\/g, "\\\\") + '"',
+            "lnk.WindowStyle = 7",
+            'lnk.Description = "ChatGPT Local Coder Manager (multi-instance)"',
+            "lnk.Save()",
+          ].join("\n");
+          const vbsPath = path.join(STATE_DIR, "make-startup-lnk.vbs");
+          await fsp.writeFile(vbsPath, vbs, "utf8");
+          const r = spawnSync("cscript", ["//nologo", "//B", vbsPath], { encoding: "utf8", windowsHide: true });
+          if (r.status !== 0) {
+            return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: " + (r.stderr || r.stdout || "").trim().slice(-200) });
+          }
+        }
+        return json(res, 200, { ok: true, enabled: true });
+      }
+      // Tắt: xóa shortcut
+      try {
+        if (fs.existsSync(STARTUP_LNK)) await fsp.unlink(STARTUP_LNK);
+        return json(res, 200, { ok: true, enabled: false });
+      } catch (err) {
+        return json(res, 500, { ok: false, error: "Xóa shortcut lỗi: " + String((err && err.message) || err).slice(-200) });
+      }
+    }
   }
 
   if (req.method === "GET" && p === "/api/health") {

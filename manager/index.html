@@ -85,9 +85,11 @@
             <p class="hint">Cổng MCP server của workspace này (phải khác các workspace khác).</p>
           </div>
           <div class="field">
-            <label for="f-admin-port">ADMIN_PORT</label>
-            <input id="f-admin-port" class="input mono" inputmode="numeric" placeholder="3001" />
-            <p class="hint">Cổng Admin UI nâng cao của workspace này.</p>
+            <label for="f-profile">CHATGPT_TOOL_PROFILE</label>
+            <select id="f-profile" class="input">
+              <option value="slim">slim (~23 tools cho ChatGPT web)</option>
+              <option value="full">full (tất cả tools)</option>
+            </select>
           </div>
           <div class="field">
             <label for="f-profile">CHATGPT_TOOL_PROFILE</label>
@@ -190,6 +192,7 @@
 <footer class="app-footer">
   <button id="btn-guide" class="btn btn-ghost wide">📖 Hướng Dẫn Sử Dụng ChatGPT Web</button>
   <button id="btn-connector" class="btn btn-green wide">🔗 Mở trang Cài Đặt Connector ChatGPT</button>
+  <button id="btn-autostart" class="btn btn-ghost wide" title="Tự chạy manager khi bạn đăng nhập Windows">⚡ Autostart: đang kiểm tra…</button>
   <a id="foot-admin" class="foot-link" href="#" target="_blank">Admin UI (nâng cao) ↗</a>
 </footer>
 
@@ -222,15 +225,10 @@
         <button id="add-pick" class="btn btn-ghost">Chọn...</button>
       </div>
     </div>
-    <div class="grid2">
-      <div class="field">
-        <label for="add-port">PORT (để trống = tự chọn)</label>
-        <input id="add-port" class="input mono" inputmode="numeric" placeholder="3002" />
-      </div>
-      <div class="field">
-        <label for="add-admin-port">ADMIN_PORT (để trống = tự chọn)</label>
-        <input id="add-admin-port" class="input mono" inputmode="numeric" placeholder="3003" />
-      </div>
+    <div class="field">
+      <label for="add-port">PORT (MCP server — để trống = tự chọn)</label>
+      <input id="add-port" class="input mono" inputmode="numeric" placeholder="3002" />
+      <p class="hint">Admin UI truy cập qua cổng manager — admin port tự cấp.</p>
     </div>
     <div class="actions">
       <label class="chk"><input id="add-autostart" type="checkbox" checked /> Tự khởi động khi mở app</label>
