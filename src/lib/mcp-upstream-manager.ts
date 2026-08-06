@@ -230,8 +230,21 @@ export class McpUpstreamManager {
   async callTool(serverId: string, toolName: string, args: Record<string, unknown> = {}): Promise<unknown> {
     const conn = await this.connect(serverId);
     this.touch(conn);
-    const result = await conn.client.callTool({ name: toolName, arguments: args });
-    return result;
+    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+    const timer = setTimeout(() => {
+      reject(new Error(`Upstream tool call timed out: ${toolName}`));
+    }, 120_000);
+    conn.client
+      .callTool({ name: toolName, arguments: args })
+      .then((r) => {
+        clearTimeout(timer);
+        resolve(r);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    return promise;
   }
 
   async checkHealth(serverId: string): Promise<UpstreamServerStatus> {

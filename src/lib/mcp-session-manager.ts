@@ -115,6 +115,8 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   const pendingRecoveries: Record<string, McpSession> = {};
   const deleteGraceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  // Lock per-session: chặn 2 request stale cùng sessionId build 2 transport song song
+  const recoveryInFlight = new Map<string, Promise<McpSession | null>>();
 
   function touch(sessionId: string): void {
     cancelDeleteGrace(sessionId);
@@ -353,21 +355,55 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         DEFAULT_PROTOCOL_VERSION;
       const mcpPath = req.path || "/mcp";
 
-      const pending = await buildSession(staleSessionId);
-      pendingRecoveries[staleSessionId] = pending;
-
-      const warmed = await warmUpRecoveredSession(staleSessionId, mcpPath, protocolVersion);
-      if (!warmed) {
-        clearPendingRecovery(staleSessionId);
-        removeSession(staleSessionId, "recovery failed");
-        return false;
+      // Lock per-session: 2 request stale cùng sessionId chạy song song → chỉ 1 build session,
+      // request sau chờ kết quả rồi dùng chung (tránh 2 transport + upstream register leak).
+      const inFlight = recoveryInFlight.get(staleSessionId);
+      if (inFlight) {
+        const recovered = await inFlight;
+        if (!recovered) return false;
+        const headers = { ...req.headers, "mcp-session-id": staleSessionId };
+        const patchedReq = Object.assign(req, { headers });
+        await enqueueSessionOp(staleSessionId, async () => {
+          await recovered.transport.handleRequest(patchedReq, res, body);
+        });
+        return true;
       }
 
-      const recovered = sessions[staleSessionId];
-      if (!recovered) {
-        clearPendingRecovery(staleSessionId);
-        return false;
+      const promise: Promise<McpSession | null> = (async () => {
+        try {
+          const pending = await buildSession(staleSessionId);
+          pendingRecoveries[staleSessionId] = pending;
+          const warmed = await warmUpRecoveredSession(staleSessionId, mcpPath, protocolVersion);
+          if (!warmed) {
+            clearPendingRecovery(staleSessionId);
+            await pending.transport.close().catch(() => undefined);
+            getUpstreamManager().unregisterMcpServer(pending.server);
+            return null;
+          }
+          const recovered = sessions[staleSessionId];
+          if (!recovered) {
+            clearPendingRecovery(staleSessionId);
+            await pending.transport.close().catch(() => undefined);
+            getUpstreamManager().unregisterMcpServer(pending.server);
+            return null;
+          }
+          return recovered;
+        } catch (err) {
+          clearPendingRecovery(staleSessionId);
+          console.log(`${formatLogTime()} [MCP] Recovery error: ${String(err)}`);
+          return null;
+        }
+      })();
+      recoveryInFlight.set(staleSessionId, promise);
+      let recovered: McpSession | null = null;
+      try {
+        recovered = await promise;
+      } finally {
+        if (recoveryInFlight.get(staleSessionId) === promise) {
+          recoveryInFlight.delete(staleSessionId);
+        }
       }
+      if (!recovered) return false;
 
       console.log(`${formatLogTime()} [MCP] Session recovered: ${staleSessionId}`);
       touch(staleSessionId);

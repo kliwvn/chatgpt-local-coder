@@ -86,11 +86,16 @@ export async function refreshProxiedTools(server: McpServer, manager: McpUpstrea
         async (args: Record<string, unknown>) => {
           const raw = await manager.callTool(config.id, tool.name, args ?? {});
           const content = formatUpstreamResult(raw);
+          const isErr =
+            typeof raw === "object" &&
+            raw !== null &&
+            "isError" in raw &&
+            Boolean(raw.isError);
           return toolResult(proxyName, {
             upstream_server: config.id,
             upstream_tool: tool.name,
             result: content,
-          });
+          }, { ok: !isErr, summary: isErr ? `${tool.name} failed upstream` : undefined });
         }
       );
       registry.set(proxyName, registered);

@@ -211,7 +211,12 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (item.exitCode !== null || item.signal !== null) {
         return toolResult("stop_process", { id, already_exited: true }, { summary: `${id} already exited` });
       }
-      item.child.kill(force ? "SIGKILL" : "SIGTERM");
+      // Giết cả process tree: child.kill() chỉ giết powershell cha, con cháu bị bỏ lại
+      if (process.platform === "win32" && item.child.pid) {
+        spawn("taskkill", ["/pid", String(item.child.pid), "/T", "/F"], { windowsHide: true });
+      } else {
+        item.child.kill(force ? "SIGKILL" : "SIGTERM");
+      }
       await audit({ tool: "stop_process", action: "stop", target: item.cwd, status: "ok", details: { id, force } });
       return toolResult("stop_process", { id, force }, { summary: `stop sent to ${id}` });
     }

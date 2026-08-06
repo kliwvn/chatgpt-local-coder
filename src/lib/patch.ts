@@ -197,9 +197,10 @@ export function parseMultiFilePatch(patchText: string, baseDir?: string): MultiP
     const flush = () => {
       if (!current) return;
       if (current.operation === "create") {
+        // Dòng trống trong khối Add File là nội dung file, không phải dấu kết thúc —
+        // giữ nguyên; chỉ bỏ tiền tố "+" của các dòng nội dung.
         current.content = chunk
-          .filter((l) => l.startsWith("+"))
-          .map((l) => l.slice(1))
+          .map((l) => (l.startsWith("+") ? l.slice(1) : l))
           .join("\n");
       } else if (current.operation === "update") {
         current.patch = chunk.join("\n");

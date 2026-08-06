@@ -91,8 +91,38 @@ const sessionManager = createSessionManager({
 });
 
 const app = express();
-app.use(cors());
+// CORS hẹp: chỉ cho phép origin local (localhost/127.0.0.1) — chặn trang web độc hại
+// gọi /mcp từ trình duyệt nạn nhân (tool run_command = toàn quyền shell).
+app.use(
+  cors({
+    origin: [/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/],
+  })
+);
 app.use(express.json({ limit: "50mb" }));
+// Error middleware: body-parser lỗi (JSON sai, body quá lớn) → trả JSON-RPC error
+// thay vì HTML mặc định của Express (phá shape JSON-RPC mà MCP client đang chờ).
+app.use(
+  (
+    err: Error & { status?: number; type?: string },
+    req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction
+  ) => {
+    const isParseError =
+      err.type === "entity.parse.failed" ||
+      err.type === "entity.too.large" ||
+      err instanceof SyntaxError;
+    const code = isParseError ? -32700 : -32000;
+    const message = err.type === "entity.too.large" ? "Request body too large" : err.message;
+    const status = isParseError ? 400 : 500;
+    const body = req.body as { id?: unknown } | undefined;
+    res.status(status).json({
+      jsonrpc: "2.0",
+      error: { code, message },
+      id: body && typeof body.id !== "undefined" ? body.id : null,
+    });
+  }
+);
 const MCP_PATHS_SET = new Set(["/", "/mcp"]);
 
 app.use((req, res, next) => {
@@ -245,39 +275,61 @@ function handleStaleSession(
 }
 
 async function handleMcpGet(req: express.Request, res: express.Response): Promise<void> {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (handleStaleSession(req, res, sessionId)) return;
+  try {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (handleStaleSession(req, res, sessionId)) return;
 
-  if (!sessionId) {
-    sessionManager.sendBadRequest(res, "Bad Request: Mcp-Session-Id header is required");
-    return;
+    if (!sessionId) {
+      sessionManager.sendBadRequest(res, "Bad Request: Mcp-Session-Id header is required");
+      return;
+    }
+
+    const session = sessionManager.get(sessionId);
+    if (!session) {
+      sessionManager.sendSessionNotFound(res);
+      return;
+    }
+
+    await sessionManager.handleExisting(session, req, res, undefined);
+  } catch (error) {
+    console.log(`${formatLogTime()} [MCP] GET error:`, error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: extractRequestId(req.body),
+      });
+    }
   }
-
-  const session = sessionManager.get(sessionId);
-  if (!session) {
-    sessionManager.sendSessionNotFound(res);
-    return;
-  }
-
-  await sessionManager.handleExisting(session, req, res, undefined);
 }
 
 async function handleMcpDelete(req: express.Request, res: express.Response): Promise<void> {
-  const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (handleStaleSession(req, res, sessionId)) return;
+  try {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (handleStaleSession(req, res, sessionId)) return;
 
-  if (!sessionId) {
-    sessionManager.sendBadRequest(res, "Bad Request: Mcp-Session-Id header is required");
-    return;
+    if (!sessionId) {
+      sessionManager.sendBadRequest(res, "Bad Request: Mcp-Session-Id header is required");
+      return;
+    }
+
+    const session = sessionManager.get(sessionId);
+    if (!session) {
+      sessionManager.sendSessionNotFound(res);
+      return;
+    }
+
+    await sessionManager.handleExisting(session, req, res, undefined);
+  } catch (error) {
+    console.log(`${formatLogTime()} [MCP] DELETE error:`, error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: extractRequestId(req.body),
+      });
+    }
   }
-
-  const session = sessionManager.get(sessionId);
-  if (!session) {
-    sessionManager.sendSessionNotFound(res);
-    return;
-  }
-
-  await sessionManager.handleExisting(session, req, res, undefined);
 }
 
 for (const mcpPath of MCP_PATHS) {
@@ -299,7 +351,7 @@ const adminServer = startAdminServer({
   instructionsPreview: () => instructionContext.instructionsText,
 });
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, "127.0.0.1", () => {
   const ts = formatLogTime();
   console.log("");
   console.log("========================================");

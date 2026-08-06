@@ -8,17 +8,21 @@ interface GitRunResult {
 }
 
 function runGit(args: string[], cwd: string): Promise<GitRunResult> {
-  return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd, windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 });
-    });
-    child.on("error", () => resolve({ stdout: "", stderr: "git not found", exit_code: 127 }));
-  });
+  const { promise, resolve } = Promise.withResolvers<GitRunResult>();
+  const child = spawn("git", args, { cwd, windowsHide: true });
+  let stdout = "";
+  let stderr = "";
+  let settled = false;
+  const settle = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    fn();
+  };
+  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  child.on("close", (code) => settle(() => resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 })));
+  child.on("error", () => settle(() => resolve({ stdout: "", stderr: "git not found", exit_code: 127 })));
+  return promise;
 }
 
 export interface GitSnapshot {

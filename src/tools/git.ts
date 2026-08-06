@@ -13,18 +13,33 @@ interface GitRunResult {
   exit_code: number;
 }
 
-function runGit(args: string[], cwd: string): Promise<GitRunResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("git", args, { cwd, windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 });
-    });
-    child.on("error", () => reject(new Error("git not found. Install Git for Windows.")));
+function runGit(args: string[], cwd: string, timeoutMs = 30_000): Promise<GitRunResult> {
+  const { promise, resolve, reject } = Promise.withResolvers<GitRunResult>();
+  const child = spawn("git", args, { cwd, windowsHide: true });
+  let stdout = "";
+  let stderr = "";
+  let settled = false;
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    child.kill("SIGKILL");
+    resolve({ stdout: stdout.trim(), stderr: (stderr || `git timed out after ${timeoutMs}ms`).trim(), exit_code: 124 });
+  }, timeoutMs);
+  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  child.on("close", (code) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 });
   });
+  child.on("error", () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    reject(new Error("git not found. Install Git for Windows."));
+  });
+  return promise;
 }
 
 async function gitOrThrow(args: string[], cwd: string): Promise<GitRunResult> {
@@ -85,7 +100,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     const cwd = await repo(repoPath);
     const args = ["add"];
     if (all && (!files || files.length === 0)) args.push("-A");
-    else if (files?.length) args.push(...files);
+    else if (files?.length) args.push("--", ...files);
     const r = await gitOrThrow(args, cwd);
     return toolResult("git_add", { path: cwd, files: files || ["-A"], output: r.stdout });
   });

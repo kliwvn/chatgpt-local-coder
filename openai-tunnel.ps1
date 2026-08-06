@@ -109,7 +109,17 @@ function Stop-ExistingTunnel([int]$TargetHealthPort) {
     $ownerPid = Get-PortOwnerPid -TargetPort $TargetHealthPort
     if (-not $ownerPid) { return }
     $proc = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
-    $name = if ($proc) { $proc.ProcessName } else { "unknown" }
+    if (-not $proc) {
+        Write-Host "Port $TargetHealthPort dang bi PID $ownerPid chiem nhung process khong con ton tai." -ForegroundColor Yellow
+        return
+    }
+    $name = $proc.ProcessName
+    # Chi giet process tunnel that su — khong giet ung dung khac dang dung cong nay
+    if ($name -notin @("tunnel-client", "cloudflared")) {
+        Write-Host "[LOI] Port $TargetHealthPort dang bi '$name' (PID $ownerPid) chiem - KHONG phai tunnel." -ForegroundColor Red
+        Write-Host "Doi OPENAI_TUNNEL_HEALTH_PORT sang cong khac trong .env." -ForegroundColor Yellow
+        return
+    }
     Write-Host "Dang tat tunnel cu (PID $ownerPid - $name)..." -ForegroundColor Yellow
     Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
@@ -243,6 +253,12 @@ $resolvedHealth = if ($HealthPort -gt 0) { $HealthPort } elseif ($envHealth) { [
 $tunnelId = Get-DotEnvValue "OPENAI_TUNNEL_ID"
 $apiKey = Get-DotEnvValue "OPENAI_TUNNEL_API_KEY"
 
+# Bin cân cho cả doctor lẫn run — install trước mọi early-exit để không chết giữa chừng.
+$bin = Get-TunnelClientPath
+if (-not $bin) {
+    $bin = Install-TunnelClient
+}
+
 if (-not $tunnelId -or -not $apiKey) {
     Write-Host ""
     Write-Host "[CHUA CAU HINH] Chay setup lan dau:" -ForegroundColor Yellow
@@ -254,13 +270,15 @@ if (-not $tunnelId -or -not $apiKey) {
     exit 1
 }
 
-$bin = Get-TunnelClientPath
-if (-not $bin) {
-    $bin = Install-TunnelClient
-}
-
 $mcpUrl = "http://127.0.0.1:$resolvedPort/mcp"
 Ensure-Profile -McpUrl $mcpUrl -TunnelId $tunnelId -TargetHealthPort $resolvedHealth
+
+# Doctor chạy độc lập với tunnel/port — xử lý sớm để không bị chặn bởi early-exit
+if ($Doctor) {
+    & $bin doctor --profile-file $ProfileFile --explain
+    exit $LASTEXITCODE
+}
+
 
 $env:OPENAI_TUNNEL_API_KEY = $apiKey
 $env:CONTROL_PLANE_API_KEY = $apiKey
@@ -290,10 +308,6 @@ if ($existingPid -and (Test-TunnelHealthy $resolvedHealth)) {
     }
 }
 
-if ($Doctor) {
-    & $bin doctor --profile-file $ProfileFile --explain
-    exit $LASTEXITCODE
-}
 
 if (-not (Test-McpServer $resolvedPort)) {
     Write-Host ""

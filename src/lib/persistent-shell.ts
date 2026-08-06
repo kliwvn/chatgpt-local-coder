@@ -110,23 +110,36 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
 }
 
 function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
-  return new Promise((resolve, reject) => {
-    const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-    const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
-    const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
+  const { promise, resolve, reject } = Promise.withResolvers<ShellExecResult>();
+  const shell = process.platform === "win32" ? "powershell.exe" : "bash";
+  const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
+  const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  let settled = false;
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
+  const settle = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    fn();
+  };
 
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      clearTimeout(timer);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    // Giết cả process tree — child process con (npm test, node script) không bị bỏ lại
+    if (process.platform === "win32" && child.pid) {
+      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+    } else {
+      child.kill("SIGKILL");
+    }
+  }, timeoutMs);
+
+  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  child.on("close", (code) => {
+    settle(() => {
       if (timedOut) {
         reject(new Error(`Command timed out after ${timeoutMs / 1000}s`));
         return;
@@ -140,13 +153,16 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
         timed_out: false,
       });
     });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
   });
+  child.on("error", (err) => settle(() => reject(err)));
+  return promise;
 }
 
+/**
+ * Chạy command trong shell session bền vững: cwd thay đổi qua `cd` được giữ
+ * giữa các lần gọi. Nếu truyền `workingDirectory`, session sẽ chuyển sang
+ * thư mục đó TRƯỚC khi chạy (và giữ nguyên cho lần sau, giống Bash persistent).
+ */
 export async function execInShellSession(
   command: string,
   defaultCwd: string,
@@ -156,7 +172,7 @@ export async function execInShellSession(
   if (!sessionCwd) initShellSession(defaultCwd);
 
   if (workingDirectory) {
-    sessionCwd = path.resolve(await Promise.resolve(workingDirectory));
+    sessionCwd = path.resolve(workingDirectory);
   }
 
   const { cwd, command: effective } = applyCwdDirectives(sessionCwd!, command);

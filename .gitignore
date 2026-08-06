@@ -19,3 +19,4 @@ log_console.txt
 *.log
 .DS_Store
 manager/instances/
+.workspace/

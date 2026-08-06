@@ -37,7 +37,7 @@ const setBusy = (b) => {
 };
 
 /* ---------------- state ---------------- */
-const state = { instances: [], current: null, lastBundle: null };
+const state = { instances: [], current: null, lastBundle: null, node: null };
 
 const instUrl = (name, sub) => `/api/instances/${encodeURIComponent(name)}${sub}`;
 const curUrl = (sub) => (state.current ? instUrl(state.current, sub) : null);
@@ -145,6 +145,7 @@ function getInstance(name) {
 async function loadInstances(initial) {
   try {
     const r = await api("/api/instances");
+    state.node = r.node || null;
     state.instances = r.instances || [];
     const list = $("inst-list");
     list.innerHTML = state.instances
@@ -178,14 +179,14 @@ async function loadInstances(initial) {
       state.current = null;
     }
     if (!state.current && state.instances.length > 0) {
-      await selectInstance(state.instances[0].name, true);
+      if (initial) await selectInstance(state.instances[0].name, true);
       return;
     }
     if (state.current) {
       const b = getInstance(state.current);
       if (b) {
         state.lastBundle = b;
-        renderServerTunnel({ installed: { dist: true, nodeModules: true }, server: b.server, tunnel: b.tunnel, env: b.env, node: state.node });
+        renderServerTunnel(b);
       }
     }
     if (initial) setBusy(false);
@@ -199,9 +200,12 @@ async function loadInstances(initial) {
 }
 
 async function selectInstance(name, initial) {
-  state.current = name;
   const b = getInstance(name);
-  if (!b) return;
+  if (!b) {
+    if (state.current === name) state.current = null;
+    return;
+  }
+  state.current = name;
   state.lastBundle = b;
   const env = b.env;
   const cfg = b.config;
@@ -217,11 +221,16 @@ async function selectInstance(name, initial) {
   // raw env
   try {
     const r = await api(instUrl(name, "/env"));
+    if (state.current !== name) return; // user đã chuyển instance — không đè form
     $("f-raw").value = r.raw || "";
-  } catch {}
+  } catch (err) {
+    if (state.current !== name) return;
+    $("f-raw").value = "";
+    console.warn("load raw env lỗi:", err);
+  }
 
   // status
-  renderServerTunnel({ installed: { dist: true, nodeModules: true }, server: b.server, tunnel: b.tunnel, env, node: state.node });
+  renderServerTunnel(b);
   $("check-result").classList.add("hidden");
 
   // sidebar active highlight
@@ -261,7 +270,7 @@ async function doCheck() {
     box.innerHTML =
       `<div style="font-weight:700;margin-bottom:6px;color:${r.ok ? "var(--green)" : "var(--red)"}">` +
       (r.ok ? "✅ Cấu hình hợp lệ" : "⚠ Có mục cần sửa") + "</div>" +
-      r.items.map((i) => `<div class="row-item"><span class="${i.ok ? "ok" : "bad"}">${i.ok ? "✔" : "✘"}</span><b>${esc(i.label)}:</b>&nbsp;${esc(i.detail)}</div>`).join("");
+      (r.items || []).map((i) => `<div class="row-item"><span class="${i.ok ? "ok" : "bad"}">${i.ok ? "✔" : "✘"}</span><b>${esc(i.label)}:</b>&nbsp;${esc(i.detail)}</div>`).join("");
     toast(r.ok ? "Cấu hình hợp lệ" : "Có mục chưa đạt", r.ok ? "ok" : "err");
   } catch (err) {
     toast("Kiểm tra lỗi: " + err.message, "err");
@@ -285,16 +294,18 @@ async function doSave() {
     });
     if (!cfgRes.ok) throw new Error(cfgRes.error || "Lưu cấu hình thất bại");
     rawDirty = false;
-    toast("Đã lưu cấu hình workspace " + name + " ✓");
-
     if ($("chk-restart").checked) {
       const b = state.lastBundle;
       if (b && b.server.running) {
         await api(instUrl(name, "/server/stop"), "POST");
         await api(instUrl(name, "/server/start"), "POST");
+      } else if (b && !b.server.running) {
+        await api(instUrl(name, "/server/start"), "POST");
       }
       if (b && b.tunnel.running) {
         await api(instUrl(name, "/tunnel/stop"), "POST");
+        await api(instUrl(name, "/tunnel/start"), "POST");
+      } else if (b && !b.tunnel.running) {
         await api(instUrl(name, "/tunnel/start"), "POST");
       }
     }
@@ -314,7 +325,7 @@ async function loadProfiles() {
   profiles = r.profiles || {};
   const sel = $("profile-select");
   sel.innerHTML = '<option value="">Mặc định</option>' +
-    Object.keys(profiles).map((n) => `<option value="${n.replace(/"/g, "&quot;")}">${n}</option>`).join("");
+    Object.keys(profiles).map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
 }
 
 async function doProfileSave() {
@@ -371,7 +382,6 @@ async function toggleServer() {
       ? await api(instUrl(name, "/server/stop"), "POST")
       : await api(instUrl(name, "/server/start"), "POST");
     toast(r.ok ? (r.alreadyRunning ? "Server đã chạy" : r.alreadyStopped ? "Server đã dừng" : "OK") : "Lỗi: " + (r.error || ""), r.ok ? "ok" : "err");
-    if (!r.ok && r.error) toast(r.error, "err");
   } catch (err) {
     toast("Lỗi: " + err.message, "err");
   }
@@ -424,12 +434,17 @@ async function doAddInstance() {
     toast("Nhập tên workspace", "err");
     return;
   }
+  const parsedPort = port ? parseInt(port, 10) : undefined;
+  if (port && (Number.isNaN(parsedPort) || parsedPort <= 0 || parsedPort > 65535)) {
+    toast("Cổng không hợp lệ (1-65535)", "err");
+    return;
+  }
   setBusy(true);
   try {
     const r = await api("/api/instances", "POST", {
       name,
       workspacePath,
-      port: port ? parseInt(port, 10) : undefined,
+      port: parsedPort,
       autoStart: $("add-autostart").checked,
     });
     if (!r.ok) {
@@ -456,7 +471,11 @@ async function doDeleteInstance() {
   setBusy(true);
   try {
     const r = await api(instUrl(name, ""), "DELETE");
-    toast(r.ok ? `Đã xóa workspace ${name}` : "Lỗi: " + (r.error || ""), r.ok ? "ok" : "err");
+    if (!r.ok) {
+      toast("Lỗi: " + (r.error || ""), "err");
+      return;
+    }
+    toast(`Đã xóa workspace ${name}`, "ok");
     state.current = null;
     state.lastBundle = null;
     await loadInstances(false);
@@ -495,9 +514,9 @@ async function doRenameInstance() {
 
 /* ---------------- misc ---------------- */
 async function copyUrl() {
-  const b = state.lastBundle;
-  if (!b || !b.tunnel.url) return;
-  const url = b.tunnel.url;
+  const el = document.querySelector("#tunnel-detail .mono");
+  const url = el ? el.textContent.trim() : "";
+  if (!url || !/^https?:\/\//i.test(url)) return;
   try {
     await navigator.clipboard.writeText(url);
     toast("Đã sao chép URL: " + url, "ok");

@@ -23,6 +23,10 @@ export async function audit(event: AuditEvent): Promise<void> {
 
   try {
     await fs.mkdir(path.dirname(auditPath), { recursive: true });
+    const stat = await fs.stat(auditPath).catch(() => null);
+    if (stat && stat.size > 10 * 1024 * 1024) {
+      await fs.rename(auditPath, `${auditPath}.1`).catch(() => undefined);
+    }
     await fs.appendFile(auditPath, JSON.stringify(record) + "\n", "utf-8");
   } catch {
     // Audit must never break the requested tool call.

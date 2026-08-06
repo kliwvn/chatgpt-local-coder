@@ -92,7 +92,8 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, offset, limit, head, tail }) => {
       const validPath = await validatePath(filePath);
       const content = await fs.readFile(validPath, "utf-8");
-      const lines = content.split("\n");
+      // BOM (UTF-8) làm dòng 1 trông có ký tự lạ — bỏ đi để line numbers khớp
+      const lines = content.replace(/^\uFEFF/, "").split("\n");
 
       if (offset !== undefined) {
         const start = Math.max(0, offset - 1);

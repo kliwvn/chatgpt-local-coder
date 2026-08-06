@@ -19,6 +19,14 @@ import {
   type ActivityEntry,
 } from "../lib/activity-log.js";
 
+const SECRET_KEY_PATTERN =
+  /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
+const REDACTED_MASK = "********";
+
+function isSecretKey(key: string): boolean {
+  return SECRET_KEY_PATTERN.test(key);
+}
+
 function parseDotEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of text.split("\n")) {
@@ -102,7 +110,12 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
   router.get("/api/config/env", async (_req, res) => {
     try {
       const text = await fs.readFile(envPath, "utf-8");
-      res.json({ ok: true, path: envPath, values: parseDotEnv(text) });
+      const values = parseDotEnv(text);
+      const masked: Record<string, string> = {};
+      for (const [key, value] of Object.entries(values)) {
+        masked[key] = isSecretKey(key) && value ? REDACTED_MASK : value;
+      }
+      res.json({ ok: true, path: envPath, values: masked });
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") {
         res.json({ ok: true, path: envPath, values: {} });
@@ -119,13 +132,18 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         res.status(400).json({ ok: false, error: "values object required" });
         return;
       }
+      // Loại bỏ giá trị mask trước khi serialize — nếu không sẽ ghi "********" đè secret thật
+      const filtered: Record<string, string> = {};
+      for (const [k, v] of Object.entries(values)) {
+        if (v !== REDACTED_MASK) filtered[k] = v;
+      }
       let original = "";
       try {
         original = await fs.readFile(envPath, "utf-8");
       } catch {}
-      const next = serializeDotEnv(values, original || "");
+      const next = serializeDotEnv(filtered, original || "");
       await fs.writeFile(envPath, next, "utf-8");
-      for (const [k, v] of Object.entries(values)) {
+      for (const [k, v] of Object.entries(filtered)) {
         process.env[k] = v;
       }
       res.json({ ok: true, path: envPath });

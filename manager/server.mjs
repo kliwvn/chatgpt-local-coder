@@ -170,8 +170,17 @@ async function readPidFile(p) {
 
 async function writePidFile(p, pid) {
   await fsp.mkdir(path.dirname(p), { recursive: true });
-  if (pid) await fsp.writeFile(p, String(pid), "utf-8");
-  else await fsp.rm(p, { force: true });
+  // Windows đôi khi trả EBUSY/EPERM khi process khác đang đọc file — retry ngắn
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      if (pid) await fsp.writeFile(p, String(pid), "utf-8");
+      else await fsp.rm(p, { force: true });
+      return;
+    } catch (err) {
+      if (err && err.code !== "EBUSY" && err.code !== "EPERM" && err.code !== "EACCES") throw err;
+      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -223,6 +232,7 @@ function spawnDetached(cmd, args, logFile, extraEnv = null) {
     windowsHide: true,
     env: extraEnv ? { ...process.env, ...extraEnv } : undefined,
   });
+  child.on("error", (err) => console.error("[spawnDetached] lỗi:", err.message));
   fs.closeSync(out);
   return child.pid;
 }
@@ -418,8 +428,17 @@ async function ensureInstances() {
   }
 }
 
+
+/** Cache kết quả quét PID ngắn (2s) — tránh spawn powershell.exe liên tục
+ *  khi UI gọi /api/instances (mỗi instance 1-2 lần quét mỗi request). */
+const pidScanCache = new Map();
+const PID_SCAN_TTL_MS = 2000;
 /** PIDs của process imageName mà command line chứa substring (phân biệt instance). */
 function pidsWithCmdLine(imageName, substring) {
+  const key = `${imageName}\u0000${substring}`;
+  const hit = pidScanCache.get(key);
+  if (hit && Date.now() - hit.at < PID_SCAN_TTL_MS) return hit.pids;
+  let pids = [];
   try {
     const needle = String(substring).replace(/'/g, "''");
     const ps = [
@@ -428,13 +447,15 @@ function pidsWithCmdLine(imageName, substring) {
       `Get-CimInstance Win32_Process -Filter "Name='${imageName}'" | Where-Object { $_.CommandLine -like '*${needle}*' } | Select-Object -ExpandProperty ProcessId`,
     ];
     const out = spawnSync("powershell.exe", ps, { encoding: "utf8", windowsHide: true, timeout: 15000 }).stdout || "";
-    return out
+    pids = out
       .split(/\r?\n/)
       .map((l) => parseInt(l.trim(), 10))
       .filter((p) => Number.isInteger(p) && p > 0);
   } catch {
-    return [];
+    pids = [];
   }
+  pidScanCache.set(key, { at: Date.now(), pids });
+  return pids;
 }
 
 async function serverHealth(port) {
@@ -459,6 +480,7 @@ async function runInstall() {
       const child = IS_WIN
         ? spawn("cmd.exe", ["/c", "npm.cmd", ...args], { cwd: ROOT, windowsHide: true })
         : spawn(NPM_CMD, args, { cwd: ROOT, windowsHide: true });
+      child.on("error", (err) => resolve({ code: -1, out: "spawn lỗi: " + err.message }));
       let out = "";
       child.stdout.on("data", (d) => (out += d));
       child.stderr.on("data", (d) => (out += d));
@@ -518,12 +540,12 @@ async function warmUpMcp(port) {
         },
         body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
         signal: AbortSignal.timeout(10000),
-      }).catch(() => {});
+      }).then((r) => r.arrayBuffer()).catch(() => {});
       await fetch(url, {
         method: "DELETE",
         headers: { "Mcp-Session-Id": sid },
         signal: AbortSignal.timeout(10000),
-      }).catch(() => {});
+      }).then((r) => r.arrayBuffer()).catch(() => {});
     }
     return true;
   } catch {
@@ -543,6 +565,8 @@ async function startServer(name) {
   await writePidFile(inst.serverPid, pid);
   const up = await waitFor(() => isPortOpen(st.port), 20000);
   if (!up) {
+    // xóa pid file stale — không để stopServer giết nhầm process sau này
+    await writePidFile(inst.serverPid, null);
     const tail = await tailFile(inst.serverLog);
     return { ok: false, error: "Server không khởi động được. Log cuối:\n" + tail.slice(-1500) };
   }
@@ -897,15 +921,17 @@ async function checkConfig(name) {
 
 /** Bundle đầy đủ trạng thái một instance (cho UI). */
 async function instanceBundle(name) {
-  const [env, config, srv, tun, chk] = await Promise.all([
+  const [env, config, srv, tun, chk, installed] = await Promise.all([
     readInstanceEnv(name),
     readInstanceConfig(name),
     serverStatus(name),
     tunnelStatus(name),
     checkConfig(name).catch((e) => ({ ok: false, items: [], error: String((e && e.message) || e) })),
+    Promise.resolve({ dist: fs.existsSync(SERVER_ENTRY), nodeModules: fs.existsSync(path.join(ROOT, "node_modules")) }),
   ]);
   return {
     name,
+    node: process.version,
     env: {
       PORT: env.PORT || "3000",
       ADMIN_PORT: env.ADMIN_PORT || "3001",
@@ -926,6 +952,7 @@ async function instanceBundle(name) {
     server: srv,
     tunnel: tun,
     check: chk,
+    installed,
   };
 }
 
@@ -1007,6 +1034,9 @@ async function deleteInstance(name) {
       await new Promise((r) => setTimeout(r, 400));
     }
   }
+  if (fs.existsSync(inst.dir)) {
+    return { ok: false, error: `Xóa instance '${name}' thất bại — thư mục vẫn tồn tại. Hãy thử lại sau khi dừng server/tunnel.` };
+  }
   return { ok: true, name };
 }
 async function renameInstance(name, body) {
@@ -1076,7 +1106,15 @@ async function saveInstanceEnv(name, body) {
       error: `Tunnel ${first.field === "OPENAI_TUNNEL_ID" ? "ID" : "API key"} '${first.value}' đã được instance '${first.instance}' dùng — mỗi workspace phải có tunnel riêng.`,
     };
   }
-  await fsp.writeFile(inst.env, next, "utf-8");
+  // Atomic write: ghi temp rồi rename (Windows rename overwrite cần unlink trước)
+  const tmp = inst.env + ".tmp";
+  await fsp.writeFile(tmp, next, "utf-8");
+  try {
+    await fsp.rename(tmp, inst.env);
+  } catch {
+    await fsp.rm(inst.env, { force: true });
+    await fsp.rename(tmp, inst.env);
+  }
   const config = await readInstanceConfig(name);
   if (hp && hp !== config.healthPort) {
     config.healthPort = hp;
@@ -1099,12 +1137,17 @@ const MIME = {
 async function readBody(req) {
   const chunks = [];
   let size = 0;
+  let tooBig = false;
   for await (const chunk of req) {
     size += chunk.length;
     if (size > 1024 * 1024) {
-      throw Object.assign(new Error("Request body quá lớn (tối đa 1MB)."), { status: 413 });
+      tooBig = true;
+      continue; // drain hết body để client không nghẽn, rồi trả 413
     }
     chunks.push(chunk);
+  }
+  if (tooBig) {
+    throw Object.assign(new Error("Request body quá lớn (tối đa 1MB)."), { status: 413 });
   }
   const text = Buffer.concat(chunks).toString("utf8");
   if (!text) return {};
@@ -1151,9 +1194,17 @@ function proxyAdmin(req, res, targetPort, pathname) {
     headers: { ...req.headers, host: `127.0.0.1:${targetPort}` },
   };
   const proxyReq = http.request(options, finish((proxyRes) => {
-    res.writeHead(proxyRes.statusCode || 502, proxyRes.headers);
+    const headers = {};
+    for (const [k, v] of Object.entries(proxyRes.headers)) {
+      // bỏ hop-by-hop headers (connection/transfer-encoding...) — không forward nguyên trạng
+      if (["connection", "transfer-encoding", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "upgrade"].includes(k.toLowerCase())) continue;
+      headers[k] = v;
+    }
+    res.writeHead(proxyRes.statusCode || 502, headers);
+    proxyRes.on("error", finish(() => res.destroy()));
     proxyRes.pipe(res);
   }));
+  req.on("error", finish(() => res.destroy()));
   proxyReq.setTimeout(30000, () => {
     proxyReq.destroy(new Error("Admin server timeout"));
   });
@@ -1161,7 +1212,7 @@ function proxyAdmin(req, res, targetPort, pathname) {
     if (!res.headersSent) {
       json(res, 502, { ok: false, error: `Admin server của instance chưa chạy (${targetPort}): ${err.message}` });
     } else {
-      res.end();
+      res.destroy();
     }
   }));
   req.pipe(proxyReq);
@@ -1175,10 +1226,28 @@ async function defaultInstanceName() {
 
 async function handleApi(req, res, url, body) {
   const p = url.pathname;
-
-  /* -------------------- multi-instance routes -------------------- */
-  // Nếu chưa có instance nào: các route instance trả lỗi rõ ràng thay vì rơi vào 404 "Not found"
-  // (app.js coi 404 = mất kết nối manager → hiểu nhầm server chết).
+  if (req.method === "GET" && p === "/api/instances") {
+    const instances = [];
+    for (const n of await listInstances()) {
+      try {
+        instances.push(await instanceBundle(n));
+      } catch (err) {
+        // một instance lỗi (vd env bị xóa) không được làm 500 toàn bộ list
+        instances.push({
+          name: n,
+          node: process.version,
+          error: String((err && err.message) || err),
+          env: {},
+          config: { connectorName: "", autoStart: true, lastTunnelUrl: "" },
+          server: { running: false, port: 0, pid: null, health: null },
+          tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
+          check: { ok: false, items: [], error: String((err && err.message) || err) },
+          installed: { dist: fs.existsSync(SERVER_ENTRY), nodeModules: fs.existsSync(path.join(ROOT, "node_modules")) },
+        });
+      }
+    }
+    return json(res, 200, { ok: true, instances });
+  }
   if (!(await listInstances()).length) {
     const noInst = {
       ok: false,
@@ -1200,11 +1269,6 @@ async function handleApi(req, res, url, body) {
     }
   }
 
-  if (req.method === "GET" && p === "/api/instances") {
-    const instances = [];
-    for (const n of await listInstances()) instances.push(await instanceBundle(n));
-    return json(res, 200, { ok: true, instances });
-  }
 
   if (req.method === "POST" && p === "/api/instances") {
     return json(res, 200, await createInstance(body));
@@ -1459,9 +1523,15 @@ async function handleApi(req, res, url, body) {
 
 function openExternal(url) {
   try {
-    if (IS_WIN) spawnSync("cmd", ["/c", "start", "", url], { windowsHide: true });
-    else if (process.platform === "darwin") spawnSync("open", [url]);
-    else spawnSync("xdg-open", [url]);
+    // Dùng spawn bất đồng bộ + unref: cmd /c start có thể treo vô hạn trong
+    // shell headless (không có desktop) — spawnSync chặn event loop (đã trace).
+    const open = (cmd, args) => {
+      const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
+      child.unref();
+    };
+    if (IS_WIN) open("cmd", ["/c", "start", "", `"${String(url).replace(/"/g, '""')}"`]);
+    else if (process.platform === "darwin") open("open", [url]);
+    else open("xdg-open", [url]);
   } catch {}
 }
 

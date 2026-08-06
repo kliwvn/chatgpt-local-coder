@@ -44,26 +44,27 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
   const shell = process.platform === "win32" ? "powershell.exe" : "bash";
   const args = process.platform === "win32" ? ["-NoProfile", "-Command", expanded] : ["-lc", expanded];
 
-  return new Promise((resolve) => {
-    const child = spawn(shell, args, { cwd: path.dirname(filePath), windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill();
-      resolve({ stdout, stderr: stderr || "hook timeout", exit_code: null });
-    }, timeoutMs);
+  const { promise, resolve } = Promise.withResolvers<{ stdout: string; stderr: string; exit_code: number | null }>();
+  const child = spawn(shell, args, { cwd: path.dirname(filePath), windowsHide: true });
+  let stdout = "";
+  let stderr = "";
+  let settled = false;
+  const settle = (fn: () => void) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    fn();
+  };
+  const timer = setTimeout(() => {
+    child.kill();
+    settle(() => resolve({ stdout, stderr: stderr || "hook timeout", exit_code: null }));
+  }, timeoutMs);
 
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code });
-    });
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve({ stdout: "", stderr: "hook spawn failed", exit_code: 1 });
-    });
-  });
+  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
+  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  child.on("close", (code) => settle(() => resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code })));
+  child.on("error", () => settle(() => resolve({ stdout: "", stderr: "hook spawn failed", exit_code: 1 })));
+  return promise;
 }
 
 export async function runPostEditHooks(filePaths: string[]): Promise<Record<string, unknown> | undefined> {
