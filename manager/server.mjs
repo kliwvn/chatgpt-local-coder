@@ -977,6 +977,7 @@ async function createInstance(body) {
 
 async function deleteInstance(name) {
   if (!INSTANCE_NAME_RE.test(name)) return { ok: false, error: "Tên không hợp lệ." };
+  if (name === "default") return { ok: false, error: "Instance 'default' là mặc định, không xóa được." };
   const inst = instPaths(name);
   try {
     await stopServer(name);
