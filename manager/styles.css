@@ -266,6 +266,8 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 }
 .inst-dots { display: flex; gap: 4px; }
 .inst-dots .status-dot { width: 8px; height: 8px; }
+.main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 24px; }
+#inst-panel-wrap { display: flex; flex-direction: column; gap: 24px; }
 .log-col {
   width: 420px;
   flex-shrink: 0;
