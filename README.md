@@ -48,7 +48,7 @@ Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/dev
 
 ## 🚀 Quick Start
 
-**Requirements:** [Node.js](https://nodejs.org) 18+, npm, Git (optional, for git tools)
+**Requirements:** [Node.js](https://nodejs.org) 22+, npm, Git (optional, for git tools)
 
 ```powershell
 git clone https://github.com/kliwvn/chatgpt-local-coder.git
