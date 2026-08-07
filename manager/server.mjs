@@ -1325,10 +1325,27 @@ async function handleApi(req, res, url, body) {
 
     if (req.method === "GET" && sub.startsWith("/log")) {
       const kind = url.searchParams.get("kind") === "tunnel" ? "tunnel" : "server";
+      const max = Math.min(
+        Math.max(parseInt(url.searchParams.get("max") || "300000", 10) || 300000, 1024),
+        1048576
+      );
+      const file = kind === "tunnel" ? inst.tunnelLog : inst.serverLog;
+      const [rawLog, st] = await Promise.all([
+        tailFile(file, max),
+        fsp.stat(file).catch(() => null),
+      ]);
+      // Tail cắt giữa chừng → bỏ phần đầu dòng dở dang (chỉ khi file lớn hơn max)
+      let log = rawLog;
+      if (st && st.size > max) {
+        const nl = log.indexOf("\n");
+        if (nl > 0) log = log.slice(nl + 1);
+      }
       return json(res, 200, {
         ok: true,
         kind,
-        log: await tailFile(kind === "tunnel" ? inst.tunnelLog : inst.serverLog),
+        log,
+        size: st ? st.size : 0,
+        mtime: st ? st.mtimeMs : 0,
       });
     }
     return json(res, 404, { ok: false, error: "Not found" });

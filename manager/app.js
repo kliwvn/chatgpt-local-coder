@@ -131,6 +131,73 @@ function renderServerTunnel(s) {
   $("mgr-version").textContent = `Manager 127.0.0.1:${location.port} • Node ${s.node}`;
 }
 
+
+/* ---------------- log viewer ---------------- */
+const LOG_MCP_RE = /\[(MCP|TOOL|AUDIT)\]|MCP ERROR/i;
+const LOG_STATE = { mode: "all", paused: false, cleared: false, lastLog: "", lastSize: 0, lastCount: 0, lastMtime: 0 };
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1048576).toFixed(1)} MB`;
+}
+
+function renderLogLines(logText) {
+  const out = [];
+  for (const line of String(logText || "").split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    const isMcp = LOG_MCP_RE.test(line);
+    if (LOG_STATE.mode === "mcp" && !isMcp) continue;
+    const e = esc(line);
+    let cls = "";
+    if (/MCP ERROR|\[err|\[error\]|\[fail\]/i.test(line)) cls = "err";
+    else if (isMcp && /\[TOOL\]/.test(line)) cls = "tool";
+    else if (isMcp) cls = "mcp";
+    else if (/\[HTTP\]/.test(line)) cls = "http";
+    out.push(cls ? `<div class="${cls}">${e}</div>` : `<div>${e}</div>`);
+  }
+  return out.join("");
+}
+
+function renderLogView() {
+  const view = $("log-view");
+  const atBottom = view.scrollHeight - view.scrollTop - view.clientHeight < 40;
+  const html = renderLogLines(LOG_STATE.lastLog);
+  view.innerHTML = html || '<div class="hint">(không có dòng phù hợp)</div>';
+  $("log-meta").textContent = LOG_STATE.lastMtime
+    ? `server.log — ${fmtBytes(LOG_STATE.lastSize)} · ${LOG_STATE.lastCount} dòng (tail) · cập nhật ${new Date(LOG_STATE.lastMtime).toLocaleTimeString("vi-VN")}${LOG_STATE.mode === "mcp" ? " · lọc: chỉ MCP/TOOL" : ""}`
+    : "";
+  if (atBottom) view.scrollTop = view.scrollHeight;
+}
+
+function setLogMode(mode) {
+  LOG_STATE.mode = mode;
+  $("log-mode-all").classList.toggle("active", mode === "all");
+  $("log-mode-mcp").classList.toggle("active", mode === "mcp");
+  renderLogView();
+}
+
+async function loadLog() {
+  if (!state.current || LOG_STATE.paused) return;
+  const name = state.current;
+  try {
+    const r = await api(instUrl(name, "/log?kind=server&max=300000"));
+    if (state.current !== name) return; // user đã chuyển instance — bỏ kết quả cũ
+    if (LOG_STATE.cleared) {
+      LOG_STATE.cleared = false;
+      LOG_STATE.lastMtime = 0;
+    }
+    LOG_STATE.lastLog = r.log || "";
+    LOG_STATE.lastSize = r.size || 0;
+    LOG_STATE.lastCount = (r.log || "").split(/\r?\n/).filter((l) => l.trim()).length;
+    if (LOG_STATE.lastMtime !== r.mtime) {
+      LOG_STATE.lastMtime = r.mtime || 0;
+      renderLogView();
+    }
+  } catch {
+    /* instance chưa có log file — giữ nguyên view */
+  }
+}
 /* ---------------- instance list / selection ---------------- */
 function shortPath(p) {
   if (!p) return "—";
@@ -215,6 +282,7 @@ async function selectInstance(name, initial) {
   $("f-connector").value = cfg.connectorName || "";
   $("f-autostart").checked = cfg.autoStart !== false;
   $("cfg-inst-name").textContent = name;
+  $("log-inst-name").textContent = name;
   $("foot-admin").href = `/admin/ui/?instance=${encodeURIComponent(name)}`;
   $("foot-admin").textContent = `Admin UI của ${name} (qua manager) ↗`;
 
@@ -238,6 +306,8 @@ async function selectInstance(name, initial) {
 
   // nút Xóa chỉ hiện với workspace không phải default (server cũng chặn)
   $("btn-del-inst").classList.toggle("hidden", name === "default");
+
+  loadLog();
 
   if (initial) setBusy(false);
 }
@@ -680,10 +750,27 @@ function init() {
     }
   });
   refreshAutostart().catch(() => {});
+
+  // log viewer controls
+  $("log-mode-all").addEventListener("click", () => setLogMode("all"));
+  $("log-mode-mcp").addEventListener("click", () => setLogMode("mcp"));
+  $("log-pause").addEventListener("click", () => {
+    LOG_STATE.paused = !LOG_STATE.paused;
+    $("log-pause").textContent = LOG_STATE.paused ? "▶" : "⏸";
+    if (!LOG_STATE.paused) loadLog();
+  });
+  $("log-clear").addEventListener("click", () => {
+    LOG_STATE.cleared = true;
+    LOG_STATE.lastMtime = 0;
+    $("log-view").textContent = "";
+    $("log-meta").textContent = "";
+  });
+
   // periodic refresh (không đụng form — chỉ sidebar + trạng thái)
   loadInstances(true);
   loadProfiles().catch(() => {});
   setInterval(() => !busy && loadInstances(false), 3000);
+  setInterval(loadLog, 2500);
 }
 
 document.addEventListener("DOMContentLoaded", init);

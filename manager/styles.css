@@ -279,3 +279,28 @@ textarea.raw { resize: vertical; line-height: 1.45; }
   .layout { flex-direction: column; }
   .sidebar { width: 100%; position: static; }
 }
+
+/* log viewer */
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg-btn {
+  background: transparent; border: none; color: var(--muted);
+  padding: 4px 12px; font-size: 12px; cursor: pointer;
+}
+.seg-btn:hover { color: var(--text); }
+.seg-btn.active { background: var(--accent); color: #fff; }
+.log-view {
+  background: #0b0e14;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: #c9d1d9;
+  font: 11px/1.55 "Cascadia Code", Consolas, monospace;
+  padding: 10px 12px;
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-view .mcp { color: #7ee787; }
+.log-view .tool { color: #79c0ff; }
+.log-view .http { color: #8b949e; }
+.log-view .err { color: #ff7b72; }
