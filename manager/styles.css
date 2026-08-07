@@ -71,8 +71,8 @@ body {
   padding: 16px 18px;
   box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
 }
-.card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: nowrap; }
-.card-head h2 { font-size: 15px; font-weight: 650; min-width: 220px; white-space: nowrap; }
+.card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; row-gap: 8px; }
+.card-head h2 { font-size: 15px; font-weight: 650; min-width: 0; white-space: nowrap; }
 .spacer { flex: 1; }
 
 .step-badge {
@@ -130,6 +130,7 @@ textarea.raw { resize: vertical; line-height: 1.45; }
   padding: 8px 14px;
   font-size: 13px;
   font-weight: 600;
+  line-height: 1;
   cursor: pointer;
   transition: transform .05s, background .15s, border-color .15s, opacity .15s;
   white-space: nowrap;
@@ -146,7 +147,7 @@ textarea.raw { resize: vertical; line-height: 1.45; }
 .btn-link:hover { color: #7cabff; }
 .btn.danger:hover:not(:disabled) { background: rgba(239, 68, 68, .15); border-color: var(--red); color: #ff9b9b; }
 /* <a> dùng class btn (vd nút Admin UI) */
-a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6px; line-height: 1; }
 
 
 /* actions */
@@ -266,8 +267,8 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 }
 .inst-dots { display: flex; gap: 4px; }
 .inst-dots .status-dot { width: 8px; height: 8px; }
-.main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 24px; }
-#inst-panel-wrap { display: flex; flex-direction: column; gap: 24px; }
+.main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+#inst-panel-wrap { display: flex; flex-direction: column; gap: 14px; }
 .log-col {
   width: 420px;
   flex-shrink: 0;
