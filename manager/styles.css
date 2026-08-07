@@ -29,13 +29,18 @@ body {
 /* header */
 .app-header {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 4px 28px 16px;
-  max-width: 900px;
-  margin: 0 auto;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 0 0 12px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--line);
 }
-.app-title { display: flex; align-items: center; gap: 14px; }
+.app-title { display: flex; align-items: center; gap: 12px; }
+.header-right { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; width: 100%; }
+.header-actions { display: flex; gap: 8px; width: 100%; }
+.header-actions .btn { flex: 1; justify-content: center; }
+
 .logo {
   display: grid; place-items: center;
   width: 44px; height: 44px;
@@ -47,8 +52,7 @@ body {
 .app-title h1 { font-size: 20px; font-weight: 700; letter-spacing: .2px; }
 .subtitle { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
 .manager-info { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
-.header-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
-.header-actions { display: flex; gap: 8px; }
+
 .conn-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; }
 .conn-dot.ok { background: var(--green); box-shadow: 0 0 8px rgba(34, 197, 94, .7); }
 .conn-dot.bad { background: var(--red); }
@@ -267,6 +271,8 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.inst-extra { color: var(--muted); font-size: 11px; display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .85; }
+.inst-access { color: var(--muted); font-size: 11px; display: block; margin-top: 2px; opacity: .9; }
 .inst-meta { color: var(--muted); font-size: 10.5px; display: block; margin-top: 2px; opacity: .8; }
 .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
 #inst-panel-wrap { display: flex; flex-direction: column; gap: 14px; }

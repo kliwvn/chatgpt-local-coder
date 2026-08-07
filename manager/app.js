@@ -234,9 +234,10 @@ async function loadInstances(initial) {
         const srv = i.server.running;
         const tun = i.tunnel.running;
         const ws = i.env.WORKSPACE_PATH || "—";
+        const extra = i.env.EXTRA_WORKSPACE_PATHS || "";
+        const access = i.env.FULL_DISK_ACCESS === "true" ? "toàn máy" : "sandbox";
         const port = i.server.port || i.env.PORT || "—";
         const active = state.current === i.name ? " active" : "";
-        const access = i.env.FULL_DISK_ACCESS === "true" ? "toàn máy" : "sandbox";
         const stateTxt = srv
           ? `<span class="status-dot ok"></span>Server chạy <span class="status-dot ok"></span>Tunnel ${tun ? "chạy" : "dừng"}`
           : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`;
@@ -245,7 +246,9 @@ async function loadInstances(initial) {
           `<div class="inst-main">` +
           `<div class="inst-top"><span class="inst-name mono">${esc(i.name)}</span><span class="inst-state">${stateTxt}</span></div>` +
           `<span class="inst-ws" title="${esc(ws)}">${esc(ws)}</span>` +
-          `<span class="inst-meta">:${esc(String(port))} · pid ${esc(String(i.server.pid || "—"))} · ${access}</span>` +
+          (extra ? `<span class="inst-extra" title="${esc(extra)}">EXTRA: ${esc(shortPath(extra))}</span>` : "") +
+          `<span class="inst-access">FULL_DISK_ACCESS: ${access}</span>` +
+          `<span class="inst-meta">:${esc(String(port))} · pid ${esc(String(i.server.pid || "—"))}</span>` +
           `</div>` +
           `</li>`
         );
