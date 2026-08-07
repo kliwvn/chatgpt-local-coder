@@ -13,8 +13,8 @@ import {
 import { appendAutoMemory, formatAutoMemoryForInstructions, loadAutoMemory } from "./auto-memory.js";
 import { formatSkillsForInstructions, loadProjectSkills } from "./skills-loader.js";
 import { getChatGptToolProfile } from "./tool-profile.js";
+import { getFullDiskAccess } from "./path-security.js";
 import { buildServerInstructions } from "./quickstart.js";
-
 export interface InstructionContextOptions {
   workspaceRoot: string;
   workspaceRoots: string[];
@@ -61,7 +61,7 @@ export async function buildInstructionContext(
   const instructionsText = buildServerInstructions(
     opts.workspaceRoot,
     opts.workspaceRoots,
-    true,
+    getFullDiskAccess(),
     projectMemoryBlock
   );
 

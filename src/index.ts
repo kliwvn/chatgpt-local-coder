@@ -9,6 +9,7 @@ import {
   setDefaultCwd,
   getDefaultCwd,
   getFullDiskAccess,
+  setWorkspaceRoots,
 } from "./lib/path-security.js";
 import {
   consumeSessionTransportError,
@@ -55,6 +56,7 @@ function resolveWorkspaceRoots(): string[] {
 const workspaceRoots = resolveWorkspaceRoots();
 const workspaceRoot = workspaceRoots[0] || process.cwd();
 setDefaultCwd(workspaceRoot);
+setWorkspaceRoots(workspaceRoots);
 
 const upstreamManager = await initUpstreamManager();
 

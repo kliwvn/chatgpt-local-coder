@@ -6,7 +6,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpServer } from "../server-factory.js";
 import { getUpstreamManager } from "./mcp-upstream-manager.js";
 import { formatLogTime } from "./activity-log.js";
-
+import { getFullDiskAccess } from "./path-security.js";
 
 const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
 const SESSION_TTL_MS = parseInt(process.env.MCP_SESSION_TTL_MS || "86400000", 10); // 24h
@@ -165,7 +165,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       config.workspaceRoot,
       config.shellTimeout,
       config.workspaceRoots,
-      true,
+      getFullDiskAccess(),
       getUpstreamManager(),
       config.projectMemoryInstructions
     );
