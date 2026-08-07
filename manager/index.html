@@ -137,6 +137,31 @@
               <option value="false">false</option>
             </select>
           </div>
+          <div class="field">
+            <label for="f-full-disk">FULL_DISK_ACCESS</label>
+            <select id="f-full-disk" class="input">
+              <option value="false">false — sandbox (chỉ trong workspace, mặc định)</option>
+              <option value="true">true — truy cập toàn máy</option>
+            </select>
+            <p class="hint">false = chặn mọi path ngoài WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS.</p>
+          </div>
+          <div class="field">
+            <label for="f-extra-ws">EXTRA_WORKSPACE_PATHS</label>
+            <div class="inline">
+              <input id="f-extra-ws" class="input grow mono" placeholder="D:\Coding\other-repo;E:\Data" spellcheck="false" />
+            </div>
+            <p class="hint">Workspace bổ sung được phép truy cập (phân cách bằng ;).</p>
+          </div>
+          <div class="field">
+            <label for="f-mem-bytes">PROJECT_MEMORY_MAX_BYTES</label>
+            <input id="f-mem-bytes" class="input mono" inputmode="numeric" placeholder="25000" />
+            <p class="hint">Giới hạn CLAUDE.md/AGENTS.md inject (mặc định ~25KB). Trống = mặc định.</p>
+          </div>
+          <div class="field">
+            <label for="f-mem-lines">PROJECT_MEMORY_MAX_LINES</label>
+            <input id="f-mem-lines" class="input mono" inputmode="numeric" placeholder="200" />
+            <p class="hint">Giới hạn số dòng project memory (mặc định 200). Trống = mặc định.</p>
+          </div>
         </div>
 
         <details class="advanced">

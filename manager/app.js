@@ -51,6 +51,10 @@ const FIELD_ENV = {
   "f-timeout": "SHELL_TIMEOUT",
   "f-recovery": "MCP_SESSION_RECOVERY",
   "f-tunnel-id": "OPENAI_TUNNEL_ID",
+  "f-full-disk": "FULL_DISK_ACCESS",
+  "f-extra-ws": "EXTRA_WORKSPACE_PATHS",
+  "f-mem-bytes": "PROJECT_MEMORY_MAX_BYTES",
+  "f-mem-lines": "PROJECT_MEMORY_MAX_LINES",
 };
 
 function collectValues() {
@@ -342,13 +346,17 @@ async function doCheck() {
   if (!state.current) return;
   setBusy(true);
   try {
-    const r = await api(curUrl("/check"), "POST");
+    const r = await api(curUrl("/check"), "POST", { values: collectValues() });
     const box = $("check-result");
     box.classList.remove("hidden");
-    box.innerHTML =
-      `<div style="font-weight:700;margin-bottom:6px;color:${r.ok ? "var(--green)" : "var(--red)"}">` +
-      (r.ok ? "✅ Cấu hình hợp lệ" : "⚠ Có mục cần sửa") + "</div>" +
-      (r.items || []).map((i) => `<div class="row-item"><span class="${i.ok ? "ok" : "bad"}">${i.ok ? "✔" : "✘"}</span><b>${esc(i.label)}:</b>&nbsp;${esc(i.detail)}</div>`).join("");
+    if (r.error) {
+      box.innerHTML = `<div style="font-weight:700;color:var(--red)">⚠ Kiểm tra gặp lỗi nội bộ</div><div class="row-item">${esc(r.error)}</div>`;
+    } else {
+      box.innerHTML =
+        `<div style="font-weight:700;margin-bottom:6px;color:${r.ok ? "var(--green)" : "var(--red)"}">` +
+        (r.ok ? "✅ Cấu hình hợp lệ" : "⚠ Có mục cần sửa") + "</div>" +
+        (r.items || []).map((i) => `<div class="row-item"><span class="${i.ok ? "ok" : "bad"}">${i.ok ? "✔" : "✘"}</span><b>${esc(i.label)}:</b>&nbsp;${esc(i.detail)}</div>`).join("");
+    }
     toast(r.ok ? "Cấu hình hợp lệ" : "Có mục chưa đạt", r.ok ? "ok" : "err");
   } catch (err) {
     toast("Kiểm tra lỗi: " + err.message, "err");

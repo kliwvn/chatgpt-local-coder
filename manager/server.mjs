@@ -868,8 +868,8 @@ async function pickFolder(initialDir = "") {
   }
 }
 
-async function checkConfig(name) {
-  const env = await readInstanceEnv(name);
+async function checkConfig(name, overrides) {
+  const env = { ...(await readInstanceEnv(name)), ...(overrides || {}) };
   const items = [];
   const push = (ok, label, detail) => items.push({ ok, label, detail });
 
@@ -893,6 +893,34 @@ async function checkConfig(name) {
 
   const profile = env.CHATGPT_TOOL_PROFILE || "slim";
   push(["slim", "full"].includes(profile), "CHATGPT_TOOL_PROFILE", profile);
+
+  // FULL_DISK_ACCESS — sandbox fail-closed
+  const fda = (env.FULL_DISK_ACCESS ?? "false").toLowerCase();
+  push(["true", "false"].includes(fda), "FULL_DISK_ACCESS", fda === "true" ? "true — truy cập toàn máy" : "false — sandbox (chỉ workspace)");
+
+  // EXTRA_WORKSPACE_PATHS — mỗi path phải tồn tại
+  const extraRaw = (env.EXTRA_WORKSPACE_PATHS || "").trim();
+  if (extraRaw) {
+    const extraPaths = extraRaw.split(";").map((s) => s.trim()).filter(Boolean);
+    const missing = [];
+    for (const p of extraPaths) {
+      const abs = path.isAbsolute(p) ? p : path.resolve(ROOT, p);
+      try {
+        if (!(await fsp.stat(abs)).isDirectory()) missing.push(p);
+      } catch {
+        missing.push(p);
+      }
+    }
+    push(missing.length === 0, "EXTRA_WORKSPACE_PATHS", missing.length ? `Không tồn tại: ${missing.join(", ")}` : `${extraPaths.length} path: ${extraPaths.join(", ")}`);
+  } else {
+    push(true, "EXTRA_WORKSPACE_PATHS", "(trống — chỉ WORKSPACE_PATH)");
+  }
+
+  // Project memory giới hạn
+  const memBytes = parseInt(env.PROJECT_MEMORY_MAX_BYTES || "", 10);
+  push(!env.PROJECT_MEMORY_MAX_BYTES || (Number.isInteger(memBytes) && memBytes > 0), "PROJECT_MEMORY_MAX_BYTES", env.PROJECT_MEMORY_MAX_BYTES ? `${env.PROJECT_MEMORY_MAX_BYTES} bytes` : "(mặc định ~25KB)");
+  const memLines = parseInt(env.PROJECT_MEMORY_MAX_LINES || "", 10);
+  push(!env.PROJECT_MEMORY_MAX_LINES || (Number.isInteger(memLines) && memLines > 0), "PROJECT_MEMORY_MAX_LINES", env.PROJECT_MEMORY_MAX_LINES ? `${env.PROJECT_MEMORY_MAX_LINES} dòng` : "(mặc định 200)");
 
   const tunnelId = env.OPENAI_TUNNEL_ID || "";
   const apiKey = env.OPENAI_TUNNEL_API_KEY || "";
@@ -939,6 +967,10 @@ async function instanceBundle(name) {
       CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
       SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
       MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
+      FULL_DISK_ACCESS: env.FULL_DISK_ACCESS ?? "false",
+      EXTRA_WORKSPACE_PATHS: env.EXTRA_WORKSPACE_PATHS || "",
+      PROJECT_MEMORY_MAX_BYTES: env.PROJECT_MEMORY_MAX_BYTES || "",
+      PROJECT_MEMORY_MAX_LINES: env.PROJECT_MEMORY_MAX_LINES || "",
       OPENAI_TUNNEL_ID: env.OPENAI_TUNNEL_ID || "",
       OPENAI_TUNNEL_API_KEY_SET: Boolean(env.OPENAI_TUNNEL_API_KEY),
       OPENAI_TUNNEL_HEALTH_PORT: String(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || "8080"),
@@ -1309,7 +1341,7 @@ async function handleApi(req, res, url, body) {
       return json(res, 200, { ok: true, config });
     }
 
-    if (req.method === "POST" && sub === "/check") return json(res, 200, await checkConfig(name));
+    if (req.method === "POST" && sub === "/check") return json(res, 200, await checkConfig(name, body && body.values));
 
     if (req.method === "POST" && sub === "/server/start") return json(res, 200, await startServer(name));
     if (req.method === "POST" && sub === "/server/stop") return json(res, 200, await stopServer(name));
@@ -1458,7 +1490,7 @@ async function handleApi(req, res, url, body) {
   }
 
   if (req.method === "POST" && p === "/api/check") {
-    return json(res, 200, await checkConfig(dname));
+    return json(res, 200, await checkConfig(dname, body && body.values));
   }
 
   if (req.method === "POST" && p === "/api/server/start") {
