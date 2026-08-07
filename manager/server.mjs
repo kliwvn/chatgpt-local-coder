@@ -68,7 +68,6 @@ const CSC_PATH = [
   "C:/Windows/Microsoft.NET/Framework/v4.0.30319/csc.exe",
 ].find(fs.existsSync) || null;
 const SERVER_ENTRY = path.join(ROOT, "dist", "index.js");
-const CONNECTOR_SETTINGS_URL = "https://chatgpt.com/settings/connectors";
 const CLOUDFLARED_DOWNLOAD_URL =
   "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
 
@@ -1485,11 +1484,6 @@ async function handleApi(req, res, url, body) {
   if (req.method === "POST" && p === "/api/pick-folder") {
     const env = await readInstanceEnv(dname);
     return json(res, 200, await pickFolder(env.WORKSPACE_PATH || ""));
-  }
-
-  if (req.method === "POST" && p === "/api/open/connector") {
-    openExternal(CONNECTOR_SETTINGS_URL);
-    return json(res, 200, { ok: true, url: CONNECTOR_SETTINGS_URL });
   }
 
   // --- Autostart manager khi đăng nhập Windows (Startup folder .lnk) ---

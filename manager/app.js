@@ -680,11 +680,18 @@ function init() {
     }
   });
 
-  $("btn-connector").addEventListener("click", async () => {
-    try {
-      await api("/api/open/connector", "POST");
-    } catch {
-      window.open("https://chatgpt.com/settings/connectors", "_blank");
+  $("btn-connector").addEventListener("click", () => {
+    // Mở thẳng từ trình duyệt (user gesture) — không phụ thuộc server session,
+    // vì cmd /c start từ manager chạy trong session khác không hiện trên desktop.
+    const url = "https://chatgpt.com/settings/connectors";
+    if (!window.open(url, "_blank", "noopener")) {
+      const a = document.createElement("a");
+      a.href = url;
+      a.target = "_blank";
+      a.rel = "noopener";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
     }
   });
 

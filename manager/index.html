@@ -16,9 +16,12 @@
       <p class="subtitle">Multi-workspace launcher — mỗi workspace một server + tunnel + connector riêng</p>
     </div>
   </div>
-  <div class="manager-info">
-    <span id="mgr-status" class="conn-dot ok"></span>
-    <span id="mgr-version">Manager 127.0.0.1:…</span>
+  <div class="header-right">
+    <button id="btn-guide" class="btn btn-ghost btn-sm">📖 Hướng Dẫn Sử Dụng</button>
+    <div class="manager-info">
+      <span id="mgr-status" class="conn-dot ok"></span>
+      <span id="mgr-version">Manager 127.0.0.1:…</span>
+    </div>
   </div>
 </header>
 
@@ -177,6 +180,7 @@
         <div class="inline" id="tunnel-extra">
           <button id="btn-tunnel-dl" class="btn btn-ghost hidden">Tải cloudflared</button>
           <button id="btn-copy-url" class="btn btn-ghost hidden">Sao chép URL</button>
+          <button id="btn-connector" class="btn btn-green">🔗 Mở trang Cài Đặt Connector</button>
         </div>
       </section>
 
@@ -198,12 +202,8 @@
       </section>
     </div>
   </div>
-
 </main>
 
-<footer class="app-footer">
-  <button id="btn-guide" class="btn btn-ghost wide">📖 Hướng Dẫn Sử Dụng ChatGPT Web</button>
-</footer>
 
 <!-- Guide modal -->
 <dialog id="guide-modal" class="modal">
@@ -216,7 +216,6 @@
       <li><b>Bắt buộc tag connector:</b> Chat mới → <b>+</b> → More → bật connector, hoặc gõ <b>@TênConnector</b> trong ô chat. Không tag → ChatGPT báo "Lỗi trong luồng tin nhắn" mà server không có log.</li>
     </ol>
     <p class="hint" id="guide-ws"></p>
-    <button id="btn-connector" class="btn btn-green wide">🔗 Mở trang Cài Đặt Connector ChatGPT</button>
     <p class="hint">Tip: sau khi restart server → Refresh connector + mở chat mới + tag lại. Không bấm "Luôn cho phép" trên popup — cấu hình quyền ở Settings → Apps.</p>
   </div>
 </dialog>

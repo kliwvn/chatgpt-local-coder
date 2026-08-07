@@ -47,6 +47,7 @@ body {
 .app-title h1 { font-size: 20px; font-weight: 700; letter-spacing: .2px; }
 .subtitle { color: var(--muted); font-size: 12.5px; margin-top: 1px; }
 .manager-info { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.header-right { display: flex; align-items: center; gap: 12px; }
 
 .conn-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--yellow); display: inline-block; }
 .conn-dot.ok { background: var(--green); box-shadow: 0 0 8px rgba(34, 197, 94, .7); }
