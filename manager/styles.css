@@ -77,7 +77,7 @@ body {
 
 .step-badge {
   display: grid; place-items: center;
-  width: 26px; height: 26px;
+  flex: 0 0 26px; width: 26px; height: 26px;
   border-radius: 50%;
   background: var(--accent);
   color: #fff; font-weight: 700; font-size: 13px;
