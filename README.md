@@ -372,6 +372,14 @@ If this saves you time, **star the repo** — it helps others find it.
 ## 🇻🇳 Tiếng Việt
 
 **ChatGPT Local Coder** biến ChatGPT web thành agent code trên máy bạn qua MCP.
+**Cách nhanh nhất:**
+```powershell
+git clone https://github.com/kliwvn/chatgpt-local-coder.git
+cd chatgpt-local-coder
+.\setup.bat                    # MỘT CHẠM: cài deps + build + autostart + mở dashboard
+```
+
+Cài thủ công từng bước:
 ```powershell
 git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
