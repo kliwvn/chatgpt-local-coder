@@ -51,7 +51,7 @@ Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/dev
 **Requirements:** [Node.js](https://nodejs.org) 18+, npm, Git (optional, for git tools)
 
 ```powershell
-git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
+git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
 copy .env.example .env          # edit WORKSPACE_PATH
 npm install
@@ -64,7 +64,7 @@ npm run build
 Muốn chạy thủ công (không dùng manager):
 
 ```powershell
-git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
+git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
 copy .env.example .env          # edit WORKSPACE_PATH
 npm install
@@ -78,7 +78,7 @@ Server runs at `http://localhost:3000` — health check: `http://localhost:3000/
 <summary><b>macOS / Linux</b></summary>
 
 ```bash
-git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
+git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
 cp .env.example .env
 npm install && npm run build
@@ -364,7 +364,7 @@ If this saves you time, **star the repo** — it helps others find it.
 
 **ChatGPT Local Coder** biến ChatGPT web thành agent code trên máy bạn qua MCP.
 ```powershell
-git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
+git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
 copy .env.example .env
 npm install && npm run build
