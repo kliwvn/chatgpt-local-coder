@@ -705,10 +705,11 @@ function init() {
       if (data.cancelled) return; // user hủy — giữ giá trị cũ
       $("f-workspace").value = data.path;
       toast("Đã chọn: " + data.path, "ok");
-      btn.disabled = false;
-      btn.textContent = old;
     } catch (err) {
       toast("Lỗi chọn folder: " + (err.message || err), "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
     }
   });
 
