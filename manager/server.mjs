@@ -556,7 +556,7 @@ async function startServer(name) {
   const st = await serverStatus(name);
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
   if (!fs.existsSync(SERVER_ENTRY)) {
-    return { ok: false, error: "dist/index.js chưa tồn tại — bấm 'Cài Đặt Lần Đầu' trước." };
+    return { ok: false, error: "dist/index.js chưa tồn tại — bấm 'Cài Đặt' trước." };
   }
   const inst = instPaths(name);
   const env = await readInstanceEnv(name);
@@ -942,7 +942,7 @@ async function checkConfig(name, overrides) {
     push(fs.existsSync(CLOUDFLARED), "Tunnel Cloudflare", fs.existsSync(CLOUDFLARED) ? "cloudflared.exe sẵn sàng" : "Chưa có cloudflared.exe — sẽ tải khi bật Tunnel");
   }
 
-  push(fs.existsSync(SERVER_ENTRY), "Build", fs.existsSync(SERVER_ENTRY) ? "dist/index.js tồn tại" : "Chưa build — bấm 'Cài Đặt Lần Đầu'");
+  push(fs.existsSync(SERVER_ENTRY), "Build", fs.existsSync(SERVER_ENTRY) ? "dist/index.js tồn tại" : "Chưa build — bấm 'Cài Đặt'");
 
   const st = await serverStatus(name);
   push(true, "Server", st.running ? `Đang chạy trên cổng ${st.port}` : `Chưa chạy (cổng ${st.port})`);
