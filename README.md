@@ -106,6 +106,7 @@ npm start
 | **Cấu hình workspace** | `WORKSPACE_PATH` + folder picker (chọn thư mục bằng dialog Windows), đổi tên, xóa, profile |
 | **Focus Server / Tunnel** | Start/stop server, nhân nuôi process/tunnel đang chạy, tunnel OpenAI ổn định (không phải cập nhật URL connector mỗi lần restart) |
 | **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear |
+| **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel (dot xanh), path đầy đủ, `WORKSPACE_PATH → EXTRA_WORKSPACE_PATHS → FULL_DISK_ACCESS`, port + PID |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Focus Tunnel |
 | **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
 
