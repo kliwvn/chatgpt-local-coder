@@ -917,10 +917,14 @@ async function checkConfig(name, overrides) {
   }
 
   // Project memory giới hạn
-  const memBytes = parseInt(env.PROJECT_MEMORY_MAX_BYTES || "", 10);
-  push(!env.PROJECT_MEMORY_MAX_BYTES || (Number.isInteger(memBytes) && memBytes > 0), "PROJECT_MEMORY_MAX_BYTES", env.PROJECT_MEMORY_MAX_BYTES ? `${env.PROJECT_MEMORY_MAX_BYTES} bytes` : "(mặc định ~25KB)");
-  const memLines = parseInt(env.PROJECT_MEMORY_MAX_LINES || "", 10);
-  push(!env.PROJECT_MEMORY_MAX_LINES || (Number.isInteger(memLines) && memLines > 0), "PROJECT_MEMORY_MAX_LINES", env.PROJECT_MEMORY_MAX_LINES ? `${env.PROJECT_MEMORY_MAX_LINES} dòng` : "(mặc định 200)");
+  const memBytesRaw = (env.PROJECT_MEMORY_MAX_BYTES || "").trim();
+  const memBytes = memBytesRaw === "" ? null : parseInt(memBytesRaw, 10);
+  const memBytesOk = memBytes === null || (Number.isInteger(memBytes) && memBytes >= 0);
+  push(memBytesOk, "PROJECT_MEMORY_MAX_BYTES", memBytes === null ? "(mặc định ~25KB)" : memBytes === 0 ? "0 — không giới hạn" : `${memBytes} bytes`);
+  const memLinesRaw = (env.PROJECT_MEMORY_MAX_LINES || "").trim();
+  const memLines = memLinesRaw === "" ? null : parseInt(memLinesRaw, 10);
+  const memLinesOk = memLines === null || (Number.isInteger(memLines) && memLines >= 0);
+  push(memLinesOk, "PROJECT_MEMORY_MAX_LINES", memLines === null ? "(mặc định 200)" : memLines === 0 ? "0 — không giới hạn" : `${memLines} dòng`);
 
   const tunnelId = env.OPENAI_TUNNEL_ID || "";
   const apiKey = env.OPENAI_TUNNEL_API_KEY || "";

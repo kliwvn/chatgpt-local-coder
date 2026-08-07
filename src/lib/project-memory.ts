@@ -16,8 +16,15 @@ const USER_MEMORY_CANDIDATES = [
 
 const RULES_GLOB_MAX = 12;
 const IMPORT_MAX_DEPTH = 4;
-const DEFAULT_MAX_BYTES = parseInt(process.env.PROJECT_MEMORY_MAX_BYTES || "25000", 10);
-const DEFAULT_MAX_LINES = parseInt(process.env.PROJECT_MEMORY_MAX_LINES || "200", 10);
+const DEFAULT_MAX_BYTES = parseLimit(process.env.PROJECT_MEMORY_MAX_BYTES, 25000);
+const DEFAULT_MAX_LINES = parseLimit(process.env.PROJECT_MEMORY_MAX_LINES, 200);
+
+/** 0 = không giới hạn; trống / không hợp lệ = fallback (mặc định). */
+function parseLimit(raw: string | undefined, fallback: number): number {
+  const n = parseInt(raw || "", 10);
+  if (n === 0) return Infinity;
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
 
 export interface ProjectMemorySection {
   path: string;
@@ -64,16 +71,17 @@ async function readTextLimited(
     let full = stripHtmlComments(buf.toString("utf-8"));
     full = await expandImportsInContent(full, path.dirname(filePath));
 
-    const lines = full.split(/\r?\n/).slice(0, maxLines);
+    const lines = Number.isFinite(maxLines) ? full.split(/\r?\n/).slice(0, maxLines) : full.split(/\r?\n/);
     const lineLimited = lines.join("\n");
     const byteLimited =
-      Buffer.byteLength(lineLimited, "utf-8") > maxBytes
+      Number.isFinite(maxBytes) && Buffer.byteLength(lineLimited, "utf-8") > maxBytes
         ? Buffer.from(lineLimited, "utf-8").subarray(0, maxBytes).toString("utf-8")
         : lineLimited;
     const truncated =
-      buf.length > maxBytes ||
-      full.split(/\r?\n/).length > maxLines ||
+      (Number.isFinite(maxBytes) && buf.length > maxBytes) ||
+      (Number.isFinite(maxLines) && full.split(/\r?\n/).length > maxLines) ||
       byteLimited.length < full.length;
+
     const trimmed = byteLimited.trim();
     if (!trimmed) return null;
     return { path: filePath, content: trimmed, truncated, kind };

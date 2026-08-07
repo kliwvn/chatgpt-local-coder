@@ -279,6 +279,7 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_SESSION_DELETE_GRACE_MS` | `45000` | Giữ session vừa ngắt 45s trước khi xóa (chống lỗi "luồng tin nhắn" khi reconnect) |
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
 | `CHECKPOINT_ENABLED` / `CHECKPOINT_MAX_FILE_BYTES` | `true` / `5242880` | Checkpoint code trước khi sửa (rewind); file > 5MB bị skip |
+| `PROJECT_MEMORY_MAX_BYTES` / `PROJECT_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn CLAUDE.md/AGENTS.md inject vào instructions. Đặt `0` = không giới hạn |
 | `MANAGER_PORT` | `3300` | Cổng manager dashboard (manager/server.mjs) |
 | `ADMIN_PORT` | `3001` | Admin GUI localhost-only (proxy qua manager) |
 
