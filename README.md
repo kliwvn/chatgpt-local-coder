@@ -16,7 +16,7 @@
 
 ---
 
-ChatGPT Local Coder is a **self-hosted MCP server** that gives ChatGPT (and any MCP client) full access to your machine — read and edit code, run `npm test`, manage git, apply unified diffs, and explore projects with `glob` / `grep`.
+ChatGPT Local Coder is a **self-hosted MCP server** that turns ChatGPT into a coding agent on your machine — read and edit code, run `npm test`, manage git, apply unified diffs, and explore projects with `glob` / `grep`. Sandboxed to your workspace by default (`FULL_DISK_ACCESS=false`).
 
 No desktop app. No vendor lock-in. Run one Node process on your PC, expose it through a tunnel, and code from ChatGPT in the browser.
 
@@ -40,7 +40,8 @@ No desktop app. No vendor lock-in. Run one Node process on your PC, expose it th
 | Run tests / builds | ❌ | ✅ `run_command`, `start_process` |
 | Git workflow | ❌ | ✅ `git_status`, `git_commit`, `git_push`, … |
 | Explore codebase | Limited | ✅ `glob`, `grep`, `list_directory` |
-| Full disk access | ❌ | ✅ Any path on your machine |
+| Disk access | Sandboxed | ✅ Workspace only (default) — `FULL_DISK_ACCESS=true` để mở toàn máy |
+| Multi-workspace | — | ✅ Manager dashboard, mỗi workspace 1 server + tunnel + connector |
 | Session recovery | — | ✅ Auto-recover after server restart |
 
 Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/developer-mode)** with optimized tool annotations (fewer permission popups) and **[OpenAI Secure MCP Tunnel](https://platform.openai.com/docs/guides/secure-mcp-tunnel)** support (stable URL, no connector re-wiring every restart).
@@ -48,6 +49,19 @@ Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/dev
 ## 🚀 Quick Start
 
 **Requirements:** [Node.js](https://nodejs.org) 18+, npm, Git (optional, for git tools)
+
+```powershell
+git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
+cd chatgpt-local-coder
+copy .env.example .env          # edit WORKSPACE_PATH
+npm install
+npm run build
+.\manager.bat                   # manager dashboard (http://127.0.0.1:3300) — chạy server + tunnel + connector cho bạn
+```
+
+> **Khuyên dùng:** mở **http://127.0.0.1:3300** — dashboard quản lý toàn bộ: install/build, cấu hình workspace, start/stop server, tunnel OpenAI, nút mở Cài Đặt Connector, log viewer, folder picker. Không cần chạy `start.ps1` + `openai-tunnel.bat` tay nữa.
+
+Muốn chạy thủ công (không dùng manager):
 
 ```powershell
 git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
@@ -72,6 +86,22 @@ npm start
 ```
 
 </details>
+
+## 🖥️ Manager Dashboard
+
+`manager.bat` mở **manager** tại `http://127.0.0.1:3300` — giao diện quản lý toàn bộ (Windows; chạy được trên mọi nền tảng bằng `node manager/server.mjs`):
+
+| Tính năng | Mô tả |
+|-----------|-------|
+| **Multi-workspace** | Mỗi workspace = 1 MCP server (PORT riêng) + 1 tunnel + 1 connector ChatGPT riêng. Workspaces lưu trong `manager/instances/` |
+| **Cài đặt lần đầu** | Kiểm tra Node/TS, `npm install` + `npm run build` một nút — đã cài thì báo "Đã cài đặt OK" |
+| **Cấu hình workspace** | `WORKSPACE_PATH` + folder picker (chọn thư mục bằng dialog Windows), đổi tên, xóa, profile |
+| **Focus Server / Tunnel** | Start/stop server, nhân nuôi process/tunnel đang chạy, tunnel OpenAI ổn định (không phải cập nhật URL connector mỗi lần restart) |
+| **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear |
+| **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Focus Tunnel |
+| **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
+
+Manager và server chạy độc lập: manager quản lý, server xử lý MCP. Tắt manager không làm chết server đang chạy.
 
 ## 🔌 Connect ChatGPT
 
@@ -220,10 +250,19 @@ Copy `.env.example` → `.env`:
 
 ```env
 PORT=3000
+MANAGER_PORT=3300
 WORKSPACE_PATH=C:\Users\You\projects\my-app
 CHATGPT_AUTO_APPROVE=true
 SHELL_TIMEOUT=120
 MCP_SESSION_RECOVERY=true
+FULL_DISK_ACCESS=false
+
+# Workspace bổ sung (phân cách bằng ; trên Windows)
+# EXTRA_WORKSPACE_PATHS=D:\Coding\other-repo
+
+# Checkpoint / rewind (Claude Code-style code undo)
+CHECKPOINT_ENABLED=true
+CHECKPOINT_MAX_FILE_BYTES=5242880
 
 # OpenAI Secure Tunnel (optional)
 OPENAI_TUNNEL_ID=
@@ -233,12 +272,18 @@ OPENAI_TUNNEL_API_KEY=
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WORKSPACE_PATH` | `cwd` | **Your project root** (like `cd` before `claude`). Auto-loads `CLAUDE.md` / `AGENTS.md` into MCP instructions |
+| `EXTRA_WORKSPACE_PATHS` | — | Thêm workspace bổ sung (`;`-separated) — server được phép truy cập tất cả các root này |
+| `FULL_DISK_ACCESS` | `false` | **Fail-closed sandbox.** `false` = chỉ truy cập trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`); `true` = mở toàn máy |
 | `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
 | `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
+| `MCP_SESSION_DELETE_GRACE_MS` | `45000` | Giữ session vừa ngắt 45s trước khi xóa (chống lỗi "luồng tin nhắn" khi reconnect) |
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
-| `FULL_DISK_ACCESS` | `true` | Access any path on the machine |
+| `CHECKPOINT_ENABLED` / `CHECKPOINT_MAX_FILE_BYTES` | `true` / `5242880` | Checkpoint code trước khi sửa (rewind); file > 5MB bị skip |
+| `MANAGER_PORT` | `3300` | Cổng manager dashboard (manager/server.mjs) |
+| `ADMIN_PORT` | `3001` | Admin GUI localhost-only (proxy qua manager) |
 
-> **Full machine access** is enabled by default. `WORKSPACE_PATH` only sets the default cwd — absolute paths like `D:\Projects\…` work everywhere.
+> **Sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → mọi tool bị chặn tại `validatePath` nếu path nằm ngoài workspace roots (đổi ổ đĩa, `..\..` escape). Muốn truy cập toàn máy: đặt `FULL_DISK_ACCESS=true` trong `.env` (instance: `manager/instances/<name>/.env`).
+
 
 ## 🏗️ Architecture
 
@@ -272,10 +317,13 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 
 ## 🔒 Security
 
-This server grants **full access to your machine** — files, shell, git. Only expose it through a tunnel you control. Never share your connector URL or tunnel API keys.
+**Fail-closed sandbox mặc định:** `FULL_DISK_ACCESS=false` → server chỉ thao tác được trong `WORKSPACE_PATH` + `EXTRA_WORKSPACE_PATHS`. Mọi path ngoài ranh giới (đổi ổ, `..\..` escape) bị chặn tại `validatePath` — kể cả khi ChatGPT yêu cầu. Bật `FULL_DISK_ACCESS=true` nghĩa là mở toàn máy — chỉ dùng khi bạn thực sự cần.
 
-- `.env` and secrets are gitignored
+- Server chỉ nghe `127.0.0.1` — không phơi ra mạng nội bộ
+- Manager + admin GUI localhost-only; CORS hẹp
+- `.env` và secrets gitignored
 - Audit log: `.mcp-audit.log` (optional, configurable)
+- Chỉ expose qua tunnel bạn kiểm soát. Không share connector URL / tunnel API key
 - Use on a trusted network / personal machine only
 
 ## 🩺 Troubleshooting
@@ -289,7 +337,8 @@ This server grants **full access to your machine** — files, shell, git. Only e
 | **Tool blocked by OpenAI safety** | Not a server bug. Retry with `run_command` (response may include `run_command_fallback`). Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
 | **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.bat`). |
-| **Access denied** | Wrong path or OS permissions on that file. |
+| **Access denied — "Path nằm ngoài workspace"** | Sandbox mặc định (`FULL_DISK_ACCESS=false`). Mở rộng `EXTRA_WORKSPACE_PATHS` hoặc bật `FULL_DISK_ACCESS=true` trong `.env` instance, restart server trong manager. |
+| **Không thấy manager / 3300** | Chạy `manager.bat` (hoặc `node manager/server.mjs`) — dashboard tại http://127.0.0.1:3300. Nếu đã có manager chạy, mở thẳng URL. |
 | **git not found** | Install [Git](https://git-scm.com). |
 
 See also [AGENTS.md](AGENTS.md) for agent onboarding and `apply_patch` format.
@@ -314,12 +363,21 @@ If this saves you time, **star the repo** — it helps others find it.
 ## 🇻🇳 Tiếng Việt
 
 **ChatGPT Local Coder** biến ChatGPT web thành agent code trên máy bạn qua MCP.
-
 ```powershell
 git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
 cd chatgpt-local-coder
 copy .env.example .env
 npm install && npm run build
+.\manager.bat                  # dashboard quản lý tại http://127.0.0.1:3300
+```
+
+Mở **http://127.0.0.1:3300**: manager tự cài đặt, cấu hình workspace (folder picker), start server + tunnel, nút mở **Cài Đặt Connector**, **log viewer** (lọc Chỉ MCP), nút **Hướng Dẫn Sử Dụng** — không cần chạy terminal tay.
+
+**Sandbox:** mặc định `FULL_DISK_ACCESS=false` — server chỉ đọc/ghi trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`). Bật `true` mới mở toàn máy.
+
+Chạy thủ công (không dùng manager):
+
+```powershell
 .\start.ps1                    # terminal 1
 .\openai-tunnel.bat            # terminal 2 (tunnel cố định)
 ```
