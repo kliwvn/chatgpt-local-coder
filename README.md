@@ -53,13 +53,21 @@ Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/dev
 ```powershell
 git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
+.\setup.bat          # TỰ ĐỘNG: cài Node deps + build + autostart + mở dashboard
+```
+
+> **`setup.bat` = một chạm duy nhất.** Kiểm tra Node 22+, tự `npm install` + `npm run build` nếu thiếu, cài autostart (Startup folder) để manager tự chạy khi đăng nhập, khởi động manager nếu chưa chạy, và **mở dashboard http://127.0.0.1:3300**. Chạy lại bất cứ lúc nào (idempotent — bỏ qua bước đã xong).
+
+Cài thủ công từng bước:
+
+```powershell
+git clone https://github.com/kliwvn/chatgpt-local-coder.git
+cd chatgpt-local-coder
 copy .env.example .env          # edit WORKSPACE_PATH
 npm install
 npm run build
 .\manager.bat                   # manager dashboard (http://127.0.0.1:3300) — chạy server + tunnel + connector cho bạn
 ```
-
-> **Khuyên dùng:** mở **http://127.0.0.1:3300** — dashboard quản lý toàn bộ: install/build, cấu hình workspace, start/stop server, tunnel OpenAI, nút mở Cài Đặt Connector, log viewer, folder picker. Không cần chạy `start.ps1` + `openai-tunnel.bat` tay nữa.
 
 Muốn chạy thủ công (không dùng manager):
 
