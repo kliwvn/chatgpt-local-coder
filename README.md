@@ -94,7 +94,7 @@ npm start
 | Tính năng | Mô tả |
 |-----------|-------|
 | **Multi-workspace** | Mỗi workspace = 1 MCP server (PORT riêng) + 1 tunnel + 1 connector ChatGPT riêng. Workspaces lưu trong `manager/instances/` |
-| **Cài đặt lần đầu** | Kiểm tra Node/TS, `npm install` + `npm run build` một nút — đã cài thì báo "Đã cài đặt OK" |
+| **Cài Đặt** | Kiểm tra Node/TS, `npm install` + `npm run build` một nút — đã cài thì báo "Trạng thái: Đã cài đặt OK" |
 | **Cấu hình workspace** | `WORKSPACE_PATH` + folder picker (chọn thư mục bằng dialog Windows), đổi tên, xóa, profile |
 | **Focus Server / Tunnel** | Start/stop server, nhân nuôi process/tunnel đang chạy, tunnel OpenAI ổn định (không phải cập nhật URL connector mỗi lần restart) |
 | **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear |
