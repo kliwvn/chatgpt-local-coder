@@ -214,24 +214,25 @@
           <button id="btn-connector" class="btn btn-green">🔗 Mở trang Cài Đặt Connector</button>
         </div>
       </section>
-
-      <!-- 5. Log -->
-      <section class="card">
-        <div class="card-head">
-          <span class="step-badge">5</span>
-          <h2>Log Server — <span id="log-inst-name" class="mono">…</span></h2>
-          <span class="spacer"></span>
-          <div class="seg" id="log-mode">
-            <button id="log-mode-all" class="seg-btn active">Tất cả</button>
-            <button id="log-mode-mcp" class="seg-btn">Chỉ MCP</button>
-          </div>
-          <button id="log-pause" class="btn btn-ghost" title="Tạm dừng / tiếp tục tự làm mới">⏸</button>
-          <button id="log-clear" class="btn btn-ghost" title="Xóa màn hình log (không xóa file)">✕</button>
-        </div>
-        <pre id="log-view" class="log-view">(chưa có log — bật Server để bắt đầu theo dõi)</pre>
-        <p class="hint" id="log-meta"></p>
-      </section>
     </div>
+  </div>
+
+  <div class="log-col">
+    <section class="card log-card">
+      <div class="card-head">
+        <span class="step-badge">5</span>
+        <h2>Log Server — <span id="log-inst-name" class="mono">…</span></h2>
+        <span class="spacer"></span>
+        <div class="seg" id="log-mode">
+          <button id="log-mode-all" class="seg-btn active">Tất cả</button>
+          <button id="log-mode-mcp" class="seg-btn">Chỉ MCP</button>
+        </div>
+        <button id="log-pause" class="btn btn-ghost" title="Tạm dừng / tiếp tục tự làm mới">⏸</button>
+        <button id="log-clear" class="btn btn-ghost" title="Xóa màn hình log (không xóa file)">✕</button>
+      </div>
+      <pre id="log-view" class="log-view">(chưa có log — bật Server để bắt đầu theo dõi)</pre>
+      <p class="hint" id="log-meta"></p>
+    </section>
   </div>
 </main>
 

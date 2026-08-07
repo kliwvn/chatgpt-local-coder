@@ -210,7 +210,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 
 /* multi-instance layout */
 .layout {
-  max-width: 1080px;
+  max-width: 1480px;
   margin: 0 auto;
   display: flex;
   gap: 14px;
@@ -266,10 +266,24 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 }
 .inst-dots { display: flex; gap: 4px; }
 .inst-dots .status-dot { width: 8px; height: 8px; }
+.log-col {
+  width: 420px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 16px;
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+}
+.log-card { display: flex; flex-direction: column; min-height: 0; height: calc(100vh - 32px); }
+.log-col .card-head h2 { min-width: 0; }
+.log-col .log-view {
+  flex: 1;
+  min-height: 0;
+  max-height: none;
+  height: auto;
+}
 .sidebar-hint { color: var(--muted); font-size: 11px; margin-top: 12px; line-height: 1.5; }
-.main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
-.btn-sm { padding: 5px 10px; font-size: 12px; }
-.card-head .btn-sm { white-space: nowrap; justify-content: center; }
 .global-tag {
   font-size: 10px;
   font-weight: 700;
@@ -283,6 +297,9 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 @media (max-width: 860px) {
   .layout { flex-direction: column; }
   .sidebar { width: 100%; position: static; }
+  .log-col { width: 100%; position: static; max-height: none; }
+  .log-card { height: auto; }
+  .log-col .log-view { max-height: 420px; flex: none; }
 }
 
 /* log viewer */
