@@ -71,8 +71,8 @@ body {
   padding: 16px 18px;
   box-shadow: 0 10px 28px rgba(0, 0, 0, .35);
 }
-.card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
-.card-head h2 { font-size: 15px; font-weight: 650; min-width: 220px; }
+.card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; flex-wrap: nowrap; }
+.card-head h2 { font-size: 15px; font-weight: 650; min-width: 220px; white-space: nowrap; }
 .spacer { flex: 1; }
 
 .step-badge {
@@ -84,7 +84,7 @@ body {
 }
 
 /* status */
-.status-label { color: var(--muted); font-size: 13px; }
+.status-label { color: var(--muted); font-size: 13px; white-space: nowrap; }
 .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--yellow); }
 .status-dot.ok { background: var(--green); box-shadow: 0 0 8px rgba(34, 197, 94, .8); }
 .status-dot.bad { background: var(--red); box-shadow: 0 0 8px rgba(239, 68, 68, .7); }
@@ -269,7 +269,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 .sidebar-hint { color: var(--muted); font-size: 11px; margin-top: 12px; line-height: 1.5; }
 .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
 .btn-sm { padding: 5px 10px; font-size: 12px; }
-.card-head .btn-sm { min-width: 150px; justify-content: center; }
+.card-head .btn-sm { white-space: nowrap; justify-content: center; }
 .global-tag {
   font-size: 10px;
   font-weight: 700;
