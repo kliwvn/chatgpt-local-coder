@@ -211,7 +211,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 
 /* multi-instance layout */
 .layout {
-  max-width: 1480px;
+  max-width: 1660px;
   margin: 0 auto;
   display: flex;
   gap: 14px;
@@ -219,7 +219,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
   padding: 0 16px 24px;
 }
 .sidebar {
-  width: 248px;
+  width: 420px;
   flex-shrink: 0;
   position: sticky;
   top: 16px;
@@ -243,30 +243,31 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 .inst-list { list-style: none; display: flex; flex-direction: column; gap: 6px; }
 .inst-item {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  align-items: flex-start;
   gap: 8px;
-  padding: 8px 10px;
-  border-radius: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
   border: 1px solid transparent;
   cursor: pointer;
   transition: background .12s, border-color .12s;
 }
 .inst-item:hover { background: #1b2233; }
 .inst-item.active { background: #1c2335; border-color: var(--accent); }
-.inst-main { min-width: 0; }
+.inst-main { min-width: 0; flex: 1; }
+.inst-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .inst-name { font-weight: 700; font-size: 13px; display: block; }
+.inst-state { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.inst-state .status-dot { width: 7px; height: 7px; }
 .inst-ws {
   color: var(--muted);
-  font-size: 11px;
+  font-size: 11.5px;
   display: block;
-  max-width: 150px;
+  margin-top: 3px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.inst-dots { display: flex; gap: 4px; }
-.inst-dots .status-dot { width: 8px; height: 8px; }
+.inst-meta { color: var(--muted); font-size: 10.5px; display: block; margin-top: 2px; opacity: .8; }
 .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
 #inst-panel-wrap { display: flex; flex-direction: column; gap: 14px; }
 .log-col {

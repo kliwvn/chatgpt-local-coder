@@ -234,17 +234,20 @@ async function loadInstances(initial) {
         const srv = i.server.running;
         const tun = i.tunnel.running;
         const ws = i.env.WORKSPACE_PATH || "—";
+        const port = i.server.port || i.env.PORT || "—";
         const active = state.current === i.name ? " active" : "";
+        const access = i.env.FULL_DISK_ACCESS === "true" ? "toàn máy" : "sandbox";
+        const stateTxt = srv
+          ? `<span class="status-dot ok"></span>Server chạy <span class="status-dot ok"></span>Tunnel ${tun ? "chạy" : "dừng"}`
+          : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`;
         return (
           `<li class="inst-item${active}" data-name="${esc(i.name)}">` +
           `<div class="inst-main">` +
-          `<span class="inst-name mono">${esc(i.name)}</span>` +
-          `<span class="inst-ws" title="${esc(ws)}">${esc(shortPath(ws))}</span>` +
+          `<div class="inst-top"><span class="inst-name mono">${esc(i.name)}</span><span class="inst-state">${stateTxt}</span></div>` +
+          `<span class="inst-ws" title="${esc(ws)}">${esc(ws)}</span>` +
+          `<span class="inst-meta">:${esc(String(port))} · pid ${esc(String(i.server.pid || "—"))} · ${access}</span>` +
           `</div>` +
-          `<span class="inst-dots">` +
-          `<span class="status-dot ${srv ? "ok" : "bad"}" title="Server ${srv ? "chạy" : "dừng"}"></span>` +
-          `<span class="status-dot ${tun ? "ok" : "bad"}" title="Tunnel ${tun ? "chạy" : "dừng"}"></span>` +
-          `</span></li>`
+          `</li>`
         );
       })
       .join("");
