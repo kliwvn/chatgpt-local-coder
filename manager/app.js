@@ -98,8 +98,16 @@ function renderServerTunnel(s) {
   setDot("server-dot", srv.running, srv.running ? "Đang chạy" : "Dừng");
   $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
   $("btn-server").disabled = busy;
+  // workspace: hiển thị WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS nếu có
+  const roots =
+    (srv.health && srv.health.instructions && srv.health.instructions.workspace_roots) ||
+    (s.env.WORKSPACE_PATH ? [s.env.WORKSPACE_PATH] : []);
+  const wsLabel =
+    roots.length > 1
+      ? `${roots[0]} (+${roots.length - 1} path mở rộng)`
+      : roots[0] || (srv.health && srv.health.defaultCwd) || "—";
   $("server-detail").textContent = srv.running
-    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${(srv.health && srv.health.defaultCwd) || s.env.WORKSPACE_PATH || "—"}`
+    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel}`
     : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
 
   // tunnel
@@ -697,17 +705,25 @@ function init() {
       if (data.cancelled) return; // user hủy — giữ giá trị cũ
       $("f-workspace").value = data.path;
       toast("Đã chọn: " + data.path, "ok");
-    } catch (err) {
-      toast("Không mở được hộp thoại chọn thư mục — gõ tay đường dẫn (VD: D:\\Coding\\my-app)", "err");
-    } finally {
       btn.disabled = false;
       btn.textContent = old;
+    } catch (err) {
+      toast("Lỗi chọn folder: " + (err.message || err), "err");
     }
   });
 
   // guide modal
   const modal = $("guide-modal");
-  $("btn-guide").addEventListener("click", () => modal.showModal());
+  $("btn-guide").addEventListener("click", () => {
+    const b = state.lastBundle;
+    const roots =
+      (b && b.server.health && b.server.health.instructions && b.server.health.instructions.workspace_roots) ||
+      (b && b.env && b.env.WORKSPACE_PATH ? [b.env.WORKSPACE_PATH] : []);
+    $("guide-ws").textContent = roots.length
+      ? `Workspace hiện tại (${state.current || "?"}): ${roots.join("  ·  ")} — ChatGPT chỉ truy cập file trong các thư mục này.`
+      : "Chưa có instance focus — chọn workspace ở sidebar trước.";
+    modal.showModal();
+  });
   $("guide-close").addEventListener("click", () => modal.close());
   modal.addEventListener("click", (e) => {
     if (e.target === modal) modal.close();

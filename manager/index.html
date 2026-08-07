@@ -157,7 +157,7 @@
           <span class="spacer"></span>
           <span id="server-status" class="status-label">Đang kiểm tra…</span>
           <span id="server-dot" class="status-dot"></span>
-          <a id="foot-admin" class="foot-link" href="#" target="_blank">Admin UI (nâng cao) ↗</a>
+          <a id="foot-admin" class="btn btn-sm" href="#" target="_blank">🛠 Admin UI (nâng cao) ↗</a>
           <button id="btn-server" class="btn btn-primary" disabled>Bật</button>
         </div>
         <p class="hint" id="server-detail"></p>
@@ -203,7 +203,6 @@
 
 <footer class="app-footer">
   <button id="btn-guide" class="btn btn-ghost wide">📖 Hướng Dẫn Sử Dụng ChatGPT Web</button>
-  <button id="btn-connector" class="btn btn-green wide">🔗 Mở trang Cài Đặt Connector ChatGPT</button>
 </footer>
 
 <!-- Guide modal -->
@@ -212,10 +211,12 @@
     <div class="modal-head"><h3>📖 Hướng dẫn kết nối ChatGPT</h3><button id="guide-close" class="btn btn-ghost">✕</button></div>
     <ol class="guide-steps">
       <li><b>Bật Developer Mode:</b> chatgpt.com → Settings → Apps &amp; Connectors → Advanced → bật <b>Developer mode</b>.</li>
-      <li><b>Server + Tunnel:</b> với từng workspace, bật <b>Focus Server</b> (mục 3) rồi <b>Focus Tunnel</b> (mục 4).</li>
+      <li><b>Server + Tunnel:</b> với từng workspace (WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS nếu có), bật <b>Focus Server</b> (mục 3) rồi <b>Focus Tunnel</b> (mục 4).</li>
       <li><b>Tạo connector:</b> Settings → Connectors → Create. Name: <b>Local Coder</b>, URL: URL tunnel (hoặc dán Tunnel ID nếu dùng OpenAI Tunnel), Authentication: None. <b>Mỗi workspace một connector riêng.</b></li>
       <li><b>Bắt buộc tag connector:</b> Chat mới → <b>+</b> → More → bật connector, hoặc gõ <b>@TênConnector</b> trong ô chat. Không tag → ChatGPT báo "Lỗi trong luồng tin nhắn" mà server không có log.</li>
     </ol>
+    <p class="hint" id="guide-ws"></p>
+    <button id="btn-connector" class="btn btn-green wide">🔗 Mở trang Cài Đặt Connector ChatGPT</button>
     <p class="hint">Tip: sau khi restart server → Refresh connector + mở chat mới + tag lại. Không bấm "Luôn cho phép" trên popup — cấu hình quyền ở Settings → Apps.</p>
   </div>
 </dialog>

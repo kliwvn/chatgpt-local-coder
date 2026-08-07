@@ -144,7 +144,9 @@ textarea.raw { resize: vertical; line-height: 1.45; }
 .btn-link { background: none; border: none; color: var(--accent); cursor: pointer; padding: 4px 6px; font-size: 12.5px; text-decoration: underline; }
 .btn-link:hover { color: #7cabff; }
 .btn.danger:hover:not(:disabled) { background: rgba(239, 68, 68, .15); border-color: var(--red); color: #ff9b9b; }
-.btn.wide { flex: 1; }
+/* <a> dùng class btn (vd nút Admin UI) */
+a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+
 
 /* actions */
 .actions { display: flex; align-items: center; gap: 12px; margin-top: 6px; flex-wrap: wrap; }
@@ -179,11 +181,12 @@ textarea.raw { resize: vertical; line-height: 1.45; }
 }
 .foot-link { color: var(--muted); font-size: 12.5px; text-decoration: none; margin-left: 4px; }
 .foot-link:hover { color: var(--accent); }
-
-/* modal */
 .modal {
   border: none; padding: 0; background: transparent; color: var(--text);
   width: min(560px, 92vw);
+  margin: auto; /* canh giữa màn hình */
+  max-height: calc(100vh - 24px);
+  overflow: auto;
 }
 .modal::backdrop { background: rgba(5, 7, 12, .72); backdrop-filter: blur(3px); }
 .modal-box { background: var(--card-2); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; box-shadow: 0 24px 60px rgba(0, 0, 0, .55); }
