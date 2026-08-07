@@ -269,6 +269,7 @@ a.btn { text-decoration: none; display: inline-flex; align-items: center; gap: 6
 .sidebar-hint { color: var(--muted); font-size: 11px; margin-top: 12px; line-height: 1.5; }
 .main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
 .btn-sm { padding: 5px 10px; font-size: 12px; }
+.card-head .btn-sm { min-width: 150px; justify-content: center; }
 .global-tag {
   font-size: 10px;
   font-weight: 700;

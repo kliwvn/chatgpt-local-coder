@@ -54,7 +54,7 @@
           <span id="install-status" class="status-label">Trạng thái: đang kiểm tra…</span>
           <span id="install-dot" class="status-dot"></span>
           <button id="btn-autostart" class="btn btn-ghost btn-sm" title="Tự chạy manager khi bạn đăng nhập Windows">⚡ Tự chạy khi đăng nhập: đang kiểm tra…</button>
-          <button id="btn-install" class="btn btn-ghost" disabled>Install_Build</button>
+          <button id="btn-install" class="btn btn-ghost btn-sm" disabled>Install_Build</button>
         </div>
         <div id="install-progress" class="progress hidden"><div class="bar"></div><pre id="install-log"></pre></div>
       </section>
@@ -64,9 +64,13 @@
         <div class="card-head">
           <span class="step-badge">2</span>
           <h2>Cấu Hình — <span id="cfg-inst-name" class="mono">…</span></h2>
+          <span class="spacer"></span>
+          <span class="status-label" id="inst-server-status">Server…</span>
+          <span class="status-dot" id="inst-server-dot"></span>
+          <span class="status-label" id="inst-tunnel-status">Tunnel…</span>
+          <span class="status-dot" id="inst-tunnel-dot"></span>
           <button id="btn-del-inst" class="btn btn-ghost danger btn-sm hidden">Xóa</button>
           <button id="btn-rename-inst" class="btn btn-ghost btn-sm">Đổi tên</button>
-          <span class="spacer"></span>
         </div>
 
         <div class="row profile-row">

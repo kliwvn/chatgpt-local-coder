@@ -100,6 +100,7 @@ function renderServerTunnel(s) {
   // server
   const srv = s.server;
   setDot("server-dot", srv.running, srv.running ? "Đang chạy" : "Dừng");
+  setDot("inst-server-dot", srv.running, srv.running ? "Server: chạy" : "Server: dừng");
   $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
   $("btn-server").disabled = busy;
   // workspace: hiển thị WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS nếu có
@@ -117,6 +118,7 @@ function renderServerTunnel(s) {
   // tunnel
   const tun = s.tunnel;
   setDot("tunnel-dot", tun.running, tun.running ? "Đang chạy" : "Dừng");
+  setDot("inst-tunnel-dot", tun.running, tun.running ? "Tunnel: chạy" : "Tunnel: dừng");
   $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
   $("btn-tunnel").disabled = busy;
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
@@ -272,6 +274,8 @@ async function loadInstances(initial) {
   } catch (err) {
     setDot("server-dot", false, "Mất kết nối manager");
     setDot("tunnel-dot", false, "Mất kết nối manager");
+    setDot("inst-server-dot", false, "Server: —");
+    setDot("inst-tunnel-dot", false, "Tunnel: —");
     $("mgr-version").textContent = "Manager không phản hồi — kiểm tra cửa sổ manager.bat";
     if (initial) setBusy(false);
     console.error(err);
