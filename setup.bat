@@ -68,13 +68,17 @@ if exist "%LNK%" (
   if exist "%LNK%" (
     echo  [OK] Da cai autostart.
   ) else (
-    echo  [LOI] Khong cai duoc autostart. Tu tao shortcut manager.bat vao Startup.
+    echo  [LOI] Khong cai duoc autostart. Tu tao shortcut vao Startup.
   )
 )
 goto :after_autostart
 
 :create_lnk
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut('%LNK%'); $s.TargetPath='%~dp0manager.bat'; $s.WorkingDirectory='%~dp0'; $s.Description='ChatGPT Local Coder Manager'; $s.Save()"
+set "VBS=%~dp0manager\state\manager-hidden.vbs"
+>  "%VBS%" echo Set sh = CreateObject("WScript.Shell")
+>> "%VBS%" echo q = Chr(34)
+>> "%VBS%" echo sh.Run "cmd.exe /c " ^& q ^& "%~dp0manager.bat" ^& q, 0, False
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut('%LNK%'); $s.TargetPath='%VBS%'; $s.WorkingDirectory='%~dp0'; $s.WindowStyle=7; $s.Description='ChatGPT Local Coder Manager (hidden)'; $s.Save()"
 exit /b 0
 
 :after_autostart
@@ -82,9 +86,9 @@ REM ---- 5. Khoi dong manager (neu chua chay) + mo dashboard ----
 echo  [..] Dang kiem tra manager tai http://127.0.0.1:3300 ...
 powershell -NoProfile -Command "try { $r = Invoke-WebRequest -Uri 'http://127.0.0.1:3300/api/health' -UseBasicParsing -TimeoutSec 3; exit 0 } catch { exit 1 }" >nul 2>nul
 if errorlevel 1 (
-  echo  [..] Manager chua chay - dang khoi dong...
-  start "" /min "%~dp0manager.bat"
-  timeout /t 3 /nobreak >nul
+  echo  [..] Manager chua chay - dang khoi dong ^(an^)...
+  start "" wscript.exe "%~dp0manager\state\manager-hidden.vbs"
+  ping -n 4 127.0.0.1 >nul
 ) else (
   echo  [OK] Manager da chay san.
 )

@@ -47,6 +47,7 @@ const INSTANCE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const IS_WIN = process.platform === "win32";
 const REPO_ROOT = ROOT; // thư mục repo (manager.bat nằm ở đây)
 const MANAGER_BAT = path.join(ROOT, "manager.bat");
+const MANAGER_HIDDEN_VBS = path.join(STATE_DIR, "manager-hidden.vbs");
 const STARTUP_LNK = IS_WIN
   ? path.join(
       process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"),
@@ -1532,14 +1533,22 @@ async function handleApi(req, res, url, body) {
       const enable = Boolean(body && body.enabled);
       if (enable) {
         if (!fs.existsSync(STARTUP_LNK)) {
-          // Tạo shortcut .lnk trỏ manager.bat (ẩn cửa sổ, chạy khi login)
+          // Tạo shortcut .lnk trỏ manager-hidden.vbs (wscript, ẩn hoàn toàn khi login)
+          // VBS tự tái tạo mỗi lần bật autostart — manager/state/ bị gitignore nên không commit file
+          const vbsBody =
+            "Set sh = CreateObject(\"WScript.Shell\")\n" +
+            "q = Chr(34)\n" +
+            'sh.Run "cmd.exe /c " & q & "' +
+            MANAGER_BAT +
+            '" & q, 0, False\n';
+          await fsp.writeFile(MANAGER_HIDDEN_VBS, vbsBody, "utf8");
           const vbs = [
             'Set ws = CreateObject("WScript.Shell")',
             'Set lnk = ws.CreateShortcut("' + STARTUP_LNK.replace(/\\/g, "\\\\") + '")',
-            'lnk.TargetPath = "' + MANAGER_BAT.replace(/\\/g, "\\\\") + '"',
+            'lnk.TargetPath = "' + MANAGER_HIDDEN_VBS.replace(/\\/g, "\\\\") + '"',
             'lnk.WorkingDirectory = "' + REPO_ROOT.replace(/\\/g, "\\\\") + '"',
             "lnk.WindowStyle = 7",
-            'lnk.Description = "ChatGPT Local Coder Manager (multi-instance)"',
+            'lnk.Description = "ChatGPT Local Coder Manager (multi-instance, hidden)"',
             "lnk.Save()",
           ].join("\n");
           const vbsPath = path.join(STATE_DIR, "make-startup-lnk.vbs");
