@@ -109,6 +109,7 @@ npm start
 | **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel (dot xanh), path đầy đủ, `WORKSPACE_PATH → EXTRA_WORKSPACE_PATHS → FULL_DISK_ACCESS`, port + PID |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Focus Tunnel |
 | **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
+| **Autostart ẩn hoàn toàn** | Tự chạy khi đăng nhập Windows qua Startup LNK → `wscript manager-hidden.vbs` → node chạy nền, **không hiện cửa sổ terminal/popup** nào. Bật/tắt trong dashboard (API `/api/autostart`) hoặc `setup.bat` |
 
 Manager và server chạy độc lập: manager quản lý, server xử lý MCP. Tắt manager không làm chết server đang chạy.
 
