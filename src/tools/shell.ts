@@ -6,6 +6,7 @@ import { requireCommandAllowed } from "../lib/permissions.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
+import { envBoundedInteger } from "../lib/env-utils.js";
 import {
   bootstrapShellSession,
   execInShellSession,
@@ -19,22 +20,155 @@ interface ManagedProcess {
   cwd: string;
   startedAt: string;
   child: ChildProcessWithoutNullStreams;
-  stdout: string[];
-  stderr: string[];
+  stdout: ManagedLogBuffer;
+  stderr: ManagedLogBuffer;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
+  finishedAt: number | null;
+  spawnError?: string;
+}
+
+interface ManagedLogBuffer {
+  chunks: string[];
+  chars: number;
 }
 
 const processes = new Map<string, ManagedProcess>();
-const MAX_LOG_CHARS = 400_000;
+const MAX_LOG_CHARS = envBoundedInteger("PROCESS_LOG_MAX_CHARS", 200_000, 4_096, 2_000_000);
+const MAX_FINISHED_PROCESSES = envBoundedInteger("PROCESS_HISTORY_MAX", 32, 1, 1_000);
+const MAX_RUNNING_PROCESSES = envBoundedInteger("PROCESS_MAX_RUNNING", 16, 1, 128);
+let managedProcessShutdownStarted = false;
 
-function appendLog(lines: string[], data: Buffer): void {
-  lines.push(data.toString());
-  let total = lines.reduce((sum, item) => sum + item.length, 0);
-  while (total > MAX_LOG_CHARS && lines.length > 1) {
-    const removed = lines.shift();
-    total -= removed?.length || 0;
+function newLogBuffer(): ManagedLogBuffer {
+  return { chunks: [], chars: 0 };
+}
+
+function appendLog(buffer: ManagedLogBuffer, data: Buffer | string): void {
+  let text = typeof data === "string" ? data : data.toString();
+  if (!text) return;
+  if (text.length >= MAX_LOG_CHARS) {
+    text = text.slice(-MAX_LOG_CHARS);
+    buffer.chunks = [text];
+    buffer.chars = text.length;
+    return;
   }
+  buffer.chunks.push(text);
+  buffer.chars += text.length;
+  while (buffer.chars > MAX_LOG_CHARS && buffer.chunks.length > 0) {
+    const excess = buffer.chars - MAX_LOG_CHARS;
+    const first = buffer.chunks[0];
+    if (first.length <= excess) {
+      buffer.chunks.shift();
+      buffer.chars -= first.length;
+      continue;
+    }
+    buffer.chunks[0] = first.slice(excess);
+    buffer.chars -= excess;
+    break;
+  }
+}
+
+function logTail(buffer: ManagedLogBuffer, maxChars: number): string {
+  if (buffer.chars <= maxChars) return buffer.chunks.join("");
+  let remaining = maxChars;
+  const out: string[] = [];
+  for (let i = buffer.chunks.length - 1; i >= 0 && remaining > 0; i--) {
+    const chunk = buffer.chunks[i];
+    if (chunk.length <= remaining) {
+      out.unshift(chunk);
+      remaining -= chunk.length;
+    } else {
+      out.unshift(chunk.slice(-remaining));
+      remaining = 0;
+    }
+  }
+  return out.join("");
+}
+
+function isRunning(item: ManagedProcess): boolean {
+  return item.finishedAt === null;
+}
+
+function pruneFinishedProcesses(): void {
+  const finished = [...processes.values()]
+    .filter((item) => !isRunning(item))
+    .sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
+  while (finished.length > MAX_FINISHED_PROCESSES) {
+    const item = finished.shift();
+    if (item) processes.delete(item.id);
+  }
+}
+
+function markFinished(item: ManagedProcess, code: number | null, signal: NodeJS.Signals | null): void {
+  if (item.finishedAt !== null) return;
+  item.exitCode = code;
+  item.signal = signal;
+  item.finishedAt = Date.now();
+  pruneFinishedProcesses();
+}
+
+async function killProcessTree(item: ManagedProcess, force = true): Promise<boolean> {
+  if (!item.child.pid || !isRunning(item)) return false;
+  try {
+    if (process.platform === "win32") {
+      const args = ["/PID", String(item.child.pid), "/T"];
+      if (force) args.push("/F");
+      const killer = spawn("taskkill", args, { windowsHide: true, stdio: "ignore" });
+      return await new Promise<boolean>((resolve) => {
+        let settled = false;
+        const finish = (value: boolean) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
+        const timer = setTimeout(() => {
+          killer.kill();
+          finish(false);
+        }, 3000);
+        timer.unref?.();
+        killer.once("error", () => finish(false));
+        killer.once("close", (code) => finish(code === 0));
+      });
+    }
+    const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
+    try {
+      process.kill(-item.child.pid, signal);
+    } catch {
+      item.child.kill(signal);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function getManagedProcessStats(): Record<string, number> {
+  let running = 0;
+  let finished = 0;
+  for (const item of processes.values()) {
+    if (isRunning(item)) running++;
+    else finished++;
+  }
+  return {
+    total: processes.size,
+    running,
+    finished,
+    max_running: MAX_RUNNING_PROCESSES,
+    max_finished: MAX_FINISHED_PROCESSES,
+    max_log_chars_per_stream: MAX_LOG_CHARS,
+  };
+}
+
+export async function shutdownManagedProcesses(): Promise<void> {
+  managedProcessShutdownStarted = true;
+  const running = [...processes.values()].filter(isRunning);
+  await Promise.allSettled(running.map((item) => killProcessTree(item, true)));
+  const deadline = Date.now() + 2000;
+  while (running.some(isRunning) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  pruneFinishedProcesses();
 }
 
 export function registerShellTools(server: McpServer, defaultCwd: string, timeoutSec: number): void {
@@ -112,11 +246,22 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       annotations: toolAnnotations("command"),
     },
     async ({ command, working_directory }) => {
+      if (managedProcessShutdownStarted) throw new Error("Gateway is shutting down; cannot start a background process");
+      pruneFinishedProcesses();
+      const runningCount = [...processes.values()].filter(isRunning).length;
+      if (runningCount >= MAX_RUNNING_PROCESSES) {
+        throw new Error(`Background process capacity reached (${runningCount}/${MAX_RUNNING_PROCESSES})`);
+      }
       requireCommandAllowed(command);
       const cwd = working_directory ? await validatePath(working_directory) : getShellStatus().cwd || defaultCwd;
       const shell = process.platform === "win32" ? "powershell.exe" : "bash";
       const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
-      const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });
+      const child = spawn(shell, args, {
+        cwd,
+        windowsHide: true,
+        env: process.env,
+        detached: process.platform !== "win32",
+      });
       const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const item: ManagedProcess = {
         id,
@@ -124,18 +269,43 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         cwd,
         startedAt: new Date().toISOString(),
         child,
-        stdout: [],
-        stderr: [],
+        stdout: newLogBuffer(),
+        stderr: newLogBuffer(),
         exitCode: null,
         signal: null,
+        finishedAt: null,
       };
       processes.set(id, item);
       child.stdout.on("data", (d: Buffer) => appendLog(item.stdout, d));
       child.stderr.on("data", (d: Buffer) => appendLog(item.stderr, d));
-      child.on("close", (code, signal) => {
-        item.exitCode = code;
-        item.signal = signal;
+      child.on("error", (err) => {
+        item.spawnError = err.message;
+        appendLog(item.stderr, `[spawn error] ${err.message}\n`);
+        if (item.finishedAt === null) markFinished(item, -1, null);
       });
+      child.on("exit", (code, signal) => {
+        markFinished(item, code, signal);
+      });
+      child.on("close", (code, signal) => {
+        markFinished(item, code, signal);
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onSpawn = () => {
+            child.off("error", onError);
+            resolve();
+          };
+          const onError = (err: Error) => {
+            child.off("spawn", onSpawn);
+            reject(err);
+          };
+          child.once("spawn", onSpawn);
+          child.once("error", onError);
+        });
+      } catch (err) {
+        processes.delete(id);
+        throw new Error(`Failed to start background process: ${err instanceof Error ? err.message : String(err)}`);
+      }
       await audit({ tool: "start_process", action: "start", target: cwd, status: "ok", details: { id, command } });
       return toolResult("start_process", { id, pid: child.pid, command, cwd, started_at: item.startedAt }, {
         summary: `started ${id}`,
@@ -161,9 +331,10 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           command: p.command,
           cwd: p.cwd,
           started_at: p.startedAt,
-          running: p.exitCode === null && p.signal === null,
+          running: isRunning(p),
           exit_code: p.exitCode,
           signal: p.signal,
+          error: p.spawnError,
         }));
       return toolResult("process_status", { processes: processes_list }, { summary: `${processes_list.length} process(es)` });
     }
@@ -186,11 +357,12 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (!item) throw new Error(`Unknown process id: ${id}`);
       const data = {
         id,
-        running: item.exitCode === null && item.signal === null,
+        running: isRunning(item),
         exit_code: item.exitCode,
         signal: item.signal,
-        stdout: item.stdout.join("").slice(-tail_chars),
-        stderr: item.stderr.join("").slice(-tail_chars),
+        error: item.spawnError,
+        stdout: logTail(item.stdout, tail_chars),
+        stderr: logTail(item.stderr, tail_chars),
       };
       return toolResult("process_output", data, { summary: `output for ${id}` });
     }
@@ -208,17 +380,12 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async ({ id, force }) => {
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
-      if (item.exitCode !== null || item.signal !== null) {
+      if (!isRunning(item)) {
         return toolResult("stop_process", { id, already_exited: true }, { summary: `${id} already exited` });
       }
-      // Giết cả process tree: child.kill() chỉ giết powershell cha, con cháu bị bỏ lại
-      if (process.platform === "win32" && item.child.pid) {
-        spawn("taskkill", ["/pid", String(item.child.pid), "/T", "/F"], { windowsHide: true });
-      } else {
-        item.child.kill(force ? "SIGKILL" : "SIGTERM");
-      }
+      const sent = await killProcessTree(item, force);
       await audit({ tool: "stop_process", action: "stop", target: item.cwd, status: "ok", details: { id, force } });
-      return toolResult("stop_process", { id, force }, { summary: `stop sent to ${id}` });
+      return toolResult("stop_process", { id, force, sent }, { summary: `stop sent to ${id}` });
     }
   );
 
@@ -234,7 +401,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async () => {
       let cleared = 0;
       for (const [id, item] of processes) {
-        if (item.exitCode !== null || item.signal !== null) {
+        if (!isRunning(item)) {
           processes.delete(id);
           cleared++;
         }

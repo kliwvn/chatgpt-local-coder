@@ -106,7 +106,7 @@ npm start
 | **Cấu hình workspace** | `WORKSPACE_PATH` + folder picker (chọn thư mục bằng dialog Windows), đổi tên, xóa, profile |
 | **Focus Server / Tunnel** | Start/stop server; **Khởi động lại Gateway** thực hiện graceful restart + xác nhận PID mới trong khi giữ Tunnel đang chạy; lifecycle server/tunnel được serialize theo workspace để tránh double-spawn/race |
 | **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear. "Tất cả" = toàn bộ server.log (MCP + TOOL + lỗi); chi tiết tool/audit đầy đủ nằm trong audit file `.mcp-audit.log` |
-| **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel (dot xanh), path đầy đủ, `WORKSPACE_PATH → EXTRA_WORKSPACE_PATHS → FULL_DISK_ACCESS`, port + PID |
+| **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel, **WORKSPACE_PATH đầy đủ**, từng `EXTRA_WORKSPACE_PATHS` trên dòng riêng (không rút gọn/ellipsis), `FULL_DISK_ACCESS`, port + PID |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Focus Tunnel |
 | **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
 | **Autostart ẩn hoàn toàn** | Tự chạy khi đăng nhập Windows qua Startup LNK → `wscript manager-hidden.vbs` → node chạy nền, **không hiện cửa sổ terminal/popup** nào. Bật/tắt trong dashboard (API `/api/autostart`) hoặc `setup.bat` |
@@ -305,6 +305,9 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_SESSION_DELETE_GRACE_MS` | `45000` | Giữ session vừa ngắt 45s trước khi xóa (chống lỗi "luồng tin nhắn" khi reconnect) |
 | `MCP_MAX_SESSIONS` | `64` | Hard cap session giữ trong RAM; evict session idle cũ nhất trước, không đụng session connected/in-flight |
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
+| `PROCESS_MAX_RUNNING` | `16` | Hard cap background process do `start_process` quản lý; ngăn process/session churn spawn vô hạn |
+| `PROCESS_HISTORY_MAX` | `32` | Số process đã kết thúc giữ trong RAM để xem status/output; process cũ tự prune |
+| `PROCESS_LOG_MAX_CHARS` | `200000` | Max ký tự giữ **mỗi stdout/stderr stream** của một background process; buffer giữ tail mới nhất |
 | `CHECKPOINT_ENABLED` / `CHECKPOINT_MAX_FILE_BYTES` | `true` / `5242880` | Checkpoint code trước khi sửa (rewind); file > 5MB bị skip |
 | `PROJECT_MEMORY_MAX_BYTES` / `PROJECT_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn CLAUDE.md/AGENTS.md inject vào instructions. Đặt `0` = không giới hạn |
 | `AUTO_MEMORY_MAX_BYTES` / `AUTO_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn recent cross-session auto-memory; `MEMORY.md` được compact atomic và ưu tiên note mới nhất thay vì tăng vô hạn |
@@ -317,6 +320,8 @@ OPENAI_TUNNEL_API_KEY=
 > **Path sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → các tool có path argument canonicalize path thật (`realpath`/nearest existing ancestor) rồi chặn `..\..`, symlink/junction và multi-file patch escape ra ngoài workspace roots. Recursive `glob`/`grep`/search không follow symlink entries. Project-controlled `CLAUDE.md`/rules imports cũng không được vượt workspace roots. **`run_command` / `start_process` là native shell và không được OS-sandbox bởi setting này**; chỉ working directory của chúng được kiểm tra. Chỉ chạy connector trên máy/code bạn tin cậy.
 
 > **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và không tự reset lịch sử chat. Server giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Các state dùng chung có tính bền vững (checkpoint index, auto-memory, shell history, `.env`/manager config) được serialize/ghi atomic để nhiều transport session chạy song song không ghi đè lẫn nhau. Initialize response vẫn mang MCP server instructions, vì vậy server chỉ gửi **một** bản instruction document (không double-wrap) và dashboard hiển thị retention policy để phát hiện churn bất thường.
+
+> **Background process lifecycle:** `start_process` dùng registry dùng chung giữa các MCP transport session. Registry giới hạn số process đang chạy, số process-history và log tail trong RAM. Khi Gateway graceful shutdown/restart, Local Coder dừng toàn bộ process tree do `start_process` tạo trước khi thoát để tránh orphan process sau restart.
 
 
 ## 🏗️ Architecture

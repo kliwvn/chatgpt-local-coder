@@ -57,6 +57,16 @@ if (since) {
   assert.ok(newer.length < all.length);
 }
 
+// limit must still apply when polling incrementally with since=<id>
+const incrementalMarker = getRecentActivity(1)[0].id;
+for (let i = 0; i < 5; i++) {
+  appendActivity({ kind: "tool", tool: "grep", status: "ok", summary: `incremental-${i}` });
+}
+const incremental = getRecentActivity(2, incrementalMarker);
+assert.equal(incremental.length, 2);
+assert.equal(incremental[0].summary, "incremental-4");
+assert.equal(incremental[1].summary, "incremental-3");
+
 // expected client-state errors should be warnings, not server errors
 logMcpRequest(
   { method: "tools/list", params: {} },

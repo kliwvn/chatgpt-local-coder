@@ -430,10 +430,12 @@ async function ensureInstances() {
   await atomicWriteFile(inst.env, legacyEnv, "utf8");
   const legacyConfig = await readConfig();
   const legacyParsed = parseDotEnv(legacyEnv);
+  const legacyHealthPortRaw = String(legacyParsed.OPENAI_TUNNEL_HEALTH_PORT || "8080").trim();
+  const legacyHealthPort = Number(legacyHealthPortRaw);
   await writeInstanceConfig("default", {
     connectorName: legacyConfig.connectorName || "",
     lastTunnelUrl: legacyConfig.lastTunnelUrl || "",
-    healthPort: parseInt(legacyParsed.OPENAI_TUNNEL_HEALTH_PORT || "8080", 10),
+    healthPort: Number.isInteger(legacyHealthPort) && legacyHealthPort > 0 && legacyHealthPort < 65536 ? legacyHealthPort : 8080,
     autoStart: true,
   });
   // Nhận nuôi process/log đang chạy (server/tunnel sống sót qua migration)
@@ -471,7 +473,7 @@ function pidsWithCmdLine(imageName, substring) {
     const out = spawnSync("powershell.exe", ps, { encoding: "utf8", windowsHide: true, timeout: 15000 }).stdout || "";
     pids = out
       .split(/\r?\n/)
-      .map((l) => parseInt(l.trim(), 10))
+      .map((l) => Number(l.trim()))
       .filter((p) => Number.isInteger(p) && p > 0);
   } catch {
     pids = [];
@@ -1078,6 +1080,9 @@ const RUNTIME_LIMIT_SPECS = [
   ["CHECKPOINT_RETENTION_DAYS", 30, 1, 3650],
   ["CHECKPOINT_MAX_FILE_BYTES", 5242880, 1024, 1073741824],
   ["AUDIT_LOG_MAX_BYTES", 10485760, 1024, 1073741824],
+  ["PROCESS_MAX_RUNNING", 16, 1, 128],
+  ["PROCESS_HISTORY_MAX", 32, 1, 1000],
+  ["PROCESS_LOG_MAX_CHARS", 200000, 4096, 2000000],
 ];
 
 /**
@@ -1725,10 +1730,9 @@ async function handleApi(req, res, url, body) {
 
     if (req.method === "GET" && sub.startsWith("/log")) {
       const kind = url.searchParams.get("kind") === "tunnel" ? "tunnel" : "server";
-      const max = Math.min(
-        Math.max(parseInt(url.searchParams.get("max") || "300000", 10) || 300000, 1024),
-        1048576
-      );
+      const maxRaw = url.searchParams.get("max");
+      const maxParsed = maxRaw === null || maxRaw.trim() === "" ? 300000 : Number(maxRaw);
+      const max = Number.isSafeInteger(maxParsed) && maxParsed >= 1024 && maxParsed <= 1048576 ? maxParsed : 300000;
       const file = kind === "tunnel" ? inst.tunnelLog : inst.serverLog;
       const st = await fsp.stat(file).catch(() => null);
       const ifSize = Number(url.searchParams.get("if_size"));

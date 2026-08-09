@@ -34,10 +34,24 @@ const setBusy = (b) => {
     const el = $(id);
     if (el) el.disabled = b;
   });
+  syncActionDisabledState();
 };
 
 /* ---------------- state ---------------- */
 const state = { instances: [], current: null, lastBundle: null, node: null };
+
+function syncActionDisabledState() {
+  const bundle = state.lastBundle;
+  const serverConflict = Boolean(bundle?.server?.portOccupied);
+  const tunnelConflict = Boolean(bundle?.tunnel?.portOccupied);
+  const serverRunning = Boolean(bundle?.server?.running);
+  const serverButton = $("btn-server");
+  const restartButton = $("btn-server-restart");
+  const tunnelButton = $("btn-tunnel");
+  if (serverButton) serverButton.disabled = busy || serverConflict;
+  if (restartButton) restartButton.disabled = busy || !serverRunning || serverConflict;
+  if (tunnelButton) tunnelButton.disabled = busy || tunnelConflict;
+}
 
 const instUrl = (name, sub) => `/api/instances/${encodeURIComponent(name)}${sub}`;
 const curUrl = (sub) => (state.current ? instUrl(state.current, sub) : null);
@@ -104,51 +118,51 @@ function renderServerTunnel(s) {
   // server
   const srv = s.server;
   const serverConflict = Boolean(srv.portOccupied);
-  setDot("server-dot", srv.running, srv.running ? "?ang ch?y" : serverConflict ? "Xung ??t c?ng" : "D?ng");
-  setDot("inst-server-dot", srv.running, srv.running ? "Server: ch?y" : serverConflict ? "Server: xung ??t c?ng" : "Server: d?ng");
-  $("btn-server").textContent = srv.running ? "T?t" : "B?t";
-  $("btn-server").disabled = busy;
+  setDot("server-dot", srv.running, srv.running ? "Đang chạy" : serverConflict ? "Xung đột cổng" : "Dừng");
+  setDot("inst-server-dot", srv.running, srv.running ? "Server: chạy" : serverConflict ? "Server: xung đột cổng" : "Server: dừng");
+  $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
+  $("btn-server").disabled = busy || serverConflict;
   $("btn-server-restart").disabled = busy || !srv.running || serverConflict;
   const roots =
     (srv.health && srv.health.instructions && srv.health.instructions.workspace_roots) ||
     (s.env.WORKSPACE_PATH ? [s.env.WORKSPACE_PATH] : []);
   const wsLabel =
     roots.length > 1
-      ? `${roots[0]} (+${roots.length - 1} path m? r?ng)`
-      : roots[0] || (srv.health && srv.health.defaultCwd) || "?";
+      ? `${roots[0]} (+${roots.length - 1} path mở rộng)`
+      : roots[0] || (srv.health && srv.health.defaultCwd) || "—";
   $("server-detail").textContent = srv.running
-    ? `PID ${srv.pid || "?"} ? c?ng ${srv.port} ? workspace: ${wsLabel} ? ${srv.health ? `${srv.health.activeSessions ?? 0} phi?n ?? ??ng k?${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} ?ang k?t n?i)` : ""}` : "health: ?"}`
+    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}`
     : serverConflict
-      ? `C?ng ${srv.port} ?ang b? process kh?c chi?m${srv.pid ? ` (PID ${srv.pid})` : ""}. ??i PORT ho?c d?ng process ?? tr??c khi b?t Local Coder.`
-      : `Server ch?a ch?y ? c?ng ${srv.port}. B?m "B?t" ?? kh?i ??ng.`;
+      ? `Cổng ${srv.port} đang bị process khác chiếm${srv.pid ? ` (PID ${srv.pid})` : ""}. Đổi PORT hoặc dừng process đó trước khi bật Local Coder.`
+      : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
 
   // tunnel
   const tun = s.tunnel;
   const tunnelConflict = Boolean(tun.portOccupied);
-  setDot("tunnel-dot", tun.running, tun.running ? "?ang ch?y" : tunnelConflict ? "Xung ??t c?ng" : "D?ng");
-  setDot("inst-tunnel-dot", tun.running, tun.running ? "Tunnel: ch?y" : tunnelConflict ? "Tunnel: xung ??t c?ng" : "Tunnel: d?ng");
-  $("btn-tunnel").textContent = tun.running ? "T?t" : "B?t";
-  $("btn-tunnel").disabled = busy;
+  setDot("tunnel-dot", tun.running, tun.running ? "Đang chạy" : tunnelConflict ? "Xung đột cổng" : "Dừng");
+  setDot("inst-tunnel-dot", tun.running, tun.running ? "Tunnel: chạy" : tunnelConflict ? "Tunnel: xung đột cổng" : "Tunnel: dừng");
+  $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
+  $("btn-tunnel").disabled = busy || tunnelConflict;
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
   if (tun.running && tun.url) {
-    $("tunnel-detail").innerHTML = `${esc(mode)} ? URL: <b class="mono">${esc(tun.url)}</b>`;
+    $("tunnel-detail").innerHTML = `${esc(mode)} • URL: <b class="mono">${esc(tun.url)}</b>`;
     $("btn-copy-url").classList.remove("hidden");
   } else if (tun.running && tun.mode === "openai") {
-    $("tunnel-detail").textContent = `${mode} ?ang ch?y (Tunnel ID: ${tun.tunnelId || "?"}) ? URL c? ??nh d?ng trong connector.`;
+    $("tunnel-detail").textContent = `${mode} đang chạy (Tunnel ID: ${tun.tunnelId || "?"}) — URL cố định dùng trong connector.`;
     $("btn-copy-url").classList.add("hidden");
   } else if (tun.running) {
-    $("tunnel-detail").textContent = `${mode} ?ang ch?y (kh?i ??ng ngo?i manager) ? t?t r?i b?t l?i ?? l?y URL.`;
+    $("tunnel-detail").textContent = `${mode} đang chạy (khởi động ngoài manager) — tắt rồi bật lại để lấy URL.`;
     $("btn-copy-url").classList.add("hidden");
   } else if (tunnelConflict) {
-    $("tunnel-detail").textContent = `Tunnel health port ${tun.healthPort} ?ang b? process kh?c chi?m. ??i OPENAI_TUNNEL_HEALTH_PORT ho?c d?ng process ??.`;
+    $("tunnel-detail").textContent = `Tunnel health port ${tun.healthPort} đang bị process khác chiếm. Đổi OPENAI_TUNNEL_HEALTH_PORT hoặc dừng process đó.`;
     $("btn-copy-url").classList.add("hidden");
   } else {
     $("tunnel-detail").textContent =
       tun.mode === "openai"
-        ? `Ch?a ch?y ? d?ng OpenAI Tunnel (ID: ${tun.tunnelId || "(thi?u)"}).`
+        ? `Chưa chạy — dùng OpenAI Tunnel (ID: ${tun.tunnelId || "(thiếu)"}).`
         : tun.cloudflaredExists
-          ? "Ch?a ch?y ? Cloudflare quick tunnel. URL ??i m?i l?n kh?i ??ng."
-          : "Ch?a c? cloudflared.exe ? b?m 'T?i cloudflared'.";
+          ? "Chưa chạy — Cloudflare quick tunnel. URL đổi mỗi lần khởi động."
+          : "Chưa có cloudflared.exe — bấm 'Tải cloudflared'.";
     $("btn-copy-url").classList.add("hidden");
   }
 
@@ -254,10 +268,11 @@ async function loadLog() {
   }
 }
 /* ---------------- instance list / selection ---------------- */
-function shortPath(p) {
-  if (!p) return "—";
-  const parts = p.split(/[\\/]/).filter(Boolean);
-  return parts.slice(-2).join("/") || p;
+function splitExtraWorkspacePaths(value) {
+  return String(value || "")
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function getInstance(name) {
@@ -278,6 +293,10 @@ async function loadInstances(initial) {
         const tun = i.tunnel.running;
         const ws = i.env.WORKSPACE_PATH || "—";
         const extra = i.env.EXTRA_WORKSPACE_PATHS || "";
+        const extraRoots = splitExtraWorkspacePaths(extra);
+        const extraHtml = extraRoots.length
+          ? `<div class="inst-extra" title="${esc(extraRoots.join("\n"))}"><span class="inst-extra-label">EXTRA:</span>${extraRoots.map((root) => `<span class="inst-extra-path mono">${esc(root)}</span>`).join("")}</div>`
+          : "";
         const access = i.env.FULL_DISK_ACCESS === "true" ? "full path" : "workspace paths";
         const port = i.server.port || i.env.PORT || "—";
         const active = state.current === i.name ? " active" : "";
@@ -289,7 +308,7 @@ async function loadInstances(initial) {
           `<div class="inst-main">` +
           `<div class="inst-top"><span class="inst-name mono">${esc(i.name)}</span><span class="inst-state">${stateTxt}</span></div>` +
           `<span class="inst-ws" title="${esc(ws)}">${esc(ws)}</span>` +
-          (extra ? `<span class="inst-extra" title="${esc(extra)}">EXTRA: ${esc(shortPath(extra))}</span>` : "") +
+          extraHtml +
           `<span class="inst-access">FULL_DISK_ACCESS: ${access}</span>` +
           `<span class="inst-meta">:${esc(String(port))} · pid ${esc(String(i.server.pid || "—"))}${srv && i.server.health ? ` · ${i.server.health.activeSessions ?? 0} đăng ký${i.server.health.connectedSessions != null ? ` · ${i.server.health.connectedSessions} kết nối` : ""}` : ""}</span>` +
           `</div>` +

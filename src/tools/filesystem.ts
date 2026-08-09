@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import { createReadStream } from "node:fs";
 import path from "path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -15,6 +16,68 @@ import { grepSearch } from "../lib/grep-search.js";
 import { atomicCopyFile, atomicWriteFile } from "../lib/atomic-write.js";
 import { withFileMutation, withFileMutations } from "../lib/file-mutation.js";
 
+const MAX_PARTIAL_TEXT_LINES = 100_000;
+const TAIL_READ_CHUNK_BYTES = 64 * 1024;
+
+async function readTextLinesFrom(
+  filePath: string,
+  startLine: number,
+  limit?: number
+): Promise<string[]> {
+  const input = createReadStream(filePath, { encoding: "utf8" });
+  const output: string[] = [];
+  let lineNumber = 0;
+  let carry = "";
+  const acceptLine = (rawLine: string): boolean => {
+    lineNumber++;
+    const line = lineNumber === 1 ? rawLine.replace(/^\uFEFF/, "") : rawLine;
+    if (lineNumber < startLine) return false;
+    output.push(line);
+    return limit !== undefined && output.length >= limit;
+  };
+  try {
+    for await (const chunk of input) {
+      carry += chunk;
+      let newline: number;
+      while ((newline = carry.indexOf("\n")) >= 0) {
+        const line = carry.slice(0, newline);
+        carry = carry.slice(newline + 1);
+        if (acceptLine(line)) return output;
+      }
+    }
+    // String.split("\n") — used by the legacy implementation — always exposes
+    // the final segment, including an empty final line after a trailing newline.
+    acceptLine(carry);
+  } finally {
+    input.destroy();
+  }
+  return output;
+}
+
+async function readTextTail(filePath: string, lineCount: number): Promise<string> {
+  const stat = await fs.stat(filePath);
+  if (stat.size === 0) return "";
+  const handle = await fs.open(filePath, "r");
+  const chunks: Buffer[] = [];
+  let position = stat.size;
+  let newlineCount = 0;
+  try {
+    while (position > 0 && newlineCount < lineCount) {
+      const size = Math.min(TAIL_READ_CHUNK_BYTES, position);
+      position -= size;
+      const buffer = Buffer.allocUnsafe(size);
+      const { bytesRead } = await handle.read(buffer, 0, size, position);
+      const chunk = buffer.subarray(0, bytesRead);
+      for (let i = 0; i < chunk.length; i++) if (chunk[i] === 0x0a) newlineCount++;
+      chunks.unshift(chunk);
+    }
+  } finally {
+    await handle.close();
+  }
+  let text = Buffer.concat(chunks).toString("utf8");
+  if (position === 0) text = text.replace(/^\uFEFF/, "");
+  return text.split("\n").slice(-lineCount).join("\n");
+}
 
 
 async function searchDirectory(
@@ -86,31 +149,28 @@ export function registerFilesystemTools(server: McpServer): void {
       inputSchema: {
         path: z.string(),
         offset: z.number().int().positive().optional().describe("1-based line number to start reading"),
-        limit: z.number().int().positive().optional().describe("Number of lines to read from offset"),
-        head: z.number().optional(),
-        tail: z.number().optional(),
+        limit: z.number().int().positive().max(MAX_PARTIAL_TEXT_LINES).optional().describe("Number of lines to read from offset"),
+        head: z.number().int().positive().max(MAX_PARTIAL_TEXT_LINES).optional(),
+        tail: z.number().int().positive().max(MAX_PARTIAL_TEXT_LINES).optional(),
       },
 
       annotations: toolAnnotations("read"),
     },
     async ({ path: filePath, offset, limit, head, tail }) => {
       const validPath = await validatePath(filePath);
-      const content = await fs.readFile(validPath, "utf-8");
-      // BOM (UTF-8) làm dòng 1 trông có ký tự lạ — bỏ đi để line numbers khớp
-      const lines = content.replace(/^\uFEFF/, "").split("\n");
 
       if (offset !== undefined) {
-        const start = Math.max(0, offset - 1);
-        const end = limit !== undefined ? start + limit : lines.length;
-        const slice = lines.slice(start, end);
-        const numbered = slice.map((line, idx) => `${String(start + idx + 1).padStart(6, " ")}|${line}`);
+        const slice = await readTextLinesFrom(validPath, offset, limit);
+        const numbered = slice.map((line, idx) => `${String(offset + idx).padStart(6, " ")}|${line}`);
         await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok", details: { offset, limit } });
         return toolResult("read_text_file", { path: validPath, content: numbered.join("\n"), offset, limit, lines: slice.length });
       }
 
-      const result =
-        head !== undefined ? lines.slice(0, head).join("\n") : tail !== undefined ? lines.slice(-tail).join("\n") : content;
-      await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok" });
+      let result: string;
+      if (head !== undefined) result = (await readTextLinesFrom(validPath, 1, head)).join("\n");
+      else if (tail !== undefined) result = await readTextTail(validPath, tail);
+      else result = await fs.readFile(validPath, "utf-8");
+      await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok", details: { head, tail } });
       return toolResult("read_text_file", { path: validPath, content: result, head, tail });
     }
   );

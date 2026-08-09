@@ -91,7 +91,7 @@ export function getRecentActivity(limit = 100, sinceId?: string): ActivityEntry[
   if (!sinceId) return [...entries].slice(-capped).reverse();
   const idx = entries.findIndex((e) => e.id === sinceId);
   if (idx < 0) return [...entries].slice(-capped).reverse();
-  return entries.slice(idx + 1).reverse();
+  return entries.slice(idx + 1).slice(-capped).reverse();
 }
 
 function writeConsole(entry: ActivityEntry): void {

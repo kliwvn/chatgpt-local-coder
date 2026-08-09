@@ -37,6 +37,9 @@ const NUMERIC_ENV_LIMITS: Record<string, [number, number]> = {
   CHECKPOINT_RETENTION_DAYS: [1, 3_650],
   CHECKPOINT_MAX_FILE_BYTES: [1_024, 1_073_741_824],
   AUDIT_LOG_MAX_BYTES: [1_024, 1_073_741_824],
+  PROCESS_MAX_RUNNING: [1, 128],
+  PROCESS_HISTORY_MAX: [1, 1_000],
+  PROCESS_LOG_MAX_CHARS: [4_096, 2_000_000],
   MCP_SESSION_TTL_MS: [15_000, 86_400_000],
   MCP_SESSION_CLEANUP_MS: [1_000, 600_000],
   MCP_SESSION_DELETE_GRACE_MS: [1_000, 600_000],
@@ -520,8 +523,15 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 
 
 
+  function queryLimit(value: unknown, fallback: number, max = 500): number {
+    const raw = typeof value === "string" ? value.trim() : "";
+    if (!raw) return fallback;
+    const parsed = Number(raw);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, max) : fallback;
+  }
+
   router.get("/api/activity", (req, res) => {
-    const limit = Math.min(parseInt(String(req.query.limit || "100"), 10) || 100, 500);
+    const limit = queryLimit(req.query.limit, 100);
     const since = typeof req.query.since === "string" ? req.query.since : undefined;
     const entries = filterActivity(getRecentActivity(limit, since), {
       kind: typeof req.query.kind === "string" ? req.query.kind : undefined,
@@ -534,7 +544,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 
   router.get("/api/activity/history", async (req, res) => {
     try {
-      const limit = Math.min(parseInt(String(req.query.limit || "80"), 10) || 80, 500);
+      const limit = queryLimit(req.query.limit, 80);
       const entries = await loadAuditHistory(limit);
       res.json({ ok: true, entries: entries.map(sanitizeActivityEntry), source: "audit_file" });
     } catch (err) {

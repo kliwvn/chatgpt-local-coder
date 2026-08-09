@@ -164,9 +164,18 @@ try {
 
   const managerHtml = await fs.readFile(path.join(process.cwd(), "manager", "index.html"), "utf8");
   const managerApp = await fs.readFile(path.join(process.cwd(), "manager", "app.js"), "utf8");
+  const managerCss = await fs.readFile(path.join(process.cwd(), "manager", "styles.css"), "utf8");
   const managerServerSource = await fs.readFile(path.join(process.cwd(), "manager", "server.mjs"), "utf8");
   assert.match(managerHtml, /id="btn-server-restart"[^>]*>[^<]*Khởi động lại Gateway/);
   assert.match(managerApp, /\/server\/restart/);
+  assert.match(managerApp, /splitExtraWorkspacePaths/);
+  assert.match(managerApp, /\.split\(";"\)/);
+  assert.match(managerApp, /inst-extra-path/);
+  assert.doesNotMatch(managerApp, /shortPath\(extra\)/, "sidebar must not collapse the whole EXTRA_WORKSPACE_PATHS string to one short path");
+  assert.match(managerApp, /Đang chạy/);
+  assert.doesNotMatch(managerApp, /\?ang ch\?y|Xung \?\?t c\?ng|Ch\?a ch\?y/, "manager status strings must stay valid UTF-8 Vietnamese");
+  assert.match(managerCss, /\.inst-extra-path\s*\{[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*normal/s);
+  assert.match(managerCss, /\.inst-ws\s*\{[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*normal/s);
   assert.match(
     managerServerSource,
     /if \(before\.running && before\.pid && started\.pid === before\.pid\) \{\s*return \{\s*\.\.\.started,\s*ok: false,\s*restarted: false,/,

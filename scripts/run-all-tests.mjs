@@ -71,6 +71,7 @@ const unitScripts = [
   "scripts/test-project-memory.mjs",
   "scripts/test-tool-profile.mjs",
   "scripts/test-shell-persist.mjs",
+  "scripts/test-shell-process-manager.mjs",
 ];
 
 console.log("\n=== Unit tests ===");
@@ -78,6 +79,16 @@ for (const script of unitScripts) {
   console.log(`\n--- ${script} ---`);
   await runNode(script);
 }
+
+console.log("\n--- scripts/test-read-text-streaming.mjs ---");
+await new Promise((resolve, reject) => {
+  const child = spawn(process.execPath, ["--expose-gc", path.join(root, "scripts/test-read-text-streaming.mjs")], {
+    cwd: root,
+    env: process.env,
+    stdio: "inherit",
+  });
+  child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`test-read-text-streaming.mjs exit ${code}`))));
+});
 
 console.log("\n=== Integration (spawn server) ===");
 const server = spawn(process.execPath, ["dist/index.js"], {
@@ -101,6 +112,9 @@ server.stderr?.on("data", (d) => (serverLog += d));
 try {
   const health = await waitFor(`http://127.0.0.1:${mcpPort}/health`);
   if (!health.instructions?.tool_profile) throw new Error("health missing instructions");
+  if (!health.managedProcesses || health.managedProcesses.max_running !== 16) {
+    throw new Error(`health missing managed process policy: ${JSON.stringify(health.managedProcesses)}`);
+  }
   console.log(`OK  health: profile=${health.instructions.tool_profile}, memory=${health.instructions.memory_files?.length ?? 0} files`);
 
   const admin = await waitFor(`http://127.0.0.1:${adminPort}/health`);

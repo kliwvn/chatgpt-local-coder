@@ -28,6 +28,7 @@ import {
 } from "./lib/instruction-context.js";
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
 import { envIntegerOrThrow } from "./lib/env-utils.js";
+import { getManagedProcessStats, shutdownManagedProcesses } from "./tools/shell.js";
 
 const PORT = envIntegerOrThrow("PORT", 3000, 1, 65_535);
 const ADMIN_PORT = envIntegerOrThrow("ADMIN_PORT", 3001, 1, 65_535);
@@ -197,6 +198,7 @@ app.get("/health", (_req, res) => {
       cleanupIntervalMs: counts.cleanupIntervalMs,
     },
     sessionRecovery: SESSION_RECOVERY,
+    managedProcesses: getManagedProcessStats(),
     mcpEndpoints: MCP_PATHS,
     instructions: summarizeInstructionContext(instructionContext),
   });
@@ -479,6 +481,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
 
   try {
     await sessionManager.shutdown();
+    await shutdownManagedProcesses();
     await upstreamManager.shutdown();
     await Promise.all([
       new Promise<void>((resolve) => adminServer.close(() => resolve())),
