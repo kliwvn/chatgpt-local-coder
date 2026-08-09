@@ -1654,7 +1654,10 @@ async function saveInstanceEnvUnlocked(name, body) {
 
   const oldPort = Number(originalValues.PORT || 0);
   const oldAdminPort = Number(originalValues.ADMIN_PORT || 0);
-  const oldHealthPort = Number(originalValues.OPENAI_TUNNEL_HEALTH_PORT || 0);
+  // An omitted health-port setting still means the runtime default (8080).
+  // Treating the old value as 0 makes every unrelated config save look like a
+  // port change while the instance's own tunnel is listening on 8080.
+  const oldHealthPort = Number(originalValues.OPENAI_TUNNEL_HEALTH_PORT || 8080);
   if (port !== oldPort && await isPortOpen(port)) return { ok: false, error: `PORT ${port} is occupied by another process.` };
   if (adminPort !== oldAdminPort && await isPortOpen(adminPort)) return { ok: false, error: `ADMIN_PORT ${adminPort} is occupied by another process.` };
   if (hp !== oldHealthPort && await isPortOpen(hp)) return { ok: false, error: `Tunnel health port ${hp} is occupied by another process.` };
