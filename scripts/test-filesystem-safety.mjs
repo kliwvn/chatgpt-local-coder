@@ -253,8 +253,9 @@ try {
       PORT: String(port),
       ADMIN_PORT: String(adminPort),
       WORKSPACE_PATH: mcpWorkspace,
+      EXTRA_WORKSPACE_PATHS: repo,
       FULL_DISK_ACCESS: "false",
-      CHATGPT_TOOL_PROFILE: "slim",
+      CHATGPT_TOOL_PROFILE: "full",
       CHECKPOINT_PATH: path.join(mcpWorkspace, ".checkpoints"),
     },
     stdio: "ignore",
@@ -303,6 +304,63 @@ try {
       });
       assert(!globEscape.text.includes("secret-link.txt"), "glob exposed an unvalidated symlink-file target");
     }
+
+    // Exercise the real EXDEV path when the test workspace and repository live
+    // on different volumes (common on the Windows deployment this project uses).
+    // On single-volume CI this still verifies normal move semantics.
+    const moveSource = path.join(mcpWorkspace, "cross-volume-source.txt");
+    const moveDestination = path.join(repo, `.cross-volume-move-test-${process.pid}-${Date.now()}.txt`);
+    await fs.writeFile(moveSource, "cross-volume-payload\n");
+    try {
+      const moveResult = await callTool(port, sessionA, 17, "move_file", {
+        source: moveSource,
+        destination: moveDestination,
+      });
+      assert(!/isError["\\]*:\s*true/i.test(moveResult.text), `move_file returned error: ${moveResult.text.slice(0, 800)}`);
+      assert((await fs.readFile(moveDestination, "utf8")) === "cross-volume-payload\n", "move_file destination content mismatch");
+      let sourceStillExists = true;
+      try {
+        await fs.access(moveSource);
+      } catch {
+        sourceStillExists = false;
+      }
+      assert(!sourceStillExists, "move_file left source behind after successful move");
+      const differentVolumes = path.parse(mcpWorkspace).root.toLowerCase() !== path.parse(repo).root.toLowerCase();
+      if (differentVolumes) {
+        assert(/cross_volume["\\]*:\s*true/i.test(moveResult.text), "cross-volume move did not report EXDEV fallback");
+      }
+    } finally {
+      await fs.rm(moveDestination, { force: true });
+    }
+
+    const moveDirSource = path.join(mcpWorkspace, "cross-volume-dir-source");
+    const moveDirDestination = path.join(repo, `.cross-volume-move-dir-test-${process.pid}-${Date.now()}`);
+    await fs.mkdir(path.join(moveDirSource, "nested"), { recursive: true });
+    await fs.writeFile(path.join(moveDirSource, "nested", "payload.txt"), "directory-payload\n");
+    try {
+      const moveDirResult = await callTool(port, sessionA, 18, "move_file", {
+        source: moveDirSource,
+        destination: moveDirDestination,
+      });
+      assert(!/isError["\\]*:\s*true/i.test(moveDirResult.text), `directory move_file returned error: ${moveDirResult.text.slice(0, 800)}`);
+      assert(
+        (await fs.readFile(path.join(moveDirDestination, "nested", "payload.txt"), "utf8")) === "directory-payload\n",
+        "cross-volume directory move content mismatch"
+      );
+      let dirSourceStillExists = true;
+      try {
+        await fs.access(moveDirSource);
+      } catch {
+        dirSourceStillExists = false;
+      }
+      assert(!dirSourceStillExists, "cross-volume directory move left source behind");
+      const differentVolumes = path.parse(mcpWorkspace).root.toLowerCase() !== path.parse(repo).root.toLowerCase();
+      if (differentVolumes) {
+        assert(/cross_volume["\\]*:\s*true/i.test(moveDirResult.text), "cross-volume directory move did not report EXDEV fallback");
+      }
+    } finally {
+      await fs.rm(moveDirDestination, { recursive: true, force: true });
+    }
   } finally {
     server.kill("SIGTERM");
     await delay(400);
@@ -311,7 +369,7 @@ try {
     }
   }
 
-  console.log("filesystem-safety: ok (junction blocked, patch escape blocked, concurrent edit merged, prefix locking parallel-safe)");
+  console.log("filesystem-safety: ok (junction/patch escapes blocked, concurrent edits serialized, prefix fairness safe, cross-volume move safe)");
 } finally {
   if (oldFullDisk === undefined) delete process.env.FULL_DISK_ACCESS;
   else process.env.FULL_DISK_ACCESS = oldFullDisk;

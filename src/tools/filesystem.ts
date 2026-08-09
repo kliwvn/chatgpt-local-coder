@@ -571,9 +571,56 @@ export function registerFilesystemTools(server: McpServer): void {
       return withFileMutations([src, dest], async () => {
         const checkpointId = await checkpointBefore("move_file", [src, dest]);
         await fs.mkdir(path.dirname(dest), { recursive: true });
-        await fs.rename(src, dest);
+        let cross_volume = false;
+        try {
+          await fs.rename(src, dest);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+          cross_volume = true;
+
+          // rename() cannot cross filesystems/volumes. Copy into a temporary
+          // sibling on the destination volume, commit it with a same-volume
+          // rename, then delete the source. If source deletion fails, remove the
+          // committed destination to preserve move semantics instead of silently
+          // leaving two divergent copies.
+          try {
+            await fs.lstat(dest);
+            throw Object.assign(new Error("Destination already exists; refusing cross-volume move overwrite"), { code: "EEXIST" });
+          } catch (destErr) {
+            if ((destErr as NodeJS.ErrnoException).code !== "ENOENT") throw destErr;
+          }
+
+          const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+          const tempDest = `${dest}.move-tmp-${token}`;
+          try {
+            const stat = await fs.stat(src);
+            await fs.cp(src, tempDest, {
+              recursive: stat.isDirectory(),
+              force: false,
+              errorOnExist: true,
+              preserveTimestamps: true,
+            });
+            await fs.rename(tempDest, dest);
+            try {
+              await fs.rm(src, { recursive: stat.isDirectory(), force: false });
+            } catch (deleteErr) {
+              try {
+                await fs.rm(dest, { recursive: stat.isDirectory(), force: true });
+              } catch (rollbackErr) {
+                throw new Error(
+                  `Cross-volume move copied destination but could not delete source or roll back destination. ` +
+                    `source delete: ${deleteErr instanceof Error ? deleteErr.message : String(deleteErr)}; ` +
+                    `destination rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`
+                );
+              }
+              throw deleteErr;
+            }
+          } finally {
+            await fs.rm(tempDest, { recursive: true, force: true }).catch(() => undefined);
+          }
+        }
         await audit({ tool: "move_file", action: "move", target: dest, status: "ok", details: { source: src } });
-        return toolResult("move_file", { source: src, destination: dest, checkpoint_id: checkpointId });
+        return toolResult("move_file", { source: src, destination: dest, cross_volume, checkpoint_id: checkpointId });
       });
     }
   );
