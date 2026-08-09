@@ -180,7 +180,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         "Run shell commands to verify work (tests, build, lint). Cwd persists across ChatGPT tool calls (saved to disk). Use shell_status to check cwd. Use start_process for long jobs.",
       inputSchema: {
         command: z.string(),
-        working_directory: z.string().optional().describe("One-off override; does not reset persistent cwd unless you use shell_reset"),
+        working_directory: z.string().optional().describe("One-off isolated cwd; does not mutate or enter persistent shell cwd/history"),
       },
 
       annotations: toolAnnotations("command"),

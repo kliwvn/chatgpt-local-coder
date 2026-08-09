@@ -59,17 +59,47 @@ try {
 
   const srcDir = path.join(root, "src");
   resetShellSession(root);
+  if (getShellStatus().recent_commands.length !== 0) throw new Error("shell_reset did not clear history");
+  const beforeOneOffHistory = [...getShellStatus().recent_commands];
   const oneOff = await execInShellSession(
-    process.platform === "win32" ? "Write-Output oneoff" : "printf oneoff",
+    process.platform === "win32"
+      ? `cd "${srcDir}"; $env:OPENAI_API_KEY='sk-oneoff-secret'; Write-Output oneoff`
+      : `cd "${srcDir}"; OPENAI_API_KEY='sk-oneoff-secret' printf oneoff`,
     root,
     5000,
     srcDir
   );
   if (path.resolve(oneOff.cwd) !== path.resolve(srcDir)) throw new Error(`one-off cwd not used: ${oneOff.cwd}`);
-  if (path.resolve(getShellStatus().cwd) !== path.resolve(root)) {
-    throw new Error(`one-off workingDirectory contaminated persistent cwd: ${getShellStatus().cwd}`);
+  const afterOneOff = getShellStatus();
+  if (path.resolve(afterOneOff.cwd) !== path.resolve(root)) {
+    throw new Error(`one-off workingDirectory contaminated persistent cwd: ${afterOneOff.cwd}`);
   }
-  ok("workingDirectory is one-off and does not contaminate persistent cwd");
+  if (JSON.stringify(afterOneOff.recent_commands) !== JSON.stringify(beforeOneOffHistory)) {
+    throw new Error("one-off workingDirectory contaminated persistent command history");
+  }
+  if (JSON.stringify(afterOneOff).includes("sk-oneoff-secret")) {
+    throw new Error("shell_status leaked a secret from one-off command history");
+  }
+  ok("workingDirectory is isolated from persistent cwd/history");
+
+  // Default-shell history remains useful, but shell_status must never expose
+  // credential-like values stored in persistent command history.
+  await execInShellSession(
+    process.platform === "win32"
+      ? "$env:OPENAI_API_KEY='sk-default-secret'; Write-Output persistent"
+      : "OPENAI_API_KEY='sk-default-secret' printf persistent",
+    root,
+    5000
+  );
+  const redactedStatus = getShellStatus();
+  if (JSON.stringify(redactedStatus).includes("sk-default-secret")) {
+    throw new Error("shell_status leaked a secret from persistent command history");
+  }
+  if (!JSON.stringify(redactedStatus.recent_commands).includes("********")) {
+    throw new Error("shell_status did not redact persistent command history");
+  }
+  resetShellSession(root);
+  ok("shell_status redacts default-shell command secrets");
 
   // Explicit cwd directives DO mutate the shared persistent cwd, but child
   // execution remains parallel. A newer cwd mutation wins even if the older

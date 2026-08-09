@@ -1,6 +1,7 @@
 import { spawn } from "child_process";
 import path from "path";
 import { appendBoundedTail, SHELL_OUTPUT_MAX_CHARS } from "./output-budget.js";
+import { redactSensitiveText } from "./redaction.js";
 
 export interface ShellExecResult {
   command: string;
@@ -82,6 +83,7 @@ export function getShellCwd(): string {
 export function resetShellSession(cwd: string): void {
   sessionCwd = path.resolve(cwd);
   sessionInitializedAt = new Date().toISOString();
+  history.length = 0;
   scheduleShellSnapshot();
 }
 
@@ -106,7 +108,8 @@ export function getShellStatus() {
     active: sessionCwd !== null,
     cwd: sessionCwd,
     started_at: sessionInitializedAt,
-    recent_commands: [...history].slice(-10),
+    recent_commands: [...history].slice(-10).map((command) => redactSensitiveText(command)),
+    history_scope: "default_shell_only",
   };
 }
 
@@ -247,16 +250,22 @@ export async function execInShellSession(
 ): Promise<ShellExecResult> {
   if (!sessionCwd) initShellSession(defaultCwd);
 
-  const baseCwd = workingDirectory ? path.resolve(workingDirectory) : sessionCwd!;
+  const isolated = Boolean(workingDirectory);
+  const baseCwd = isolated ? path.resolve(workingDirectory!) : sessionCwd!;
   const { cwd, command: effective, changed } = applyCwdDirectives(baseCwd, command);
-  // Explicit workingDirectory is intentionally one-off. Only an explicit cwd
-  // directive mutates process-wide persistent cwd. Apply that mutation before
-  // spawn so the newest invocation wins regardless of completion order.
-  if (changed) sessionCwd = cwd;
 
-  history.push(effective);
-  if (history.length > MAX_HISTORY) history.shift();
-  scheduleShellSnapshot();
+  // An explicit workingDirectory is a fully isolated one-off invocation: cwd
+  // directives inside it affect only that child process, and its command/history
+  // never enters the process-wide default shell state. This prevents concurrent
+  // agents/workspaces sharing one Gateway from contaminating each other's shell
+  // cwd/history. Calls without workingDirectory retain the legacy persistent-shell
+  // behavior for interactive use.
+  if (!isolated) {
+    if (changed) sessionCwd = cwd;
+    history.push(effective);
+    if (history.length > MAX_HISTORY) history.shift();
+    scheduleShellSnapshot();
+  }
 
   const result = await runOnce(effective, cwd, timeoutMs);
   return result;
