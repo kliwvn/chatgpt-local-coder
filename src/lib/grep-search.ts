@@ -1,6 +1,8 @@
 import fs from "fs/promises";
 import path from "path";
 import { READ_TEXT_MAX_BYTES } from "./output-budget.js";
+import { readUtf8FileBounded } from "./bounded-file.js";
+import { globToRegExp, matchesCompiledGlob } from "./glob-match.js";
 
 export type GrepOutputMode = "content" | "files_with_matches" | "count";
 
@@ -17,20 +19,12 @@ interface GrepOptions {
   contextAround?: number;
 }
 
-function globToRegExp(pattern: string): RegExp {
-  const escaped = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, ".*")
-    .replace(/\?/g, ".");
-  return new RegExp(`^${escaped}$`, "i");
-}
-
 function shouldSkipDir(name: string): boolean {
   return name === "node_modules" || name === ".git";
 }
 
 function buildRegex(pattern: string, caseInsensitive: boolean, multiline: boolean): RegExp {
-  const flags = `${caseInsensitive ? "i" : ""}${multiline ? "m" : ""}`;
+  const flags = `${caseInsensitive ? "i" : ""}${multiline ? "gm" : ""}`;
   return new RegExp(pattern, flags || undefined);
 }
 
@@ -51,11 +45,60 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
   const before = contextAround || contextBefore;
   const after = contextAround || contextAfter;
   const regex = buildRegex(pattern, caseInsensitive, multiline);
-  const globMatcher = globToRegExp(glob);
-
   const fileMatches = new Map<string, number>();
   const contentLines: string[] = [];
   let totalMatches = 0;
+  const globMatcher = globToRegExp(glob);
+
+  async function processFile(fullPath: string, relativePath: string, basename: string): Promise<void> {
+    if (!matchesCompiledGlob(globMatcher, relativePath, basename)) return;
+
+    let text: string;
+    try {
+      const stat = await fs.stat(fullPath);
+      if (!stat.isFile() || stat.size > READ_TEXT_MAX_BYTES) return;
+      text = await readUtf8FileBounded(fullPath, READ_TEXT_MAX_BYTES, "grep file");
+    } catch {
+      return;
+    }
+
+    if (multiline) {
+      // multiline regex carries `g`, so count reflects every match in a file.
+      const matches = text.match(regex);
+      const count = matches?.length || 0;
+      if (count > 0) {
+        totalMatches += count;
+        fileMatches.set(fullPath, (fileMatches.get(fullPath) || 0) + count);
+        if (outputMode === "content") {
+          contentLines.push(`${fullPath}: [multiline match x${count}]`);
+        }
+      }
+      return;
+    }
+
+    const lines = text.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (!regex.test(lines[i])) continue;
+
+      totalMatches++;
+      fileMatches.set(fullPath, (fileMatches.get(fullPath) || 0) + 1);
+
+      if (outputMode === "content") {
+        if (contentLines.length >= headLimit) break;
+        if (before > 0 || after > 0) {
+          const start = Math.max(0, i - before);
+          const end = Math.min(lines.length - 1, i + after);
+          for (let j = start; j <= end; j++) {
+            const prefix = j === i ? ":" : "-";
+            contentLines.push(`${fullPath}${prefix}${j + 1}: ${lines[j]}`);
+            if (contentLines.length >= headLimit) break;
+          }
+        } else {
+          contentLines.push(`${fullPath}:${i + 1}: ${lines[i].trim()}`);
+        }
+      }
+    }
+  }
 
   async function walk(dir: string): Promise<void> {
     if (
@@ -63,79 +106,49 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
       (outputMode !== "content" && fileMatches.size >= headLimit)
     ) return;
 
-    let entries;
+    let handle;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      handle = await fs.opendir(dir);
     } catch {
       return;
     }
+    try {
+      for await (const entry of handle) {
+        if (
+          (outputMode === "content" && contentLines.length >= headLimit) ||
+          (outputMode !== "content" && fileMatches.size >= headLimit)
+        ) break;
+        // Do not read through a symlink/reparse point discovered during recursive
+        // traversal; explicit file reads are canonicalized by validatePath instead.
+        if (entry.isSymbolicLink()) continue;
 
-    for (const entry of entries) {
-      if (
-        (outputMode === "content" && contentLines.length >= headLimit) ||
-        (outputMode !== "content" && fileMatches.size >= headLimit)
-      ) break;
-      if (entry.name.startsWith(".") && entry.name !== ".") continue;
-      // Do not read through a symlink/reparse point discovered during recursive
-      // traversal; explicit file reads are canonicalized by validatePath instead.
-      if (entry.isSymbolicLink()) continue;
-
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (!shouldSkipDir(entry.name)) await walk(fullPath);
-        continue;
-      }
-
-      if (!globMatcher.test(entry.name)) continue;
-
-      let text: string;
-      try {
-        const stat = await fs.stat(fullPath);
-        if (!stat.isFile() || stat.size > READ_TEXT_MAX_BYTES) continue;
-        text = await fs.readFile(fullPath, "utf-8");
-      } catch {
-        continue;
-      }
-
-      if (multiline) {
-        const matches = text.match(regex);
-        const count = matches?.length || 0;
-        if (count > 0) {
-          totalMatches += count;
-          fileMatches.set(fullPath, (fileMatches.get(fullPath) || 0) + count);
-          if (outputMode === "content") {
-            contentLines.push(`${fullPath}: [multiline match x${count}]`);
-          }
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!shouldSkipDir(entry.name)) await walk(fullPath);
+          continue;
         }
-        continue;
+
+        const rel = path.relative(searchRoot, fullPath).replace(/\\/g, "/");
+        await processFile(fullPath, rel, entry.name);
       }
-
-      const lines = text.split("\n");
-      for (let i = 0; i < lines.length; i++) {
-        if (!regex.test(lines[i])) continue;
-
-        totalMatches++;
-        fileMatches.set(fullPath, (fileMatches.get(fullPath) || 0) + 1);
-
-        if (outputMode === "content") {
-          if (contentLines.length >= headLimit) break;
-          if (before > 0 || after > 0) {
-            const start = Math.max(0, i - before);
-            const end = Math.min(lines.length - 1, i + after);
-            for (let j = start; j <= end; j++) {
-              const prefix = j === i ? ":" : "-";
-              contentLines.push(`${fullPath}${prefix}${j + 1}: ${lines[j]}`);
-              if (contentLines.length >= headLimit) break;
-            }
-          } else {
-            contentLines.push(`${fullPath}:${i + 1}: ${lines[i].trim()}`);
-          }
-        }
-      }
+    } finally {
+      await handle.close().catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ERR_DIR_CLOSED") throw err;
+      });
     }
   }
 
-  await walk(searchRoot);
+  try {
+    const rootStat = await fs.stat(searchRoot);
+    if (rootStat.isFile()) {
+      const basename = path.basename(searchRoot);
+      await processFile(searchRoot, basename, basename);
+    } else if (rootStat.isDirectory()) {
+      await walk(searchRoot);
+    }
+  } catch {
+    return "No matches found";
+  }
 
   if (outputMode === "files_with_matches") {
     const files = [...fileMatches.keys()].slice(0, headLimit);

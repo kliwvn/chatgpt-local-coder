@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import assert from "node:assert/strict";
 import { fileURLToPath } from "url";
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -8,13 +9,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   importCursorMcpConfig,
   loadUpstreamConfig,
+  normalizeUpstreamConfig,
   parseClaudeCodeConfig,
   parseMcpServersFile,
   parseOpenCodeConfig,
   saveUpstreamConfig,
 } from "../dist/lib/mcp-upstream-config.js";
 import { McpUpstreamManager } from "../dist/lib/mcp-upstream-manager.js";
-import { refreshProxiedTools, jsonSchemaToZodShape } from "../dist/lib/mcp-tool-proxy.js";
+import { formatUpstreamResult, refreshProxiedTools, jsonSchemaToZodShape } from "../dist/lib/mcp-tool-proxy.js";
 import { createMcpServer } from "../dist/server-factory.js";
 import { registerMcpBridgeTools } from "../dist/tools/mcp-bridge.js";
 
@@ -81,6 +83,27 @@ await run("jsonSchemaToZodShape respects required fields", async () => {
   if (!bParsed.success) throw new Error("b should be optional");
 });
 
+await run("upstream result preserves mixed MCP content blocks", async () => {
+  const textOnly = formatUpstreamResult({
+    content: [{ type: "text", text: "alpha" }, { type: "text", text: "beta" }],
+  });
+  if (textOnly !== "alpha\nbeta") throw new Error(`text-only result changed: ${JSON.stringify(textOnly)}`);
+
+  const mixed = formatUpstreamResult({
+    content: [
+      { type: "text", text: "hello" },
+      { type: "resource_link", uri: "file:///tmp/example.txt", name: "example" },
+    ],
+  });
+  if (!Array.isArray(mixed) || mixed.length !== 2) throw new Error(`mixed content lost structure: ${JSON.stringify(mixed)}`);
+  if (mixed[1]?.uri !== "file:///tmp/example.txt") throw new Error(`resource block corrupted: ${JSON.stringify(mixed)}`);
+
+  const emptyStructured = formatUpstreamResult({ structuredContent: {}, content: [{ type: "text", text: "fallback" }] });
+  if (!emptyStructured || Array.isArray(emptyStructured) || Object.keys(emptyStructured).length !== 0) {
+    throw new Error(`empty structuredContent was ignored: ${JSON.stringify(emptyStructured)}`);
+  }
+});
+
 await run("save and load upstream config", async () => {
   await saveUpstreamConfig(
     {
@@ -106,6 +129,44 @@ await run("save and load upstream config", async () => {
   if (loaded.servers[0].headers?.Authorization !== "Bearer test") {
     throw new Error(`headers lost: ${JSON.stringify(loaded.servers[0].headers)}`);
   }
+});
+
+await run("upstream config rejects oversized files and unbounded shapes", async () => {
+  const oversized = path.join(tmpDir, "oversized-upstream.json");
+  await fs.writeFile(oversized, " ".repeat(2 * 1024 * 1024 + 1), "utf8");
+  await assert.rejects(
+    () => loadUpstreamConfig(oversized),
+    /MCP upstream config exceeds 2097152 bytes/,
+  );
+
+  const tooMany = {
+    version: 1,
+    servers: Array.from({ length: 257 }, (_, i) => ({
+      id: `server-${i}`,
+      name: `server-${i}`,
+      enabled: false,
+      transport: "http",
+      url: "http://127.0.0.1",
+      expose: "meta_only",
+    })),
+  };
+  assert.throws(() => normalizeUpstreamConfig(tooMany), /servers exceeds maximum 256/);
+
+  assert.throws(
+    () => normalizeUpstreamConfig({
+      version: 1,
+      servers: [{
+        id: "bad-args",
+        name: "bad-args",
+        enabled: false,
+        transport: "stdio",
+        command: "node",
+        args: "--not-an-array",
+        expose: "meta_only",
+      }],
+    }),
+    /args for bad-args must be an array/,
+  );
 });
 
 await run("upstream config rejects duplicate exposed prefixes", async () => {

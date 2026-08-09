@@ -1,5 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
+import { readBufferFileBounded, readUtf8FileBounded } from "./bounded-file.js";
+import { EDIT_TEXT_MAX_BYTES } from "./output-budget.js";
 import { atomicWriteFile } from "./atomic-write.js";
 
 /**
@@ -301,6 +303,25 @@ export async function applyMultiFilePatch(
 
   const prepared: PreparedOperation[] = [];
   let preflightError: { index: number; message: string } | null = null;
+  const maxBufferedBytes = Math.min(32 * 1024 * 1024, EDIT_TEXT_MAX_BYTES * 8);
+  let bufferedBytes = 0;
+
+  const reserveBuffered = (bytes: number): void => {
+    bufferedBytes += bytes;
+    if (bufferedBytes > maxBufferedBytes) {
+      throw new Error(
+        `Multi-file patch preflight exceeds buffered source limit ${maxBufferedBytes} bytes. ` +
+        "Split the patch into smaller batches."
+      );
+    }
+  };
+
+  const assertNextSize = (text: string): void => {
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > EDIT_TEXT_MAX_BYTES) {
+      throw new Error(`Patched file would exceed EDIT_TEXT_MAX_BYTES=${EDIT_TEXT_MAX_BYTES} (${bytes} bytes)`);
+    }
+  };
 
   // Preflight every operation before touching disk. This prevents the common
   // partial-patch failure where file A is changed and file B's hunk then fails.
@@ -310,10 +331,12 @@ export async function applyMultiFilePatch(
       if (op.operation === "delete") {
         const stat = await fs.stat(op.path);
         if (!stat.isFile()) throw new Error("Delete target is not a regular file");
+        const original = await readBufferFileBounded(op.path, EDIT_TEXT_MAX_BYTES, "patch delete target (EDIT_TEXT_MAX_BYTES)");
+        reserveBuffered(original.length);
         prepared.push({
           op,
           originalExists: true,
-          original: await fs.readFile(op.path),
+          original,
           result: { path: op.path, operation: "delete", ok: true, diff: "[deleted]" },
         });
         continue;
@@ -327,10 +350,12 @@ export async function applyMultiFilePatch(
           const stat = await fs.stat(op.path);
           if (!stat.isFile()) throw new Error("Create target exists and is not a regular file");
           originalExists = true;
-          original = await fs.readFile(op.path);
+          original = await readBufferFileBounded(op.path, EDIT_TEXT_MAX_BYTES, "patch create target (EDIT_TEXT_MAX_BYTES)");
+          reserveBuffered(original.length);
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
+        assertNextSize(content);
         prepared.push({
           op,
           originalExists,
@@ -341,8 +366,10 @@ export async function applyMultiFilePatch(
         continue;
       }
 
-      const original = await fs.readFile(op.path, "utf-8");
+      const original = await readUtf8FileBounded(op.path, EDIT_TEXT_MAX_BYTES, "patch update target (EDIT_TEXT_MAX_BYTES)");
+      reserveBuffered(Buffer.byteLength(original, "utf8"));
       const next = applyUnifiedPatchToText(original, op.patch || "");
+      assertNextSize(next);
       const diff = buildSimpleDiff(original, next);
       prepared.push({
         op,

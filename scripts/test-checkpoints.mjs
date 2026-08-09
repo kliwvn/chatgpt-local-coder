@@ -112,6 +112,54 @@ await run("restores move by snapshotting source and destination", async () => {
   if (destText !== "old-dest\n") throw new Error(`dest: ${destText}`);
 });
 
+await run("directory checkpoint propagates oversized child as incomplete", async () => {
+  await clearCheckpoints();
+  process.env.CHECKPOINT_MAX_FILE_BYTES = "1024";
+  process.env.CHECKPOINT_MAX_TOTAL_BYTES = "65536";
+  process.env.CHECKPOINT_MAX_NODES = "1000";
+  const dir = path.join(tmpDir, "oversized-dir");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "large.txt"), "x".repeat(2048), "utf8");
+  const id = await checkpointBefore("delete_directory", [dir]);
+  if (!id) throw new Error("checkpoint id missing");
+  const plan = await previewRestore(id);
+  const top = plan.changes.find((change) => path.resolve(change.path) === path.resolve(dir));
+  if (top?.action !== "skip") throw new Error(`incomplete directory was not skipped: ${JSON.stringify(plan)}`);
+  if (!/directory snapshot incomplete/i.test(top.reason || "")) throw new Error(`missing incomplete reason: ${top.reason}`);
+  if (!/CHECKPOINT_MAX_FILE_BYTES/i.test(top.reason || "")) throw new Error(`missing per-file cap reason: ${top.reason}`);
+});
+
+await run("directory checkpoint enforces aggregate byte budget", async () => {
+  await clearCheckpoints();
+  process.env.CHECKPOINT_MAX_FILE_BYTES = "65536";
+  process.env.CHECKPOINT_MAX_TOTAL_BYTES = "65536";
+  process.env.CHECKPOINT_MAX_NODES = "1000";
+  const dir = path.join(tmpDir, "aggregate-dir");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, "a.txt"), "a".repeat(40 * 1024), "utf8");
+  await fs.writeFile(path.join(dir, "b.txt"), "b".repeat(40 * 1024), "utf8");
+  const id = await checkpointBefore("delete_directory", [dir]);
+  const plan = await previewRestore(id);
+  const top = plan.changes.find((change) => path.resolve(change.path) === path.resolve(dir));
+  if (top?.action !== "skip") throw new Error(`aggregate-limited directory was not skipped: ${JSON.stringify(plan)}`);
+  if (!/CHECKPOINT_MAX_TOTAL_BYTES/i.test(top.reason || "")) throw new Error(`missing aggregate cap reason: ${top.reason}`);
+});
+
+await run("directory checkpoint enforces node budget without false restore", async () => {
+  await clearCheckpoints();
+  process.env.CHECKPOINT_MAX_FILE_BYTES = "65536";
+  process.env.CHECKPOINT_MAX_TOTAL_BYTES = String(128 * 1024 * 1024);
+  process.env.CHECKPOINT_MAX_NODES = "100";
+  const dir = path.join(tmpDir, "node-dir");
+  await fs.mkdir(dir, { recursive: true });
+  await Promise.all(Array.from({ length: 110 }, (_, i) => fs.writeFile(path.join(dir, `f-${i}.txt`), "x", "utf8")));
+  const id = await checkpointBefore("delete_directory", [dir]);
+  const plan = await previewRestore(id);
+  const top = plan.changes.find((change) => path.resolve(change.path) === path.resolve(dir));
+  if (top?.action !== "skip") throw new Error(`node-limited directory was not skipped: ${JSON.stringify(plan)}`);
+  if (!/checkpoint node limit 100 reached/i.test(top.reason || "")) throw new Error(`missing node cap reason: ${top.reason}`);
+});
+
 await fs.rm(tmpDir, { recursive: true, force: true });
 
 console.log(`\n${passed} passed, ${failed} failed`);

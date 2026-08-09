@@ -65,6 +65,7 @@ const unitScripts = [
   "scripts/test-state-concurrency.mjs",
   "scripts/test-filesystem-safety.mjs",
   "scripts/test-output-budget.mjs",
+  "scripts/test-post-edit-hooks.mjs",
   "scripts/test-manager-log-utils.mjs",
   "scripts/test-manager-fs-utils.mjs",
   "scripts/test-manager-env-redaction.mjs",

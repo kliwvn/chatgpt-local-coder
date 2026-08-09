@@ -40,6 +40,17 @@ export const READ_TEXT_MAX_BYTES = envBoundedInteger(
   6 * 1024 * 1024
 );
 
+// Exact/patch edits materialize both the old and new text in memory. Keep source
+// files bounded separately from read_text_file's response-oriented 2 MiB cap.
+// The 5 MiB default aligns with CHECKPOINT_MAX_FILE_BYTES so normal edits remain
+// rewindable under default settings.
+export const EDIT_TEXT_MAX_BYTES = envBoundedInteger(
+  "EDIT_TEXT_MAX_BYTES",
+  5 * 1024 * 1024,
+  64 * 1024,
+  64 * 1024 * 1024
+);
+
 // Base64 expands binary data by roughly 4/3 before the JSON envelope. A 2 MiB
 // binary chunk stays comfortably below the tunnel result budget.
 export const READ_BASE64_MAX_BYTES = envBoundedInteger(

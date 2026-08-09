@@ -13,7 +13,8 @@
 // and asserts the singleton's registered-server count returns to baseline and
 // the server's close() was attempted.
 
-import { createSessionManager } from "../dist/lib/mcp-session-manager.js";
+import http from "node:http";
+import { createSessionManager, loopbackMcpPost } from "../dist/lib/mcp-session-manager.js";
 import { getUpstreamManager } from "../dist/lib/mcp-upstream-manager.js";
 
 let passed = 0;
@@ -57,6 +58,35 @@ function fakeReqRes() {
 }
 
 async function main() {
+  const hangingServer = http.createServer((_req, _res) => {
+    // Intentionally never respond: recovery loopback must abort itself rather
+    // than pinning recoveryInFlight/caller forever.
+  });
+  await new Promise((resolve, reject) => {
+    hangingServer.once("error", reject);
+    hangingServer.listen(0, "127.0.0.1", resolve);
+  });
+  const hangingPort = hangingServer.address().port;
+  const started = Date.now();
+  let timedOut = false;
+  try {
+    await loopbackMcpPost(
+      hangingPort,
+      "/mcp",
+      { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+      undefined,
+      undefined,
+      100
+    );
+  } catch (err) {
+    timedOut = /loopback timed out after 100ms/i.test(String(err));
+  } finally {
+    await new Promise((resolve) => hangingServer.close(resolve));
+  }
+  const elapsed = Date.now() - started;
+  if (!timedOut || elapsed > 2000) fail("recovery loopback is bounded", `timedOut=${timedOut} elapsed=${elapsed}ms`);
+  else ok("recovery loopback is bounded");
+
   const baseline = getUpstreamManager().getRegisteredServerCount();
   const fake = fakeMcpServer(true);
   const upstreamManager = getUpstreamManager();

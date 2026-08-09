@@ -38,6 +38,27 @@ await run("glob finds typescript files", async () => {
   if (!matches.some((m) => m.path.endsWith("filesystem.ts"))) throw new Error("filesystem.ts not found");
 });
 
+await run("globstar matches root, immediate child, nested, and dotfiles", async () => {
+  const dir = path.join(tmpDir, "globstar");
+  await fs.mkdir(path.join(dir, "src", "deep"), { recursive: true });
+  await fs.mkdir(path.join(dir, ".github"), { recursive: true });
+  await fs.writeFile(path.join(dir, "root.ts"), "root\n");
+  await fs.writeFile(path.join(dir, "src", "App.tsx"), "app\n");
+  await fs.writeFile(path.join(dir, "src", "deep", "Nested.tsx"), "nested\n");
+  await fs.writeFile(path.join(dir, ".env"), "SECRET=nope\n");
+  await fs.writeFile(path.join(dir, ".github", "workflow.yml"), "name: ci\n");
+
+  const rootTs = await globFiles(dir, "**/*.ts", 50);
+  if (!rootTs.some((m) => m.path.endsWith("root.ts"))) throw new Error("globstar missed root-level root.ts");
+  const tsx = await globFiles(dir, "src/**/*.tsx", 50);
+  if (!tsx.some((m) => m.path.endsWith("App.tsx"))) throw new Error("globstar missed immediate App.tsx");
+  if (!tsx.some((m) => m.path.endsWith("Nested.tsx"))) throw new Error("globstar missed nested Nested.tsx");
+  const env = await globFiles(dir, ".env", 10);
+  if (!env.some((m) => m.path.endsWith(".env"))) throw new Error("glob skipped dotfile");
+  const github = await globFiles(dir, ".github/**/*.yml", 10);
+  if (!github.some((m) => m.path.endsWith("workflow.yml"))) throw new Error("glob skipped dot-directory");
+});
+
 await run("grep content mode", async () => {
   const out = await grepSearch({ pattern: "registerFilesystemTools", path: path.join(root, "src"), glob: "*.ts", headLimit: 10 });
   if (!out.includes("filesystem.ts")) throw new Error("pattern not found");
@@ -52,6 +73,59 @@ await run("grep files_with_matches mode", async () => {
     headLimit: 10,
   });
   if (!out.includes("server-factory")) throw new Error("file not listed");
+});
+
+await run("grep accepts a direct file path", async () => {
+  const file = path.join(tmpDir, "direct-grep.txt");
+  await fs.writeFile(file, "alpha\nneedle direct\nomega\n");
+  const out = await grepSearch({
+    pattern: "needle direct",
+    path: file,
+    glob: "*",
+    outputMode: "content",
+    headLimit: 10,
+  });
+  if (!out.includes("direct-grep.txt:2: needle direct")) throw new Error(`direct file grep failed: ${out}`);
+});
+
+await run("grep path glob and multiline count", async () => {
+  const dir = path.join(tmpDir, "grep-glob");
+  await fs.mkdir(path.join(dir, "src", "deep"), { recursive: true });
+  await fs.writeFile(path.join(dir, "src", "App.tsx"), "needle\nneedle\n");
+  await fs.writeFile(path.join(dir, "src", "deep", "Nested.tsx"), "needle\n");
+  await fs.writeFile(path.join(dir, "outside.tsx"), "needle\n");
+  await fs.writeFile(path.join(dir, ".hidden.tsx"), "needle\n");
+
+  const pathFiltered = await grepSearch({
+    pattern: "needle",
+    path: dir,
+    glob: "src/**/*.tsx",
+    outputMode: "files_with_matches",
+    headLimit: 20,
+  });
+  if (!pathFiltered.includes("App.tsx") || !pathFiltered.includes("Nested.tsx")) {
+    throw new Error(`path glob missed expected files: ${pathFiltered}`);
+  }
+  if (pathFiltered.includes("outside.tsx")) throw new Error(`path glob leaked outside match: ${pathFiltered}`);
+
+  const counted = await grepSearch({
+    pattern: "needle",
+    path: dir,
+    glob: "src/App.tsx",
+    outputMode: "count",
+    multiline: true,
+    headLimit: 20,
+  });
+  if (!counted.endsWith("App.tsx:2")) throw new Error(`multiline count incorrect: ${counted}`);
+
+  const hidden = await grepSearch({
+    pattern: "needle",
+    path: dir,
+    glob: ".hidden.tsx",
+    outputMode: "files_with_matches",
+    headLimit: 20,
+  });
+  if (!hidden.includes(".hidden.tsx")) throw new Error("grep skipped dotfile");
 });
 
 await run("apply_patch codex style", async () => {

@@ -1099,11 +1099,15 @@ const SESSION_POLICY_DEFAULTS = {
 const RUNTIME_LIMIT_SPECS = [
   ["SHELL_TIMEOUT", 120, 1, 86400],
   ["ACTIVITY_LOG_MAX", 500, 1, 100000],
+  ["PROJECT_MEMORY_MAX_BYTES", 25000, 0, 5000000],
+  ["PROJECT_MEMORY_MAX_LINES", 200, 0, 10000],
   ["AUTO_MEMORY_MAX_BYTES", 25000, 1024, 10000000],
   ["AUTO_MEMORY_MAX_LINES", 200, 1, 10000],
   ["CHECKPOINT_MAX_COUNT", 500, 1, 100000],
   ["CHECKPOINT_RETENTION_DAYS", 30, 1, 3650],
   ["CHECKPOINT_MAX_FILE_BYTES", 5242880, 1024, 1073741824],
+  ["CHECKPOINT_MAX_TOTAL_BYTES", 33554432, 65536, 134217728],
+  ["CHECKPOINT_MAX_NODES", 10000, 100, 100000],
   ["AUDIT_LOG_MAX_BYTES", 10485760, 1024, 1073741824],
   ["PROCESS_MAX_RUNNING", 16, 1, 128],
   ["PROCESS_HISTORY_MAX", 32, 1, 1000],
@@ -1111,6 +1115,7 @@ const RUNTIME_LIMIT_SPECS = [
   ["SHELL_OUTPUT_MAX_CHARS", 250000, 4096, 1000000],
   ["GIT_OUTPUT_MAX_CHARS", 500000, 4096, 2000000],
   ["READ_TEXT_MAX_BYTES", 2097152, 65536, 6291456],
+  ["EDIT_TEXT_MAX_BYTES", 5242880, 65536, 67108864],
   ["READ_BASE64_MAX_BYTES", 2097152, 65536, 2097152],
   ["MCP_TOOL_RESULT_MAX_BYTES", 7340032, 262144, 8388608],
   ["MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES", 131072, 16384, 524288],
@@ -1274,16 +1279,6 @@ async function checkConfig(name, overrides) {
   } else {
     push(true, "EXTRA_WORKSPACE_PATHS", "(trống — chỉ WORKSPACE_PATH)");
   }
-
-  // Project memory giới hạn
-  const memBytesRaw = (env.PROJECT_MEMORY_MAX_BYTES || "").trim();
-  const memBytes = memBytesRaw === "" ? null : Number(memBytesRaw);
-  const memBytesOk = memBytes === null || (Number.isInteger(memBytes) && memBytes >= 0);
-  push(memBytesOk, "PROJECT_MEMORY_MAX_BYTES", memBytes === null ? "(mặc định ~25KB)" : memBytes === 0 ? "0 — không giới hạn" : `${memBytes} bytes`);
-  const memLinesRaw = (env.PROJECT_MEMORY_MAX_LINES || "").trim();
-  const memLines = memLinesRaw === "" ? null : Number(memLinesRaw);
-  const memLinesOk = memLines === null || (Number.isInteger(memLines) && memLines >= 0);
-  push(memLinesOk, "PROJECT_MEMORY_MAX_LINES", memLines === null ? "(mặc định 200)" : memLines === 0 ? "0 — không giới hạn" : `${memLines} dòng`);
 
   const tunnelId = env.OPENAI_TUNNEL_ID || "";
   const apiKey = env.OPENAI_TUNNEL_API_KEY || "";

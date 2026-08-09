@@ -1,6 +1,10 @@
 import fs from "fs/promises";
 import path from "path";
 import { validatePath } from "./path-security.js";
+import { readUtf8FilePrefix } from "./bounded-file.js";
+
+const MAX_RULE_FILES = 128;
+const MAX_RULE_SOURCE_BYTES = 64 * 1024;
 
 function parseFrontmatter(content: string): { paths?: string[] } {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -24,24 +28,35 @@ function globToRegex(glob: string): RegExp {
 
 function matchesAny(filePath: string, patterns: string[]): boolean {
   const norm = filePath.replace(/\\/g, "/");
-  return patterns.some((p) => globToRegex(p).test(norm) || globToRegex(p).test(path.basename(norm)));
+  const basename = path.basename(norm);
+  return patterns.some((p) => {
+    const matcher = globToRegex(p);
+    return matcher.test(norm) || matcher.test(basename);
+  });
 }
 
 async function listRuleFiles(rulesDir: string): Promise<string[]> {
   const found: string[] = [];
   async function walk(dir: string, depth: number): Promise<void> {
-    if (depth > 3) return;
-    let entries;
+    if (depth > 3 || found.length >= MAX_RULE_FILES) return;
+    let handle;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      handle = await fs.opendir(dir);
     } catch {
       return;
     }
-    for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) await walk(full, depth + 1);
-      else if (entry.name.endsWith(".md")) found.push(full);
+    try {
+      for await (const entry of handle) {
+        if (found.length >= MAX_RULE_FILES) break;
+        if (entry.isSymbolicLink()) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) await walk(full, depth + 1);
+        else if (entry.isFile() && entry.name.endsWith(".md")) found.push(full);
+      }
+    } finally {
+      await handle.close().catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ERR_DIR_CLOSED") throw err;
+      });
     }
   }
   await walk(rulesDir, 0);
@@ -63,7 +78,7 @@ export async function loadPathRulesForFile(
   for (const ruleFile of await listRuleFiles(rulesDir)) {
     try {
       const safeRuleFile = await validatePath(ruleFile);
-      const raw = await fs.readFile(safeRuleFile, "utf-8");
+      const raw = (await readUtf8FilePrefix(safeRuleFile, MAX_RULE_SOURCE_BYTES)).text;
       const fm = parseFrontmatter(raw);
       if (!fm.paths?.length) continue;
       if (!matchesAny(filePath, fm.paths)) continue;

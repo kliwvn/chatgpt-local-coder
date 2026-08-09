@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import os from "os";
 import { atomicWriteFile } from "./atomic-write.js";
+import { readUtf8FileBounded } from "./bounded-file.js";
 
 export type UpstreamTransport = "stdio" | "http";
 export type UpstreamExposeMode = "none" | "meta_only" | "allowlist" | "all";
@@ -29,6 +30,12 @@ export interface UpstreamConfigFile {
 }
 
 const CONFIG_VERSION = 1 as const;
+const MAX_CONFIG_BYTES = 2 * 1024 * 1024;
+const MAX_SERVERS = 256;
+const MAX_MAP_ENTRIES = 256;
+const MAX_ARGS = 256;
+const MAX_TOOLS = 1024;
+const MAX_STRING_CHARS = 32_768;
 
 export function defaultUpstreamConfig(): UpstreamConfigFile {
   return { version: CONFIG_VERSION, servers: [] };
@@ -41,19 +48,15 @@ export function resolveUpstreamConfigPath(): string {
 }
 
 function normalizeServer(raw: UpstreamServerConfig): UpstreamServerConfig {
+  if (!raw || typeof raw !== "object") throw new Error("Upstream server entry must be an object");
+  if (typeof raw.id !== "string") throw new Error("Upstream server id must be a string");
   const id = raw.id.trim();
   if (!id) throw new Error("Upstream server id is required");
+  if (id.length > 128) throw new Error("Upstream server id must be <= 128 characters");
 
   const transport = raw.transport;
   if (transport !== "stdio" && transport !== "http") {
     throw new Error(`Invalid transport for ${id}: ${String(raw.transport)}`);
-  }
-
-  if (transport === "stdio" && !raw.command?.trim()) {
-    throw new Error(`stdio server ${id} requires command`);
-  }
-  if (transport === "http" && !raw.url?.trim()) {
-    throw new Error(`http server ${id} requires url`);
   }
 
   const expose = raw.expose ?? "meta_only";
@@ -71,34 +74,73 @@ function normalizeServer(raw: UpstreamServerConfig): UpstreamServerConfig {
     if (typeof value !== "object" || Array.isArray(value)) {
       throw new Error(`${label} for ${id} must be an object`);
     }
+    const entries = Object.entries(value);
+    if (entries.length > MAX_MAP_ENTRIES) throw new Error(`${label} for ${id} exceeds ${MAX_MAP_ENTRIES} entries`);
     const out: Record<string, string> = {};
-    for (const [key, entry] of Object.entries(value)) {
+    for (const [key, entry] of entries) {
       if (typeof entry !== "string") throw new Error(`${label}.${key} for ${id} must be a string`);
+      if (key.length > 512 || entry.length > MAX_STRING_CHARS) {
+        throw new Error(`${label}.${key.slice(0, 80)} for ${id} exceeds configured string limits`);
+      }
       out[key] = entry;
     }
     return out;
   };
 
+  const normalizeStringList = (value: string[] | undefined, label: string, maxItems: number): string[] => {
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) throw new Error(`${label} for ${id} must be an array`);
+    if (value.length > maxItems) throw new Error(`${label} for ${id} exceeds ${maxItems} items`);
+    return value.map((entry, index) => {
+      if (typeof entry !== "string") throw new Error(`${label}[${index}] for ${id} must be a string`);
+      if (entry.length > MAX_STRING_CHARS) throw new Error(`${label}[${index}] for ${id} exceeds ${MAX_STRING_CHARS} chars`);
+      return entry;
+    });
+  };
+
+  const optionalString = (value: unknown, label: string): string | undefined => {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== "string") throw new Error(`${label} for ${id} must be a string`);
+    if (value.length > MAX_STRING_CHARS) throw new Error(`${label} for ${id} exceeds ${MAX_STRING_CHARS} chars`);
+    return value.trim();
+  };
+
+  const name = optionalString(raw.name, "name") || id;
+  const command = optionalString(raw.command, "command");
+  const cwd = optionalString(raw.cwd, "cwd");
+  const url = optionalString(raw.url, "url");
+  const toolPrefix = optionalString(raw.tool_prefix, "tool_prefix") || id;
+  const args = normalizeStringList(raw.args, "args", MAX_ARGS);
+  const tools = normalizeStringList(raw.tools, "tools", MAX_TOOLS);
+
+  if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
+    throw new Error(`enabled for ${id} must be a boolean`);
+  }
+
+  if (transport === "stdio" && !command) throw new Error(`stdio server ${id} requires command`);
+  if (transport === "http" && !url) throw new Error(`http server ${id} requires url`);
+
   return {
     id,
-    name: raw.name?.trim() || id,
+    name,
     enabled: raw.enabled !== false,
     transport,
-    command: raw.command?.trim(),
-    args: raw.args ?? [],
+    command,
+    args,
     env: normalizeStringMap(raw.env, "env"),
-    cwd: raw.cwd?.trim(),
-    url: raw.url?.trim(),
+    cwd,
+    url,
     headers: normalizeStringMap(raw.headers, "headers"),
-    tool_prefix: (raw.tool_prefix?.trim() || id).replace(/[^a-zA-Z0-9_-]/g, "_"),
+    tool_prefix: toolPrefix.replace(/[^a-zA-Z0-9_-]/g, "_"),
     expose,
-    tools: raw.tools ?? [],
+    tools,
     idle_timeout_sec: idleTimeout,
   };
 }
 
 export function normalizeUpstreamConfig(config: UpstreamConfigFile): UpstreamConfigFile {
   if (!config || !Array.isArray(config.servers)) throw new Error("servers must be an array");
+  if (config.servers.length > MAX_SERVERS) throw new Error(`servers exceeds maximum ${MAX_SERVERS}`);
   const servers = config.servers.map(normalizeServer);
   const ids = new Set<string>();
   const exposedPrefixes = new Map<string, string>();
@@ -119,7 +161,7 @@ export function normalizeUpstreamConfig(config: UpstreamConfigFile): UpstreamCon
 
 export async function loadUpstreamConfig(configPath = resolveUpstreamConfigPath()): Promise<UpstreamConfigFile> {
   try {
-    const raw = await fs.readFile(configPath, "utf-8");
+    const raw = await readUtf8FileBounded(configPath, MAX_CONFIG_BYTES, "MCP upstream config");
     const parsed = JSON.parse(raw) as UpstreamConfigFile;
     if (!Array.isArray(parsed.servers)) throw new Error("servers must be an array");
     return normalizeUpstreamConfig(parsed);
@@ -138,7 +180,10 @@ export async function saveUpstreamConfig(
   configPath = resolveUpstreamConfigPath()
 ): Promise<void> {
   const normalized = normalizeUpstreamConfig(config);
-  await atomicWriteFile(configPath, JSON.stringify(normalized, null, 2), "utf8");
+  const serialized = JSON.stringify(normalized, null, 2);
+  const bytes = Buffer.byteLength(serialized, "utf8");
+  if (bytes > MAX_CONFIG_BYTES) throw new Error(`MCP upstream config exceeds ${MAX_CONFIG_BYTES} bytes (${bytes})`);
+  await atomicWriteFile(configPath, serialized, "utf8");
 }
 
 export type McpImportSource = "cursor" | "claude" | "opencode" | "file";
@@ -177,13 +222,20 @@ function parseJsonc(text: string): unknown {
 function commandToParts(command: string | string[] | undefined): { command?: string; args: string[] } {
   if (!command) return { args: [] };
   if (Array.isArray(command)) {
+    if (command.some((part) => typeof part !== "string")) {
+      throw new Error("command array must contain only strings");
+    }
     return { command: command[0], args: command.slice(1) };
   }
+  if (typeof command !== "string") throw new Error("command must be a string or string array");
   return { command, args: [] };
 }
 
 function resolveTransport(entry: McpServersEntry): UpstreamTransport | null {
-  const type = (entry.type || entry.transport || "").toLowerCase();
+  const rawType = entry.type ?? entry.transport ?? "";
+  if (typeof rawType !== "string") throw new Error("MCP server type/transport must be a string");
+  if (entry.url !== undefined && typeof entry.url !== "string") throw new Error("MCP server url must be a string");
+  const type = rawType.toLowerCase();
   const hasUrl = Boolean(entry.url?.trim());
   const cmdParts = commandToParts(entry.command as string | string[] | undefined);
   const hasCommand = Boolean(cmdParts.command?.trim());
@@ -197,11 +249,19 @@ function resolveTransport(entry: McpServersEntry): UpstreamTransport | null {
 }
 
 function entryToServer(id: string, entry: McpServersEntry, enabledDefault = false): UpstreamServerConfig | null {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new Error(`MCP server ${id} must be an object`);
+  }
   const transport = resolveTransport(entry);
   if (!transport) return null;
 
   const cmdParts = commandToParts(entry.command as string | string[] | undefined);
   const args = Array.isArray(entry.args) ? entry.args : entry.args ? [entry.args] : cmdParts.args;
+  for (const [label, value] of [["env", entry.env], ["environment", entry.environment]] as const) {
+    if (value !== undefined && (typeof value !== "object" || value === null || Array.isArray(value))) {
+      throw new Error(`${label} for ${id} must be an object`);
+    }
+  }
   const env = { ...(entry.env ?? {}), ...(entry.environment ?? {}) };
 
   return normalizeServer({
@@ -314,7 +374,7 @@ export async function importMcpConfigFromFile(
   source: McpImportSource,
   options?: { merge?: boolean; enableImported?: boolean }
 ): Promise<{ imported: string[]; config: UpstreamConfigFile; source: McpImportSource; path: string }> {
-  const rawText = await fs.readFile(filePath, "utf-8");
+  const rawText = await readUtf8FileBounded(filePath, MAX_CONFIG_BYTES, "MCP import config");
   const parsed = parseJsonc(rawText);
   let incoming: UpstreamServerConfig[] = [];
 
@@ -370,7 +430,7 @@ export async function discoverMcpConfigs(): Promise<DiscoveredMcpConfig[]> {
     seen.add(candidate.path);
     try {
       await fs.access(candidate.path);
-      const rawText = await fs.readFile(candidate.path, "utf-8");
+      const rawText = await readUtf8FileBounded(candidate.path, MAX_CONFIG_BYTES, "discovered MCP config");
       const parsed = parseJsonc(rawText);
       let count = 0;
       if (candidate.source === "opencode") count = Object.keys((parsed as OpenCodeConfigFile).mcp ?? {}).length;

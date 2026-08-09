@@ -49,7 +49,17 @@ export function toolResult<T extends object>(
     structuredContent: payload as Record<string, unknown>,
   };
 
-  if (Buffer.byteLength(JSON.stringify(result), "utf8") <= MCP_TOOL_RESULT_MAX_BYTES) {
+  // Avoid serializing a potentially multi-megabyte structured payload a second
+  // time just to estimate the outer result size. payloadJson is exactly the JSON
+  // representation used by structuredContent; only the small envelope/text need
+  // to be measured separately here.
+  const resultBytes =
+    Buffer.byteLength('{"content":[{"type":"text","text":', "utf8") +
+    Buffer.byteLength(JSON.stringify(text), "utf8") +
+    Buffer.byteLength('}],"structuredContent":', "utf8") +
+    payloadBytes +
+    1;
+  if (resultBytes <= MCP_TOOL_RESULT_MAX_BYTES) {
     return result;
   }
 

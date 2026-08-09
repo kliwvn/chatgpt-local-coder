@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import os from "os";
 import path from "path";
 import { validatePath } from "./path-security.js";
+import { readUtf8FilePrefix } from "./bounded-file.js";
 
 const ROOT_MEMORY_FILES = [
   "CLAUDE.md",
@@ -73,19 +74,29 @@ async function readTextLimited(
     // otherwise a repository-controlled symlink or @import can exfiltrate an
     // arbitrary local file into MCP instructions during server startup.
     const resolvedPath = kind === "user" ? path.resolve(filePath) : await validatePath(filePath);
-    const buf = await fs.readFile(resolvedPath);
-    let full = stripHtmlComments(buf.toString("utf-8"));
-    full = await expandImportsInContent(full, path.dirname(resolvedPath), kind !== "user");
+    let sourceText: string;
+    let sourceTruncated = false;
+    if (Number.isFinite(maxBytes)) {
+      const source = await readUtf8FilePrefix(resolvedPath, Math.max(1, Math.floor(maxBytes)));
+      sourceText = source.text;
+      sourceTruncated = source.truncated;
+    } else {
+      sourceText = await fs.readFile(resolvedPath, "utf8");
+    }
+    let full = stripHtmlComments(sourceText);
+    const expanded = await expandImportsInContent(full, path.dirname(resolvedPath), kind !== "user", maxBytes);
+    full = expanded.content;
 
-    const lines = Number.isFinite(maxLines) ? full.split(/\r?\n/).slice(0, maxLines) : full.split(/\r?\n/);
+    const fullLines = full.split(/\r?\n/);
+    const lines = Number.isFinite(maxLines) ? fullLines.slice(0, maxLines) : fullLines;
     const lineLimited = lines.join("\n");
     const byteLimited =
       Number.isFinite(maxBytes) && Buffer.byteLength(lineLimited, "utf-8") > maxBytes
-        ? Buffer.from(lineLimited, "utf-8").subarray(0, maxBytes).toString("utf-8")
+        ? truncateUtf8Text(lineLimited, maxBytes)
         : lineLimited;
     const truncated =
-      (Number.isFinite(maxBytes) && buf.length > maxBytes) ||
-      (Number.isFinite(maxLines) && full.split(/\r?\n/).length > maxLines) ||
+      sourceTruncated || expanded.truncated ||
+      (Number.isFinite(maxLines) && fullLines.length > maxLines) ||
       byteLimited.length < full.length;
 
     const trimmed = byteLimited.trim();
@@ -96,9 +107,14 @@ async function readTextLimited(
   }
 }
 
-async function expandImportsInContent(content: string, baseDir: string, restrictToWorkspace: boolean): Promise<string> {
+async function expandImportsInContent(
+  content: string,
+  baseDir: string,
+  restrictToWorkspace: boolean,
+  maxBytes: number
+): Promise<{ content: string; truncated: boolean }> {
   const visited = new Set<string>();
-  return expandMemoryImportsAsync(content, baseDir, visited, 0, restrictToWorkspace);
+  return expandMemoryImportsAsync(content, baseDir, visited, 0, restrictToWorkspace, maxBytes);
 }
 
 async function expandMemoryImportsAsync(
@@ -106,28 +122,56 @@ async function expandMemoryImportsAsync(
   baseDir: string,
   visited: Set<string>,
   depth: number,
-  restrictToWorkspace: boolean
-): Promise<string> {
-  if (depth >= IMPORT_MAX_DEPTH) return content;
+  restrictToWorkspace: boolean,
+  maxBytes: number
+): Promise<{ content: string; truncated: boolean }> {
+  if (depth >= IMPORT_MAX_DEPTH) {
+    const clipped = truncateUtf8Text(content, maxBytes);
+    return { content: clipped, truncated: clipped.length < content.length };
+  }
 
   const lines = content.split(/\r?\n/);
   const out: string[] = [];
+  let usedBytes = 0;
+  let truncated = false;
   let inFence = false;
+
+  const append = (value: string): boolean => {
+    const separatorBytes = out.length > 0 ? 1 : 0;
+    if (!Number.isFinite(maxBytes)) {
+      out.push(value);
+      usedBytes += separatorBytes + Buffer.byteLength(value, "utf8");
+      return true;
+    }
+    const remaining = Math.floor(maxBytes) - usedBytes - separatorBytes;
+    if (remaining <= 0) {
+      truncated = true;
+      return false;
+    }
+    const clipped = truncateUtf8Text(value, remaining);
+    out.push(clipped);
+    usedBytes += separatorBytes + Buffer.byteLength(clipped, "utf8");
+    if (clipped.length < value.length) {
+      truncated = true;
+      return false;
+    }
+    return true;
+  };
 
   for (const line of lines) {
     if (line.trim().startsWith("```")) {
       inFence = !inFence;
-      out.push(line);
+      if (!append(line)) break;
       continue;
     }
     if (inFence) {
-      out.push(line);
+      if (!append(line)) break;
       continue;
     }
 
     const importMatch = line.match(/^@(~\/[^\s`]+|[^\s`]+)\s*$/);
     if (!importMatch) {
-      out.push(line);
+      if (!append(line)) break;
       continue;
     }
 
@@ -143,33 +187,58 @@ async function expandMemoryImportsAsync(
       try {
         resolved = await validatePath(resolved);
       } catch {
-        out.push("<!-- import blocked: outside configured workspace roots -->");
+        if (!append("<!-- import blocked: outside configured workspace roots -->")) break;
         continue;
       }
     }
     if (visited.has(resolved)) {
-      out.push(`<!-- skipped circular import ${resolved} -->`);
+      if (!append(`<!-- skipped circular import ${resolved} -->`)) break;
       continue;
     }
 
     visited.add(resolved);
     try {
-      const buf = await fs.readFile(resolved);
-      const imported = stripHtmlComments(buf.toString("utf-8"));
+      const remaining = Number.isFinite(maxBytes) ? Math.max(1, Math.floor(maxBytes) - usedBytes) : Infinity;
+      let imported: string;
+      let importedTruncated = false;
+      if (Number.isFinite(remaining)) {
+        const importedSource = await readUtf8FilePrefix(resolved, remaining);
+        imported = stripHtmlComments(importedSource.text);
+        importedTruncated = importedSource.truncated;
+      } else {
+        imported = stripHtmlComments(await fs.readFile(resolved, "utf8"));
+      }
       const expanded = await expandMemoryImportsAsync(
         imported,
         path.dirname(resolved),
         visited,
         depth + 1,
-        restrictToWorkspace
+        restrictToWorkspace,
+        remaining
       );
-      out.push(`<!-- @import ${resolved} -->`, expanded);
+      if (!append(`<!-- @import ${resolved} -->`)) break;
+      if (!append(expanded.content)) break;
+      if (importedTruncated || expanded.truncated) truncated = true;
     } catch {
-      out.push(`<!-- import failed: ${resolved} -->`);
+      if (!append(`<!-- import failed: ${resolved} -->`)) break;
     }
   }
 
-  return out.join("\n");
+  return { content: out.join("\n"), truncated };
+}
+
+function truncateUtf8Text(text: string, maxBytes: number): string {
+  if (!Number.isFinite(maxBytes)) return text;
+  const limit = Math.max(0, Math.floor(maxBytes));
+  const buffer = Buffer.from(text, "utf8");
+  if (buffer.length <= limit) return text;
+  for (let trim = 0; trim <= 3 && limit - trim >= 0; trim++) {
+    const candidate = buffer.subarray(0, limit - trim);
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(candidate);
+    } catch {}
+  }
+  return buffer.subarray(0, limit).toString("utf8");
 }
 
 async function listUnconditionalRuleFiles(rulesDir: string): Promise<string[]> {
@@ -177,22 +246,30 @@ async function listUnconditionalRuleFiles(rulesDir: string): Promise<string[]> {
 
   async function walk(dir: string, depth: number): Promise<void> {
     if (depth > 3) return;
-    let entries;
+    let handle;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      handle = await fs.opendir(dir);
     } catch {
       return;
     }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await walk(full, depth + 1);
-      } else if (entry.isFile() && entry.name.endsWith(".md")) {
-        try {
-          const head = await fs.readFile(full, "utf-8");
-          if (!hasPathsFrontmatter(head)) found.push(full);
-        } catch {}
+    try {
+      for await (const entry of handle) {
+        if (found.length >= RULES_GLOB_MAX) break;
+        if (entry.isSymbolicLink()) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await walk(full, depth + 1);
+        } else if (entry.isFile() && entry.name.endsWith(".md")) {
+          try {
+            const head = await readUtf8FilePrefix(full, 64 * 1024);
+            if (!hasPathsFrontmatter(head.text)) found.push(full);
+          } catch {}
+        }
       }
+    } finally {
+      await handle.close().catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ERR_DIR_CLOSED") throw err;
+      });
     }
   }
 
@@ -222,7 +299,7 @@ async function appendSection(
 
 export async function loadProjectMemory(
   workspaceRoot: string,
-  opts?: { maxBytes?: number; maxLines?: number; workspaceRoots?: string[] }
+  opts?: { maxBytes?: number; maxLines?: number; workspaceRoots?: string[]; includeUserMemory?: boolean }
 ): Promise<ProjectMemoryBundle> {
   const maxBytes = opts?.maxBytes ?? DEFAULT_MAX_BYTES;
   const maxLines = opts?.maxLines ?? DEFAULT_MAX_LINES;
@@ -231,10 +308,12 @@ export async function loadProjectMemory(
   const sections: ProjectMemorySection[] = [];
   const totalBytes = { value: 0 };
 
-  for (const userPath of USER_MEMORY_CANDIDATES) {
-    if (!(await fileExists(userPath))) continue;
-    await appendSection(sections, totalBytes, maxBytes, maxLines, userPath, "user");
-    break;
+  if (opts?.includeUserMemory !== false) {
+    for (const userPath of USER_MEMORY_CANDIDATES) {
+      if (!(await fileExists(userPath))) continue;
+      await appendSection(sections, totalBytes, maxBytes, maxLines, userPath, "user");
+      break;
+    }
   }
 
   for (const rel of ROOT_MEMORY_FILES) {

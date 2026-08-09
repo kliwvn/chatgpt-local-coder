@@ -6,6 +6,10 @@ import {
   buildInstructionContext,
   summarizeInstructionContext,
 } from "../dist/lib/instruction-context.js";
+import { loadProjectMemory } from "../dist/lib/project-memory.js";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 
 const workspaceRoot = process.env.WORKSPACE_PATH || process.cwd();
 let passed = 0;
@@ -61,6 +65,30 @@ try {
   console.log("Memory files:", ctx.projectMemory.sections.map((s) => s.path).join(", ") || "(none)");
 } catch (err) {
   fail("buildInstructionContext", err.message || err);
+}
+
+try {
+  const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-project-memory-"));
+  try {
+    await fs.writeFile(path.join(temp, "large-import.md"), "ữ".repeat(600_000), "utf8");
+    await fs.writeFile(path.join(temp, "CLAUDE.md"), "@large-import.md\nroot-tail\n", "utf8");
+    const bundle = await loadProjectMemory(temp, {
+      maxBytes: 4096,
+      maxLines: 1000,
+      workspaceRoots: [temp],
+      includeUserMemory: false,
+    });
+    if (bundle.total_bytes > 4096) throw new Error(`memory budget exceeded: ${bundle.total_bytes}`);
+    const section = bundle.sections.find((item) => item.path.endsWith("CLAUDE.md"));
+    if (!section) throw new Error("bounded project CLAUDE.md missing");
+    if (!section.truncated) throw new Error("oversized imported memory was not marked truncated");
+    if (section.content.includes("\uFFFD")) throw new Error("UTF-8 prefix truncation emitted replacement character");
+    ok("project memory import I/O and expansion stay within byte budget");
+  } finally {
+    await fs.rm(temp, { recursive: true, force: true });
+  }
+} catch (err) {
+  fail("bounded project memory", err.message || err);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

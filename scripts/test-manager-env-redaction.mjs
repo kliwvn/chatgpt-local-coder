@@ -160,6 +160,18 @@ try {
     throw new Error("invalid ACTIVITY_LOG_MAX was persisted despite validation failure");
   }
 
+  const invalidEditLimitSave = await jsonFetch(`${base}/api/instances/test/env`, {
+    method: "PUT",
+    body: JSON.stringify({ values: { EDIT_TEXT_MAX_BYTES: "1" } }),
+  });
+  if (invalidEditLimitSave.body?.ok !== false) {
+    throw new Error(`invalid EDIT_TEXT_MAX_BYTES was accepted: ${JSON.stringify(invalidEditLimitSave.body)}`);
+  }
+  const afterInvalidEditLimit = await fs.readFile(path.join(dir, "instances", "test", ".env"), "utf-8");
+  if (afterInvalidEditLimit.includes("EDIT_TEXT_MAX_BYTES=1")) {
+    throw new Error("invalid EDIT_TEXT_MAX_BYTES was persisted despite validation failure");
+  }
+
   // 6. Cross-field output-budget invariants must be validated at the Manager
   // boundary. A text-duplication threshold above the total wire budget would
   // re-enable oversized duplicate responses and must never reach disk.

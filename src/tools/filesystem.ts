@@ -15,12 +15,63 @@ import { globFiles } from "../lib/glob-search.js";
 import { grepSearch } from "../lib/grep-search.js";
 import { atomicCopyFile, atomicWriteFile } from "../lib/atomic-write.js";
 import { withFileMutation, withFileMutations } from "../lib/file-mutation.js";
-import { READ_BASE64_MAX_BYTES, READ_TEXT_MAX_BYTES } from "../lib/output-budget.js";
+import { EDIT_TEXT_MAX_BYTES, READ_BASE64_MAX_BYTES, READ_TEXT_MAX_BYTES } from "../lib/output-budget.js";
+import { readUtf8FileBounded } from "../lib/bounded-file.js";
+import { globToRegExp, matchesCompiledGlob } from "../lib/glob-match.js";
 
 const MAX_PARTIAL_TEXT_LINES = 100_000;
 const TAIL_READ_CHUNK_BYTES = 64 * 1024;
 const DIRECTORY_TREE_MAX_NODES = 5_000;
 const DIRECTORY_LIST_MAX_ENTRIES = 5_000;
+
+function assertEditableResultSize(text: string, operation: string): void {
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > EDIT_TEXT_MAX_BYTES) {
+    throw new Error(
+      `${operation} would produce ${bytes} bytes, exceeding EDIT_TEXT_MAX_BYTES=${EDIT_TEXT_MAX_BYTES}. ` +
+      "Split the edit into a smaller artifact or use a purpose-built transformation."
+    );
+  }
+}
+
+function countNonOverlapping(text: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const index = text.indexOf(needle, offset);
+    if (index < 0) return count;
+    count++;
+    offset = index + needle.length;
+  }
+}
+
+function applyExactEditBounded(text: string, oldText: string, newText: string, replaceAll: boolean): string {
+  if (!oldText) throw new Error("old_text must not be empty");
+  const count = replaceAll ? countNonOverlapping(text, oldText) : text.includes(oldText) ? 1 : 0;
+  if (count === 0) throw new Error("old_text not found in file. Ensure exact match.");
+  const projectedBytes =
+    Buffer.byteLength(text, "utf8") +
+    count * (Buffer.byteLength(newText, "utf8") - Buffer.byteLength(oldText, "utf8"));
+  if (projectedBytes > EDIT_TEXT_MAX_BYTES) {
+    throw new Error(
+      `Edit would produce about ${projectedBytes} bytes, exceeding EDIT_TEXT_MAX_BYTES=${EDIT_TEXT_MAX_BYTES}.`
+    );
+  }
+  return replaceAll ? text.split(oldText).join(newText) : text.replace(oldText, newText);
+}
+
+function decodeBase64Strict(content: string): Buffer {
+  const compact = content.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(compact) || compact.length % 4 === 1) {
+    throw new Error("Invalid base64 content");
+  }
+  const buffer = Buffer.from(compact, "base64");
+  const canonicalInput = compact.replace(/=+$/, "");
+  const canonicalDecoded = buffer.toString("base64").replace(/=+$/, "");
+  if (canonicalInput !== canonicalDecoded) throw new Error("Invalid base64 content");
+  return buffer;
+}
 
 async function readTextLinesFrom(
   filePath: string,
@@ -50,19 +101,20 @@ async function readTextLinesFrom(
   try {
     for await (const chunk of input) {
       carry += chunk;
-      // A single line without a newline can otherwise grow until the entire file
-      // is resident in memory before the result-level wire guard ever sees it.
-      if (Buffer.byteLength(carry, "utf8") > READ_TEXT_MAX_BYTES) {
-        throw new Error(
-          `A text line exceeds READ_TEXT_MAX_BYTES=${READ_TEXT_MAX_BYTES}. ` +
-          "Use read_file_base64 with byte offset/length for oversized single-line data."
-        );
-      }
       let newline: number;
       while ((newline = carry.indexOf("\n")) >= 0) {
         const line = carry.slice(0, newline);
         carry = carry.slice(newline + 1);
         if (acceptLine(line)) return output;
+      }
+      // Check the unfinished line only after consuming complete lines from this
+      // chunk; otherwise a valid near-limit line followed by more data in the same
+      // stream chunk can be rejected even though the line itself is within budget.
+      if (Buffer.byteLength(carry, "utf8") > READ_TEXT_MAX_BYTES) {
+        throw new Error(
+          `A text line exceeds READ_TEXT_MAX_BYTES=${READ_TEXT_MAX_BYTES}. ` +
+          "Use read_file_base64 with byte offset/length for oversized single-line data."
+        );
       }
     }
     // String.split("\n") — used by the legacy implementation — always exposes
@@ -109,30 +161,33 @@ async function readTextTail(filePath: string, lineCount: number): Promise<string
 
 
 async function searchDirectory(
+  rootDir: string,
   dir: string,
   regex: RegExp,
-  globPattern: string,
+  globMatcher: RegExp,
   results: string[],
   maxResults: number
 ): Promise<void> {
   if (results.length >= maxResults) return;
+  const handle = await fs.opendir(dir);
+  try {
+    for await (const entry of handle) {
+      if (results.length >= maxResults) break;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.name === ".git" || entry.name === "node_modules") continue;
+      if (entry.isSymbolicLink()) continue;
 
-  const entries = await fs.readdir(dir, { withFileTypes: true });
+      if (entry.isDirectory()) {
+        await searchDirectory(rootDir, fullPath, regex, globMatcher, results, maxResults);
+        continue;
+      }
 
-  for (const entry of entries) {
-    if (results.length >= maxResults) break;
-
-    const fullPath = path.join(dir, entry.name);
-    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-    if (entry.isSymbolicLink()) continue;
-
-    if (entry.isDirectory()) {
-      await searchDirectory(fullPath, regex, globPattern, results, maxResults);
-    } else if (matchesGlob(entry.name, globPattern)) {
+      const rel = path.relative(rootDir, fullPath).replace(/\\/g, "/");
+      if (!matchesCompiledGlob(globMatcher, rel, entry.name)) continue;
       try {
         const stat = await fs.stat(fullPath);
         if (!stat.isFile() || stat.size > READ_TEXT_MAX_BYTES) continue;
-        const content = await fs.readFile(fullPath, "utf-8");
+        const content = await readUtf8FileBounded(fullPath, READ_TEXT_MAX_BYTES, "search file");
         const lines = content.split("\n");
         lines.forEach((line, idx) => {
           if (results.length < maxResults && regex.test(line)) {
@@ -141,15 +196,11 @@ async function searchDirectory(
         });
       } catch {}
     }
+  } finally {
+    await handle.close().catch((err: NodeJS.ErrnoException) => {
+      if (err.code !== "ERR_DIR_CLOSED") throw err;
+    });
   }
-}
-
-function matchesGlob(filename: string, pattern: string): boolean {
-  if (pattern === "*") return true;
-  const regex = new RegExp(
-    "^" + pattern.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$"
-  );
-  return regex.test(filename);
 }
 
 interface TreeBuildState {
@@ -165,25 +216,30 @@ async function buildTree(
 ): Promise<object> {
   const name = path.basename(dirPath);
   state.nodes++;
-  const entries = await fs.readdir(dirPath, { withFileTypes: true });
-
   if (depth >= maxDepth) return { name, type: "directory", truncated: true };
 
   const children = [];
-  for (const entry of entries) {
-    if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
-    if (entry.isSymbolicLink()) continue;
-    if (state.nodes >= DIRECTORY_TREE_MAX_NODES) {
-      state.truncated = true;
-      children.push({ name: "…", type: "truncated", reason: `node limit ${DIRECTORY_TREE_MAX_NODES}` });
-      break;
+  const handle = await fs.opendir(dirPath);
+  try {
+    for await (const entry of handle) {
+      if (entry.name === ".git" || entry.name === "node_modules") continue;
+      if (entry.isSymbolicLink()) continue;
+      if (state.nodes >= DIRECTORY_TREE_MAX_NODES) {
+        state.truncated = true;
+        children.push({ name: "…", type: "truncated", reason: `node limit ${DIRECTORY_TREE_MAX_NODES}` });
+        break;
+      }
+      const childPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) children.push(await buildTree(childPath, depth + 1, maxDepth, state));
+      else {
+        state.nodes++;
+        children.push({ name: entry.name, type: "file" });
+      }
     }
-    const childPath = path.join(dirPath, entry.name);
-    if (entry.isDirectory()) children.push(await buildTree(childPath, depth + 1, maxDepth, state));
-    else {
-      state.nodes++;
-      children.push({ name: entry.name, type: "file" });
-    }
+  } finally {
+    await handle.close().catch((err: NodeJS.ErrnoException) => {
+      if (err.code !== "ERR_DIR_CLOSED") throw err;
+    });
   }
 
   return { name, type: "directory", children };
@@ -242,7 +298,7 @@ export function registerFilesystemTools(server: McpServer): void {
             { summary: `large file: use partial read (${stat.size} bytes)` }
           );
         }
-        result = await fs.readFile(validPath, "utf-8");
+        result = await readUtf8FileBounded(validPath, READ_TEXT_MAX_BYTES, "text file");
       }
       await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok", details: { head, tail } });
       return toolResult("read_text_file", { path: validPath, content: result, head, tail });
@@ -328,7 +384,7 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, content }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const buffer = Buffer.from(content, "base64");
+      const buffer = decodeBase64Strict(content);
       return withFileMutation(validPath, async () => {
         const checkpointId = await checkpointBefore("write_file_base64", [validPath]);
         await atomicWriteFile(validPath, buffer);
@@ -345,7 +401,7 @@ export function registerFilesystemTools(server: McpServer): void {
       description: "Apply exact text replacement to a file. Returns diff.",
       inputSchema: {
         path: z.string(),
-        old_text: z.string(),
+        old_text: z.string().min(1),
         new_text: z.string(),
         replace_all: z.boolean().optional().default(false),
         dry_run: z.boolean().optional().default(false),
@@ -357,9 +413,8 @@ export function registerFilesystemTools(server: McpServer): void {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
       return withFileMutation(validPath, async () => {
-        const content = await fs.readFile(validPath, "utf-8");
-        if (!content.includes(old_text)) throw new Error("old_text not found in file. Ensure exact match.");
-        const newContent = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, new_text);
+        const content = await readUtf8FileBounded(validPath, EDIT_TEXT_MAX_BYTES, "editable text file (EDIT_TEXT_MAX_BYTES)");
+        const newContent = applyExactEditBounded(content, old_text, new_text, replace_all);
         const diff = buildSimpleDiff(content, newContent);
         const checkpointId = await checkpointBefore("edit_file", [validPath], { dry_run });
         if (!dry_run) await atomicWriteFile(validPath, newContent, "utf-8");
@@ -377,7 +432,7 @@ export function registerFilesystemTools(server: McpServer): void {
       description: "Apply multiple exact replacements to one text file atomically.",
       inputSchema: {
         path: z.string(),
-        edits: z.array(z.object({ old_text: z.string(), new_text: z.string(), replace_all: z.boolean().optional().default(false) })),
+        edits: z.array(z.object({ old_text: z.string().min(1), new_text: z.string(), replace_all: z.boolean().optional().default(false) })).max(1000),
         dry_run: z.boolean().optional().default(false),
       },
 
@@ -387,11 +442,15 @@ export function registerFilesystemTools(server: McpServer): void {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
       return withFileMutation(validPath, async () => {
-        const original = await fs.readFile(validPath, "utf-8");
+        const original = await readUtf8FileBounded(validPath, EDIT_TEXT_MAX_BYTES, "editable text file (EDIT_TEXT_MAX_BYTES)");
         let next = original;
         for (const edit of edits) {
-          if (!next.includes(edit.old_text)) throw new Error(`old_text not found: ${edit.old_text.slice(0, 120)}`);
-          next = edit.replace_all ? next.split(edit.old_text).join(edit.new_text) : next.replace(edit.old_text, edit.new_text);
+          try {
+            next = applyExactEditBounded(next, edit.old_text, edit.new_text, edit.replace_all);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            throw new Error(`${message} (old_text: ${edit.old_text.slice(0, 120)})`);
+          }
         }
         const diff = buildSimpleDiff(original, next);
         const checkpointId = await checkpointBefore("multi_edit", [validPath], { dry_run });
@@ -420,10 +479,11 @@ export function registerFilesystemTools(server: McpServer): void {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
       return withFileMutation(validPath, async () => {
-        const original = await fs.readFile(validPath, "utf-8");
+        const original = await readUtf8FileBounded(validPath, EDIT_TEXT_MAX_BYTES, "editable text file (EDIT_TEXT_MAX_BYTES)");
         const regex = new RegExp(pattern, flags);
         const next = original.replace(regex, replacement);
         if (next === original) throw new Error("Regex made no changes.");
+        assertEditableResultSize(next, "Regex edit");
         const diff = buildSimpleDiff(original, next);
         const checkpointId = await checkpointBefore("replace_regex", [validPath], { dry_run });
         if (!dry_run) await atomicWriteFile(validPath, next, "utf-8");
@@ -486,8 +546,9 @@ export function registerFilesystemTools(server: McpServer): void {
       if (!filePath) throw new Error("path is required for single-file patches");
       const validPath = await validatePath(filePath);
       return withFileMutation(validPath, async () => {
-        const original = await fs.readFile(validPath, "utf-8");
+        const original = await readUtf8FileBounded(validPath, EDIT_TEXT_MAX_BYTES, "editable text file (EDIT_TEXT_MAX_BYTES)");
         const next = applyUnifiedPatchToText(original, patch);
+        assertEditableResultSize(next, "Patch");
         const diff = buildSimpleDiff(original, next);
         const checkpointId = await checkpointBefore("apply_patch", [validPath], { dry_run });
         if (!dry_run) await atomicWriteFile(validPath, next, "utf-8");
@@ -785,7 +846,7 @@ export function registerFilesystemTools(server: McpServer): void {
   server.registerTool("search_files", { title: "Search Files", description: "Search file contents for a text pattern.", inputSchema: { path: z.string(), pattern: z.string(), glob: z.string().optional().default("*"), max_results: z.number().int().positive().max(500).optional().default(50) }, annotations: toolAnnotations("read") }, async ({ path: searchPath, pattern, glob: globPattern, max_results }) => {
     const validPath = await validatePath(searchPath);
     const results: string[] = [];
-    await searchDirectory(validPath, new RegExp(pattern, "i"), globPattern, results, max_results);
+    await searchDirectory(validPath, validPath, new RegExp(pattern, "i"), globToRegExp(globPattern), results, max_results);
     await audit({ tool: "search_files", action: "search", target: validPath, status: "ok", details: { pattern, results: results.length } });
     return toolResult("search_files", { path: validPath, pattern, matches: results, count: results.length });
   });

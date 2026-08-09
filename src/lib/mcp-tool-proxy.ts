@@ -183,17 +183,18 @@ export async function refreshProxiedTools(server: McpServer, manager: McpUpstrea
   return [...activeNames];
 }
 
-function formatUpstreamResult(raw: unknown): unknown {
+export function formatUpstreamResult(raw: unknown): unknown {
   if (!raw || typeof raw !== "object") return raw;
   const obj = raw as { content?: unknown; structuredContent?: unknown; isError?: boolean };
-  if (obj.structuredContent) return obj.structuredContent;
+  if (obj.structuredContent !== undefined) return obj.structuredContent;
   if (Array.isArray(obj.content)) {
-    return obj.content
-      .map((c) => {
-        if (c && typeof c === "object" && "text" in c) return (c as { text: string }).text;
-        return c;
-      })
-      .join("\n");
+    const allText = obj.content.every(
+      (c) => c && typeof c === "object" && "text" in c && typeof (c as { text?: unknown }).text === "string"
+    );
+    if (allText) return obj.content.map((c) => (c as { text: string }).text).join("\n");
+    // Preserve image/resource/resource_link/audio blocks instead of coercing them
+    // through Array.join(), which turns objects into the lossy "[object Object]".
+    return obj.content;
   }
   return raw;
 }

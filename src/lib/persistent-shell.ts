@@ -121,14 +121,16 @@ function resolveCdTarget(current: string, target: string): string {
 }
 
 /** Cập nhật cwd khi gặp cd / Set-Location ở đầu command (giống Bash persistent). */
-export function applyCwdDirectives(currentCwd: string, command: string): { cwd: string; command: string } {
+export function applyCwdDirectives(currentCwd: string, command: string): { cwd: string; command: string; changed: boolean } {
   let cwd = currentCwd;
   let rest = command.trim();
+  let changed = false;
 
   for (let i = 0; i < 8; i++) {
     const psMatch = rest.match(/^(?:Set-Location|sl)\s+(.+?)(?:\s*;\s*|\s*&&\s*|$)/i);
     if (psMatch) {
       cwd = resolveCdTarget(cwd, psMatch[1]);
+      changed = true;
       rest = rest.slice(psMatch[0].length).trim();
       continue;
     }
@@ -136,6 +138,7 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
     const cdMatch = rest.match(/^cd(?:\s+(.+?))?(?:\s*;\s*|\s*&&\s*|$)/i);
     if (cdMatch) {
       if (cdMatch[1]) cwd = resolveCdTarget(cwd, cdMatch[1]);
+      changed = true;
       rest = rest.slice(cdMatch[0].length).trim();
       continue;
     }
@@ -143,6 +146,7 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
     const pushdMatch = rest.match(/^pushd\s+(.+?)(?:\s*;\s*|\s*&&\s*|$)/i);
     if (pushdMatch) {
       cwd = resolveCdTarget(cwd, pushdMatch[1]);
+      changed = true;
       rest = rest.slice(pushdMatch[0].length).trim();
       continue;
     }
@@ -150,7 +154,7 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
     break;
   }
 
-  return { cwd, command: rest || "pwd" };
+  return { cwd, command: rest || "pwd", changed };
 }
 
 function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
@@ -219,8 +223,8 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
 
 /**
  * Chạy command trong shell session bền vững: cwd thay đổi qua `cd` được giữ
- * giữa các lần gọi. Nếu truyền `workingDirectory`, session sẽ chuyển sang
- * thư mục đó TRƯỚC khi chạy (và giữ nguyên cho lần sau, giống Bash persistent).
+ * giữa các lần gọi khi command có `cd`/`Set-Location`/`pushd`. `workingDirectory`
+ * chỉ là one-off execution cwd và không đổi persistent cwd.
  */
 export async function execInShellSession(
   command: string,
@@ -231,12 +235,11 @@ export async function execInShellSession(
   if (!sessionCwd) initShellSession(defaultCwd);
 
   const baseCwd = workingDirectory ? path.resolve(workingDirectory) : sessionCwd!;
-  const { cwd, command: effective } = applyCwdDirectives(baseCwd, command);
-  // Apply the invocation's cwd synchronously before spawning. A later concurrent
-  // invocation therefore deterministically wins the persistent cwd, regardless
-  // of which child process completes first. This avoids serial head-of-line
-  // blocking (and re-entrant MCP deadlocks) while keeping shell state ordered.
-  sessionCwd = cwd;
+  const { cwd, command: effective, changed } = applyCwdDirectives(baseCwd, command);
+  // Explicit workingDirectory is intentionally one-off. Only an explicit cwd
+  // directive mutates process-wide persistent cwd. Apply that mutation before
+  // spawn so the newest invocation wins regardless of completion order.
+  if (changed) sessionCwd = cwd;
 
   history.push(effective);
   if (history.length > MAX_HISTORY) history.shift();

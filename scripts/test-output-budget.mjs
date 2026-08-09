@@ -8,10 +8,12 @@ process.env.MCP_TOOL_RESULT_MAX_BYTES = "262144";
 process.env.MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES = "16384";
 process.env.SHELL_OUTPUT_MAX_CHARS = "4096";
 process.env.READ_TEXT_MAX_BYTES = "65536";
+process.env.EDIT_TEXT_MAX_BYTES = "65536";
 
 const { toolResult } = await import("../dist/lib/tool-result.js");
 const { execInShellSession, initShellSession } = await import("../dist/lib/persistent-shell.js");
 const { registerFilesystemTools } = await import("../dist/tools/filesystem.js");
+const { readUtf8FilePrefix } = await import("../dist/lib/bounded-file.js");
 
 const mediumText = "m".repeat(64 * 1024);
 const medium = toolResult("medium", { output: mediumText });
@@ -40,14 +42,20 @@ try {
   const largeFile = path.join(temp, "large.txt");
   await fs.writeFile(largeFile, "z".repeat(80 * 1024), "utf8");
   let readHandler;
+  let editHandler;
+  let writeBase64Handler;
   const fakeServer = {
     registerTool(name, _definition, handler) {
       if (name === "read_text_file") readHandler = handler;
+      if (name === "edit_file") editHandler = handler;
+      if (name === "write_file_base64") writeBase64Handler = handler;
       return { remove() {}, update() {}, enable() {}, disable() {} };
     },
   };
   registerFilesystemTools(fakeServer);
   assert.equal(typeof readHandler, "function");
+  assert.equal(typeof editHandler, "function");
+  assert.equal(typeof writeBase64Handler, "function");
   const read = await readHandler({ path: largeFile });
   assert.equal(read.structuredContent.data.truncated, true, "large full-text read did not require partial mode");
   assert.equal(read.structuredContent.data.content, "");
@@ -63,8 +71,40 @@ try {
     /READ_TEXT_MAX_BYTES/,
     "oversized single-line tail read was allowed to accumulate past the memory budget"
   );
+
+  await assert.rejects(
+    () => editHandler({ path: largeFile, old_text: "z", new_text: "q", replace_all: false, dry_run: true }),
+    /EDIT_TEXT_MAX_BYTES/,
+    "edit_file materialized an oversized source file"
+  );
+
+  const amplificationFile = path.join(temp, "amplification.txt");
+  await fs.writeFile(amplificationFile, "x".repeat(40 * 1024), "utf8");
+  await assert.rejects(
+    () => editHandler({ path: amplificationFile, old_text: "x", new_text: "yy", replace_all: true, dry_run: true }),
+    /EDIT_TEXT_MAX_BYTES/,
+    "replace_all amplification was allowed to construct an oversized edit result"
+  );
+  assert.equal((await fs.stat(amplificationFile)).size, 40 * 1024, "rejected amplification mutated the source file");
+
+  const binaryFile = path.join(temp, "binary.bin");
+  await assert.rejects(
+    () => writeBase64Handler({ path: binaryFile, content: "%%%%" }),
+    /Invalid base64 content/,
+    "invalid base64 was silently decoded"
+  );
+  const validBinary = await writeBase64Handler({ path: binaryFile, content: "aGVsbG8" });
+  assert.equal(validBinary.structuredContent.data.bytes, 5, "unpadded valid base64 was rejected/corrupted");
+  assert.equal((await fs.readFile(binaryFile)).toString("utf8"), "hello");
+
+  const utf8File = path.join(temp, "utf8-prefix.txt");
+  await fs.writeFile(utf8File, "abcữdef", "utf8");
+  const utf8Prefix = await readUtf8FilePrefix(utf8File, 4);
+  assert.equal(utf8Prefix.truncated, true);
+  assert.equal(utf8Prefix.text.includes("\uFFFD"), false, "UTF-8 prefix ended on an invalid code-point boundary");
+  assert.equal(utf8Prefix.text, "abc", `unexpected UTF-8-safe prefix: ${JSON.stringify(utf8Prefix.text)}`);
 } finally {
   await fs.rm(temp, { recursive: true, force: true });
 }
 
-console.log("output-budget: ok (wire guard, no large duplication, bounded shell output, large text partial-read gate)");
+console.log("output-budget: ok (wire/edit guards, no large duplication, bounded shell output, strict base64)");

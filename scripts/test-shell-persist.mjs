@@ -56,23 +56,32 @@ try {
   if (cwd2 !== root) throw new Error(`explicit re-bootstrap did not reload disk state: ${cwd2}`);
   ok("explicit re-bootstrap reloads durable state when requested");
 
-  // Foreground commands share one persistent cwd, but they must not serialize
-  // child execution: a long command in one MCP transport must not block another
-  // transport (or a command that calls back into this MCP server). Persistent cwd
-  // follows invocation order, so the newest invocation wins even if it completes
-  // first.
   const srcDir = path.join(root, "src");
-  const slowCommand = process.platform === "win32"
-    ? "Start-Sleep -Milliseconds 700; Write-Output first"
-    : "sleep 0.7; printf first";
-  const first = execInShellSession(slowCommand, root, 5000, srcDir);
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  const second = execInShellSession(
-    process.platform === "win32" ? "Write-Output second" : "printf second",
+  resetShellSession(root);
+  const oneOff = await execInShellSession(
+    process.platform === "win32" ? "Write-Output oneoff" : "printf oneoff",
     root,
     5000,
-    root
+    srcDir
   );
+  if (path.resolve(oneOff.cwd) !== path.resolve(srcDir)) throw new Error(`one-off cwd not used: ${oneOff.cwd}`);
+  if (path.resolve(getShellStatus().cwd) !== path.resolve(root)) {
+    throw new Error(`one-off workingDirectory contaminated persistent cwd: ${getShellStatus().cwd}`);
+  }
+  ok("workingDirectory is one-off and does not contaminate persistent cwd");
+
+  // Explicit cwd directives DO mutate the shared persistent cwd, but child
+  // execution remains parallel. A newer cwd mutation wins even if the older
+  // process completes later.
+  const firstCommand = process.platform === "win32"
+    ? `cd "${srcDir}"; Start-Sleep -Milliseconds 700; Write-Output first`
+    : `cd "${srcDir}"; sleep 0.7; printf first`;
+  const secondCommand = process.platform === "win32"
+    ? `cd "${root}"; Write-Output second`
+    : `cd "${root}"; printf second`;
+  const first = execInShellSession(firstCommand, root, 5000);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const second = execInShellSession(secondCommand, root, 5000);
   const winner = await Promise.race([
     first.then(() => "first"),
     second.then(() => "second"),
@@ -85,9 +94,9 @@ try {
   if (path.resolve(getShellStatus().cwd) !== path.resolve(root)) {
     throw new Error(`foreground shell concurrency left stale cwd: ${getShellStatus().cwd}`);
   }
-  ok("foreground shell commands stay parallel while latest invocation owns cwd");
+  ok("explicit cwd mutations stay parallel while latest invocation owns cwd");
 
-  const slowBeforeReset = execInShellSession(slowCommand, root, 5000, srcDir);
+  const slowBeforeReset = execInShellSession(firstCommand, root, 5000);
   resetShellSession(root);
   await slowBeforeReset;
   if (path.resolve(getShellStatus().cwd) !== path.resolve(root)) {

@@ -1,5 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
+import { validatePath } from "./path-security.js";
+import { readUtf8FilePrefix } from "./bounded-file.js";
 
 export interface SkillSummary {
   name: string;
@@ -8,6 +10,7 @@ export interface SkillSummary {
 }
 
 const MAX_SKILLS = 20;
+const MAX_SKILL_SOURCE_BYTES = 64 * 1024;
 
 function parseFrontmatter(content: string): { name?: string; description?: string } {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -24,27 +27,35 @@ export async function loadProjectSkills(workspaceRoot: string): Promise<SkillSum
 
   async function walk(dir: string, depth: number): Promise<void> {
     if (depth > 3 || out.length >= MAX_SKILLS) return;
-    let entries;
+    let handle;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      handle = await fs.opendir(dir);
     } catch {
       return;
     }
-    for (const entry of entries) {
-      if (out.length >= MAX_SKILLS) break;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        const skillFile = path.join(full, "SKILL.md");
-        try {
-          const content = await fs.readFile(skillFile, "utf-8");
-          const fm = parseFrontmatter(content);
-          const name = fm.name || entry.name;
-          const description = fm.description || content.split("\n").find((l) => l.trim() && !l.startsWith("#"))?.trim() || name;
-          out.push({ name, description: description.slice(0, 200), path: skillFile });
-        } catch {
-          await walk(full, depth + 1);
+    try {
+      for await (const entry of handle) {
+        if (out.length >= MAX_SKILLS) break;
+        if (entry.isSymbolicLink()) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          const skillFile = path.join(full, "SKILL.md");
+          try {
+            const safeSkillFile = await validatePath(skillFile);
+            const content = (await readUtf8FilePrefix(safeSkillFile, MAX_SKILL_SOURCE_BYTES)).text;
+            const fm = parseFrontmatter(content);
+            const name = fm.name || entry.name;
+            const description = fm.description || content.split("\n").find((l) => l.trim() && !l.startsWith("#"))?.trim() || name;
+            out.push({ name, description: description.slice(0, 200), path: safeSkillFile });
+          } catch {
+            await walk(full, depth + 1);
+          }
         }
       }
+    } finally {
+      await handle.close().catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ERR_DIR_CLOSED") throw err;
+      });
     }
   }
 

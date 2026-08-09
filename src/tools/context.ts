@@ -13,6 +13,7 @@ import { getUpstreamManager } from "../lib/mcp-upstream-manager.js";
 import { appendAutoMemory } from "../lib/auto-memory.js";
 import { loadPathRulesForFile } from "../lib/path-rules.js";
 import { toolResult } from "../lib/tool-result.js";
+import { readUtf8FilePrefix } from "../lib/bounded-file.js";
 
 
 
@@ -34,14 +35,15 @@ async function exists(filePath: string): Promise<boolean> {
   }
 }
 
-async function findContextFiles(root: string, maxDepth: number): Promise<string[]> {
+async function findContextFiles(root: string, maxDepth: number, maxFiles: number): Promise<string[]> {
   const found: string[] = [];
 
   async function walk(dir: string, depth: number): Promise<void> {
-    if (depth > maxDepth) return;
+    if (depth > maxDepth || found.length >= maxFiles) return;
 
     for (const name of contextFileNames) {
       const candidate = path.join(dir, name);
+      if (found.length >= maxFiles) break;
       if (!(await exists(candidate))) continue;
       try {
         found.push(await validatePath(candidate));
@@ -50,18 +52,24 @@ async function findContextFiles(root: string, maxDepth: number): Promise<string[
 
     if (depth === maxDepth) return;
 
-    let entries;
+    let handle;
     try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
+      handle = await fs.opendir(dir);
     } catch {
       return;
     }
-
-    for (const entry of entries) {
-      if (entry.isSymbolicLink()) continue;
-      if (!entry.isDirectory()) continue;
-      if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist" || entry.name === "build") continue;
-      await walk(path.join(dir, entry.name), depth + 1);
+    try {
+      for await (const entry of handle) {
+        if (found.length >= maxFiles) break;
+        if (entry.isSymbolicLink()) continue;
+        if (!entry.isDirectory()) continue;
+        if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist" || entry.name === "build") continue;
+        await walk(path.join(dir, entry.name), depth + 1);
+      }
+    } finally {
+      await handle.close().catch((err: NodeJS.ErrnoException) => {
+        if (err.code !== "ERR_DIR_CLOSED") throw err;
+      });
     }
   }
 
@@ -79,22 +87,21 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       inputSchema: {
         path: z.string().optional().describe("Project directory, defaults to primary workspace"),
         max_depth: z.number().int().min(0).max(5).optional().default(3),
+        max_files: z.number().int().min(1).max(200).optional().default(50),
         max_bytes_per_file: z.number().int().positive().max(200000).optional().default(60000),
       },
 
       annotations: toolAnnotations("read"),
     },
-    async ({ path: projectPath, max_depth, max_bytes_per_file }) => {
+    async ({ path: projectPath, max_depth, max_files, max_bytes_per_file }) => {
       const root = await validatePath(projectPath || workspaceRoot);
-      const files = await findContextFiles(root, max_depth);
+      const files = await findContextFiles(root, max_depth, max_files);
       const fileContents: Array<{ path: string; content: string; truncated: boolean }> = [];
 
       for (const file of files) {
         try {
-          const buf = await fs.readFile(file);
-          const truncated = buf.length > max_bytes_per_file;
-          const text = buf.subarray(0, max_bytes_per_file).toString("utf-8");
-          fileContents.push({ path: file, content: text, truncated });
+          const prefix = await readUtf8FilePrefix(file, max_bytes_per_file);
+          fileContents.push({ path: file, content: prefix.text, truncated: prefix.truncated });
         } catch {}
       }
 

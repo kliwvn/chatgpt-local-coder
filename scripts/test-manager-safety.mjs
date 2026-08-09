@@ -182,6 +182,8 @@ try {
   const managerApp = await fs.readFile(path.join(process.cwd(), "manager", "app.js"), "utf8");
   const managerCss = await fs.readFile(path.join(process.cwd(), "manager", "styles.css"), "utf8");
   const managerServerSource = await fs.readFile(path.join(process.cwd(), "manager", "server.mjs"), "utf8");
+  const adminUiSource = await fs.readFile(path.join(process.cwd(), "public", "ui", "app.js"), "utf8");
+  const envExampleSource = await fs.readFile(path.join(process.cwd(), ".env.example"), "utf8");
   assert.match(managerHtml, /id="btn-server-restart"[^>]*>[^<]*Khởi động lại Gateway/);
   assert.match(managerApp, /\/server\/restart/);
   assert.match(managerApp, /splitExtraWorkspacePaths/);
@@ -197,6 +199,16 @@ try {
     /if \(before\.running && before\.pid && started\.pid === before\.pid\) \{\s*return \{\s*\.\.\.started,\s*ok: false,\s*restarted: false,/,
     "same-PID restart guard must override started.ok instead of being overwritten by object spread"
   );
+  const runtimeSpecsBlock = managerServerSource.match(/const RUNTIME_LIMIT_SPECS = \[([\s\S]*?)\n\];/)?.[1] || "";
+  const runtimeSpecKeys = [...runtimeSpecsBlock.matchAll(/^\s*\["([A-Z0-9_]+)",/gm)].map((match) => match[1]);
+  assert.ok(runtimeSpecKeys.length > 0, "failed to parse RUNTIME_LIMIT_SPECS for drift check");
+  const envKeysBlock = adminUiSource.match(/const ENV_KEYS = \[([\s\S]*?)\];/)?.[1] || "";
+  const adminEnvKeys = new Set([...envKeysBlock.matchAll(/"([A-Z0-9_]+)"/g)].map((match) => match[1]));
+  const exampleEnvKeys = new Set([...envExampleSource.matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((match) => match[1]));
+  const runtimeLimitsMissingFromUi = runtimeSpecKeys.filter((key) => !adminEnvKeys.has(key));
+  const runtimeLimitsMissingFromExample = runtimeSpecKeys.filter((key) => !exampleEnvKeys.has(key));
+  assert.deepEqual(runtimeLimitsMissingFromUi, [], `Manager runtime limits missing from Admin ENV_KEYS: ${runtimeLimitsMissingFromUi.join(", ")}`);
+  assert.deepEqual(runtimeLimitsMissingFromExample, [], `Manager runtime limits missing from .env.example: ${runtimeLimitsMissingFromExample.join(", ")}`);
 
   const managedStart = (await post("/api/instances/restart-demo/server/start")).body;
   assert.equal(managedStart.ok, true, `managed server start failed: ${JSON.stringify(managedStart)}`);

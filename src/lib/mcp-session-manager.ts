@@ -39,6 +39,7 @@ if (SESSION_CLEANUP_INTERVAL_MS > SESSION_TTL_MS) {
 // Internal shutdown safety bound. Keep this below the process-level graceful
 // shutdown deadline so one wedged SDK transport cannot stall all sessions.
 const SESSION_RESOURCE_CLOSE_TIMEOUT_MS = 2000;
+const RECOVERY_LOOPBACK_TIMEOUT_MS = 5000;
 
 const lastTransportErrors: Record<string, string> = {};
 const sessionOpChains = new Map<string, Promise<void>>();
@@ -127,12 +128,13 @@ function extractRequestId(body: unknown): string | number | null {
   return null;
 }
 
-async function loopbackMcpPost(
+export async function loopbackMcpPost(
   port: number,
   path: string,
   body: unknown,
   sessionId?: string,
-  protocolVersion?: string
+  protocolVersion?: string,
+  timeoutMs = RECOVERY_LOOPBACK_TIMEOUT_MS
 ): Promise<{ ok: boolean; status: number; sessionId?: string }> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -141,17 +143,33 @@ async function loopbackMcpPost(
   if (sessionId) headers["mcp-session-id"] = sessionId;
   if (protocolVersion) headers["mcp-protocol-version"] = protocolVersion;
 
-  const response = await fetch(`http://127.0.0.1:${port}${path}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  });
-
-  return {
-    ok: response.ok,
-    status: response.status,
-    sessionId: response.headers.get("mcp-session-id") ?? undefined,
-  };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const result = {
+      ok: response.ok,
+      status: response.status,
+      sessionId: response.headers.get("mcp-session-id") ?? undefined,
+    };
+    // Drain the local response before returning so undici can release/reuse the
+    // socket instead of leaving recovery warm-up bodies pending in the pool.
+    await response.arrayBuffer();
+    return result;
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`MCP recovery loopback timed out after ${timeoutMs}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function consumeSessionTransportError(sessionId?: string): string | undefined {

@@ -308,6 +308,7 @@ OPENAI_TUNNEL_API_KEY=
 | `SHELL_OUTPUT_MAX_CHARS` | `250000` | Giới hạn tail stdout/stderr của `run_command` trong RAM; response báo `*_truncated` khi bị cắt |
 | `GIT_OUTPUT_MAX_CHARS` | `500000` | Giới hạn output Git trong RAM; output bị cắt có marker rõ để agent không hiểu nhầm diff/log là đầy đủ |
 | `READ_TEXT_MAX_BYTES` | `2097152` | Whole-file `read_text_file` tối đa 2 MiB. File lớn phải dùng `offset+limit`, `head` hoặc `tail`; partial reads cũng fail-fast nếu một slice/single line vượt budget |
+| `EDIT_TEXT_MAX_BYTES` | `5242880` | Max source/result cho exact edit và patch text. Default 5 MiB khớp checkpoint file cap để edit mặc định vẫn rewindable; multi-file patch còn có aggregate preflight buffer cap |
 | `READ_BASE64_MAX_BYTES` | `2097152` | Max binary chunk mỗi lần `read_file_base64`; dùng `offset/length` để đọc tiếp file lớn |
 | `MCP_TOOL_RESULT_MAX_BYTES` | `7340032` | Global result wire budget ~7 MiB, giữ margin dưới giới hạn 10 MiB của OpenAI Secure MCP Tunnel; result quá lớn trả preview + metadata thay vì để tunnel 413 |
 | `MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES` | `131072` | Chỉ duplicate payload đầy đủ sang cả MCP text + structured content khi payload nhỏ (≤128 KiB); payload lớn chỉ giữ một bản structured để giảm wire/context/GC |
@@ -315,6 +316,7 @@ OPENAI_TUNNEL_API_KEY=
 | `PROCESS_HISTORY_MAX` | `32` | Số process đã kết thúc giữ trong RAM để xem status/output; process cũ tự prune |
 | `PROCESS_LOG_MAX_CHARS` | `200000` | Max ký tự giữ **mỗi stdout/stderr stream** của một background process; buffer giữ tail mới nhất |
 | `CHECKPOINT_ENABLED` / `CHECKPOINT_MAX_FILE_BYTES` | `true` / `5242880` | Checkpoint code trước khi sửa (rewind); file > 5MB bị skip |
+| `CHECKPOINT_MAX_TOTAL_BYTES` / `CHECKPOINT_MAX_NODES` | `33554432` / `10000` | Bound aggregate snapshot RAM/traversal mỗi mutation. Directory subtree thiếu vì byte/node/file cap được đánh dấu `skipped` ở parent để rewind preview không báo restore giả |
 | `PROJECT_MEMORY_MAX_BYTES` / `PROJECT_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn CLAUDE.md/AGENTS.md inject vào instructions. Đặt `0` = không giới hạn |
 | `AUTO_MEMORY_MAX_BYTES` / `AUTO_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn recent cross-session auto-memory; `MEMORY.md` được compact atomic và ưu tiên note mới nhất thay vì tăng vô hạn |
 | `AUDIT_LOG_PATH` | `.mcp-audit.log` | JSONL audit log. Với managed instance, path tương đối được resolve trong `manager/instances/<name>/` để không trộn log giữa workspace |
@@ -326,9 +328,17 @@ OPENAI_TUNNEL_API_KEY=
 
 > **Path sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → các tool có path argument canonicalize path thật (`realpath`/nearest existing ancestor) rồi chặn `..\..`, symlink/junction và multi-file patch escape ra ngoài workspace roots. Recursive `glob`/`grep`/search không follow symlink entries. Project-controlled `CLAUDE.md`/rules imports cũng không được vượt workspace roots. **`run_command` / `start_process` là native shell và không được OS-sandbox bởi setting này**; chỉ working directory của chúng được kiểm tra. Chỉ chạy connector trên máy/code bạn tin cậy.
 
-> **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và **không reset/xóa lịch sử chat, reasoning context hay chất lượng model trực tiếp**. Chi phí thật nằm ở transport handshake, object allocation/tool registration và state/lifecycle nếu server thiết kế sai. Local Coder giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Shell cwd/history giờ bootstrap từ disk **một lần mỗi process/workspace** thay vì mỗi transport. Foreground `run_command` vẫn có thể chạy song song; cwd/history được cập nhật theo **thứ tự invocation (latest invocation wins)** chứ không theo thứ tự process hoàn tất, nên không tạo head-of-line blocking/re-entrant MCP deadlock và cũng không để session chậm rollback cwd của session mới hơn. Explicit DELETE chạy trong cùng per-session op chain với POST, nên phải chờ tool call trước đó hoàn tất rồi session được dispose ngay; `MCP_SESSION_DELETE_GRACE_MS` chỉ còn là fallback cho transport-close ngoài explicit DELETE. Các state bền vững khác (checkpoint index, auto-memory, `.env`/manager config) được serialize/ghi atomic và keyed queue tự giải phóng key sau khi settle. Initialize response vẫn mang đúng một MCP instruction document (không double-wrap). Vì vậy initialize churn hiện có thể tốn CPU/GC/I/O nhỏ, nhưng không làm mất model context; ảnh hưởng gián tiếp tới tool context đã được tách khỏi transport lifecycle.
+> **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và **không reset/xóa lịch sử chat, reasoning context hay chất lượng model trực tiếp**. Chi phí thật nằm ở transport handshake, object allocation/tool registration và state/lifecycle nếu server thiết kế sai. Local Coder giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Shell cwd/history giờ bootstrap từ disk **một lần mỗi process/workspace** thay vì mỗi transport. `run_command.working_directory` là one-off và không đổi persistent cwd; chỉ `cd`/`Set-Location`/`pushd` hoặc `shell_reset` mới mutate cwd dùng chung. Foreground commands vẫn chạy song song; cwd mutation mới nhất thắng theo **thứ tự invocation**, không theo thứ tự process hoàn tất, nên không tạo head-of-line blocking/re-entrant MCP deadlock và cũng không để command chậm rollback cwd mới hơn. Stale-session recovery loopback có timeout nội bộ và drain response để một recovery lỗi không treo caller/recovery lock vô hạn. Explicit DELETE chạy trong cùng per-session op chain với POST, nên phải chờ tool call trước đó hoàn tất rồi session được dispose ngay; `MCP_SESSION_DELETE_GRACE_MS` chỉ còn là fallback cho transport-close ngoài explicit DELETE. Các state bền vững khác (checkpoint index, auto-memory, `.env`/manager config) được serialize/ghi atomic và keyed queue tự giải phóng key sau khi settle. Initialize response vẫn mang đúng một MCP instruction document (không double-wrap). Vì vậy initialize churn hiện có thể tốn CPU/GC/I/O nhỏ, nhưng không làm mất model context; ảnh hưởng gián tiếp tới tool context đã được tách khỏi transport lifecycle.
 
 > **Large tool output / tunnel 413:** OpenAI Secure MCP Tunnel có body limit khoảng 10 MiB. Local Coder giữ result budget mặc định ~7 MiB, không duplicate payload lớn giữa `content.text` và `structuredContent`, cap foreground shell/Git output, và yêu cầu chunk/range cho file lớn. Nếu một local hoặc proxied upstream tool vẫn tạo result vượt budget, server trả `truncated`, `original_payload_bytes`, preview và hint thay vì để request chết bằng HTTP 413. Điều này cũng giảm token/context pressure do log/diff/base64 quá lớn bị nhét lặp vào tool result.
+
+> **Discovery/edit bounds:** `glob`/`grep` dùng cùng globstar semantics, hỗ trợ root-level match, path glob và dotfiles/dot-directories (trừ `.git`/`node_modules`, không follow symlink); traversal dùng streaming directory handles thay vì materialize toàn bộ entry list. Exact edit/patch source và result được bounded bởi `EDIT_TEXT_MAX_BYTES`; multi-file patch còn giới hạn tổng original buffers giữ cho rollback/preflight.
+
+> **Context-loader bounds:** `PROJECT_MEMORY_MAX_BYTES/LINES` được áp ngay từ lúc đọc `CLAUDE.md`/`AGENTS.md` và mở rộng `@import`, không đợi đọc nguyên file rồi mới cắt. Skill/rule/project-context discovery dùng streaming directory handles, không follow symlink, giới hạn số file và chỉ đọc prefix cần thiết; prefix truncation giữ biên UTF-8 hợp lệ để không inject ký tự thay thế `U+FFFD` vào instructions.
+
+> **Post-edit hook bounds:** file cấu hình hooks bị giới hạn kích thước/số hook, glob dùng cùng matcher chuẩn với discovery, số hook execution mỗi mutation có hard cap, stdout/stderr được giữ bằng bounded tail. Hook timeout giết cả process tree trên Windows (SIGKILL trên POSIX) và chờ child close với bounded fallback để giảm orphan process sau formatter/linter bị treo.
+
+> **Upstream MCP config bounds:** config/import/discovery MCP chỉ đọc tối đa 2 MiB, giới hạn số server/list/map/string và validate runtime type trước khi dùng. Mixed upstream MCP content (text + resource/image/etc.) được giữ cấu trúc thay vì bị ép thành chuỗi `[object Object]`.
 
 > **Background process lifecycle:** `start_process` dùng registry dùng chung giữa các MCP transport session. Registry giới hạn số process đang chạy, số process-history và log tail trong RAM. Khi Gateway graceful shutdown/restart, Local Coder dừng toàn bộ process tree do `start_process` tạo trước khi thoát để tránh orphan process sau restart.
 
@@ -344,9 +354,9 @@ src/
 │   ├── patch.ts             # apply_patch engine
 │   └── persistent-shell.ts  # Stateful shell
 └── tools/
-    ├── filesystem.ts        # 18 tools
+    ├── filesystem.ts        # 19 tools
     ├── shell.ts             # 8 tools
-    ├── git.ts               # 11 tools
+    ├── git.ts               # 12 tools
     └── context.ts           # agent_status, project_context
 ```
 
