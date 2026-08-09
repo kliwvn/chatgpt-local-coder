@@ -26,11 +26,12 @@ import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { rotateLogFile, tailFile } from "./log-utils.mjs";
+import { atomicWriteFile } from "./fs-utils.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const ENV_PATH = path.join(ROOT, ".env");
-const STATE_DIR = path.join(__dirname, "state");
+const STATE_DIR = path.resolve(process.env.MANAGER_STATE_DIR || path.join(__dirname, "state"));
 const LOG_DIR = path.join(STATE_DIR, "logs");
 const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 const PROFILES_PATH = path.join(STATE_DIR, "profiles.json");
@@ -81,6 +82,23 @@ const SECRET_KEY_RE =
   /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
 const MASK_SENTINEL = "********";
 
+function isSecretKey(key) { return SECRET_KEY_RE.test(String(key)); }
+function withoutSecrets(values) {
+  const out = {};
+  if (!values || typeof values !== "object") return out;
+  for (const [key, value] of Object.entries(values)) if (!isSecretKey(key)) out[key] = value;
+  return out;
+}
+function scrubProfiles(profiles) {
+  if (!profiles || typeof profiles !== "object") return {};
+  for (const profile of Object.values(profiles)) {
+    if (profile && typeof profile === "object" && profile.values && typeof profile.values === "object") {
+      profile.values = withoutSecrets(profile.values);
+    }
+  }
+  return profiles;
+}
+
 /* ------------------------------------------------------------------ */
 /* dotenv helpers (preserve comments/order, like src/admin/routes.ts)  */
 /* ------------------------------------------------------------------ */
@@ -113,15 +131,27 @@ function serializeDotEnv(values, original) {
   return result.join("\n");
 }
 
-function pidOnPort(port) {
+const PORT_PID_CACHE_TTL_MS = 2000;
+let portPidCache = { at: 0, pids: new Map() };
+function invalidatePortPidCache() { portPidCache = { at: 0, pids: new Map() }; }
+function listeningPortPids() {
+  if (Date.now() - portPidCache.at < PORT_PID_CACHE_TTL_MS) return portPidCache.pids;
+  const pids = new Map();
   try {
-    const out = spawnSync("netstat", ["-ano"], { encoding: "utf8", windowsHide: true }).stdout || "";
+    const out = spawnSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8", windowsHide: true }).stdout || "";
     for (const line of out.split(/\r?\n/)) {
-      const m = line.match(new RegExp(`:${port}\\s+\\S+\\s+LISTENING\\s+(\\d+)`));
-      if (m && m[1] !== "0") return parseInt(m[1], 10);
+      const m = /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i.exec(line);
+      if (!m) continue;
+      const port = Number(m[1]);
+      const pid = Number(m[2]);
+      if (Number.isInteger(port) && Number.isInteger(pid) && pid > 0 && !pids.has(port)) pids.set(port, pid);
     }
   } catch {}
-  return null;
+  portPidCache = { at: Date.now(), pids };
+  return pids;
+}
+function pidOnPort(port) {
+  return listeningPortPids().get(Number(port)) || null;
 }
 
 /* LEGACY single-instance .env tại ROOT/.env — chỉ còn dùng để đọc
@@ -157,8 +187,23 @@ async function readJson(p, fallback) {
 }
 
 async function writeJson(p, data) {
-  await fsp.mkdir(path.dirname(p), { recursive: true });
-  await fsp.writeFile(p, JSON.stringify(data, null, 2), "utf-8");
+  await atomicWriteFile(p, JSON.stringify(data, null, 2), "utf8");
+}
+
+const fileMutationChains = new Map();
+function enqueueFileMutation(file, operation) {
+  const previous = fileMutationChains.get(file) || Promise.resolve();
+  const run = previous.then(operation, operation);
+  fileMutationChains.set(file, run.then(() => undefined, () => undefined));
+  return run;
+}
+async function mutateJson(file, fallback, mutator) {
+  return enqueueFileMutation(file, async () => {
+    const value = await readJson(file, fallback);
+    const result = await mutator(value);
+    await writeJson(file, value);
+    return result === undefined ? value : result;
+  });
 }
 
 async function readConfig() {
@@ -194,6 +239,7 @@ async function writePidFile(p, pid) {
 /* ------------------------------------------------------------------ */
 
 function isPortOpen(port, host = "127.0.0.1") {
+  if (!Number.isInteger(port) || port <= 0 || port >= 65536) return Promise.resolve(false);
   return new Promise((resolve) => {
     const sock = net.connect({ port, host, timeout: 1200 });
     sock.once("connect", () => {
@@ -243,42 +289,13 @@ function spawnDetached(cmd, args, logFile, extraEnv = null) {
   return child.pid;
 }
 
-/** First PID of a running image (tasklist). Returns null if not found. */
-async function pidOf(name) {
-  try {
-    const out = spawnSync("tasklist", ["/FI", `IMAGENAME eq ${name}`], {
-      encoding: "utf8",
-      windowsHide: true,
-    }).stdout || "";
-    for (const line of out.split(/\r?\n/)) {
-      const m = line.match(/^(\S+)\s+(\d+)\s/);
-      if (m && m[1].toLowerCase() === name.toLowerCase()) return parseInt(m[2], 10);
-    }
-  } catch {}
-  return null;
-}
-
-
-/** PID còn sống không? (tasklist /FI "PID eq n") */
-function pidAlive(pid) {
-  if (!pid || !Number.isInteger(pid)) return false;
-  try {
-    const out = spawnSync("tasklist", ["/FI", `PID eq ${pid}`], { encoding: "utf8", windowsHide: true }).stdout || "";
-    for (const line of out.split(/\r?\n/)) {
-      const m = line.match(/^(\S+)\s+(\d+)\s/);
-      if (m && parseInt(m[2], 10) === pid) return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
+let hiddenLaunchSeq = 0;
 function spawnHiddenDetached(cmd, args, logFile, extraEnv = null) {
-  const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
-  const batPath = path.join(STATE_DIR, "spawn-hidden.cmd");
-  const vbsPath = path.join(STATE_DIR, "spawn-hidden.vbs");
+  const q = (value) => `"${String(value).replace(/"/g, '""')}"`;
+  const token = `${process.pid}-${Date.now().toString(36)}-${(++hiddenLaunchSeq).toString(36)}`;
+  const batPath = path.join(STATE_DIR, `spawn-hidden-${token}.cmd`);
+  const vbsPath = path.join(STATE_DIR, `spawn-hidden-${token}.vbs`);
   const bat = `@echo off\r\ncd /d ${q(STATE_DIR)}\r\n${q(cmd)} ${args.map(q).join(" ")} >> ${q(logFile)} 2>&1\r\n`;
-  // VBS dùng Chr(34) cho dấu nháy — tránh lỗi escaping chuỗi VBS
   const vbs = [
     'Set sh = CreateObject("WScript.Shell")',
     "q = Chr(34)",
@@ -292,8 +309,12 @@ function spawnHiddenDetached(cmd, args, logFile, extraEnv = null) {
     detached: true,
     env: extraEnv ? { ...process.env, ...extraEnv } : undefined,
   });
-  child.on("error", (err) => console.error("[spawnHiddenDetached] wscript lỗi:", err.message));
-  return child.pid; // wscript exits at once; the real tunnel pid is tracked via tasklist/port
+  child.on("error", (err) => console.error("[spawnHiddenDetached] wscript error:", err.message));
+  const cleanupTimer = setTimeout(() => {
+    void Promise.all([fsp.rm(batPath, { force: true }), fsp.rm(vbsPath, { force: true })]).catch(() => undefined);
+  }, 60000);
+  cleanupTimer.unref?.();
+  return child.pid;
 }
 
 
@@ -354,18 +375,27 @@ async function writeInstanceConfig(name, config) {
   await writeJson(instPaths(name).config, config);
 }
 
+async function updateInstanceConfig(name, updater) {
+  const file = instPaths(name).config;
+  return mutateJson(file, { connectorName: "", lastTunnelUrl: "", healthPort: 8080, autoStart: true }, async (config) => {
+    await updater(config);
+    return config;
+  });
+}
+
 /** Tất cả cổng đang được các instance khác dùng (PORT/ADMIN_PORT/healthPort). */
 async function allUsedPorts(excludeName = null) {
   const ports = new Set();
   for (const n of await listInstances()) {
     if (n === excludeName) continue;
     const env = await readInstanceEnv(n);
-    const p = parseInt(env.PORT, 10);
-    if (p) ports.add(p);
-    const a = parseInt(env.ADMIN_PORT, 10);
-    if (a) ports.add(a);
+    const p = Number(env.PORT);
+    if (Number.isInteger(p) && p > 0 && p < 65536) ports.add(p);
+    const a = Number(env.ADMIN_PORT);
+    if (Number.isInteger(a) && a > 0 && a < 65536) ports.add(a);
     const cfg = await readInstanceConfig(n);
-    ports.add(cfg.healthPort || parseInt(env.OPENAI_TUNNEL_HEALTH_PORT || "8080", 10));
+    const h = Number(cfg.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 8080);
+    if (Number.isInteger(h) && h > 0 && h < 65536) ports.add(h);
   }
   return ports;
 }
@@ -397,7 +427,7 @@ async function ensureInstances() {
   if (!legacyEnv) return;
   const inst = instPaths("default");
   await fsp.mkdir(inst.dir, { recursive: true });
-  await fsp.writeFile(inst.env, legacyEnv, "utf-8");
+  await atomicWriteFile(inst.env, legacyEnv, "utf8");
   const legacyConfig = await readConfig();
   const legacyParsed = parseDotEnv(legacyEnv);
   await writeInstanceConfig("default", {
@@ -424,6 +454,7 @@ async function ensureInstances() {
  *  khi UI gọi /api/instances (mỗi instance 1-2 lần quét mỗi request). */
 const pidScanCache = new Map();
 const PID_SCAN_TTL_MS = 2000;
+function invalidateProcessScanCache() { pidScanCache.clear(); }
 /** PIDs của process imageName mà command line chứa substring (phân biệt instance). */
 function pidsWithCmdLine(imageName, substring) {
   const key = `${imageName}\u0000${substring}`;
@@ -459,6 +490,32 @@ async function serverHealth(port) {
   }
 }
 
+function samePath(a, b) {
+  if (!a || !b) return false;
+  const left = path.resolve(String(a));
+  const right = path.resolve(String(b));
+  return IS_WIN ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+function expectedWorkspacePath(env) {
+  const configured = String(env.WORKSPACE_PATH || "").trim();
+  if (!configured) return null;
+  return path.isAbsolute(configured) ? path.resolve(configured) : path.resolve(ROOT, configured);
+}
+function isLocalCoderHealth(health, env) {
+  if (!health || health.status !== "ok" || health.name !== "codex-mcp-server") return false;
+  const expected = expectedWorkspacePath(env);
+  return !expected || samePath(expected, health.workspace);
+}
+async function tunnelClientHealth(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) });
+    if (!res.ok) return false;
+    const type = String(res.headers.get("content-type") || "").toLowerCase();
+    if (!type.includes("text/html")) return false;
+    return /<title>\s*tunnel-client\s*<\/title>/i.test(await res.text());
+  } catch { return false; }
+}
+
 /* ------------------------------------------------------------------ */
 /* install / server / tunnel control                                   */
 /* ------------------------------------------------------------------ */
@@ -488,12 +545,16 @@ async function runInstall() {
 async function serverStatus(name) {
   const env = await readInstanceEnv(name);
   const inst = instPaths(name);
-  const port = parseInt(env.PORT || "3000", 10);
-  const running = await isPortOpen(port);
-  const pid = running ? pidOnPort(port) : (await readPidFile(inst.serverPid)) || null;
-  let health = null;
-  if (running) health = await serverHealth(port);
-  return { running, port, pid, health };
+  const port = Number(env.PORT || 0);
+  if (!Number.isInteger(port) || port <= 0 || port >= 65536) {
+    return { running: false, port: 0, pid: await readPidFile(inst.serverPid), health: null, portOccupied: false, invalidConfig: true };
+  }
+  const portOpen = await isPortOpen(port);
+  const health = portOpen ? await serverHealth(port) : null;
+  const running = portOpen && isLocalCoderHealth(health, env);
+  const portPid = portOpen ? pidOnPort(port) : null;
+  const savedPid = await readPidFile(inst.serverPid);
+  return { running, port, pid: portPid || savedPid || null, health: running ? health : null, portOccupied: portOpen && !running };
 }
 
 async function warmUpMcp(port) {
@@ -547,6 +608,8 @@ async function warmUpMcp(port) {
 async function startServer(name) {
   const st = await serverStatus(name);
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
+  if (st.invalidConfig) return { ok: false, error: "PORT is invalid; fix configuration before starting Local Coder." };
+  if (st.portOccupied) return { ok: false, error: `PORT ${st.port} is occupied by another process${st.pid ? ` (PID ${st.pid})` : ""}; refusing to start Local Coder.` };
   if (!fs.existsSync(SERVER_ENTRY)) {
     return { ok: false, error: "dist/index.js chưa tồn tại — bấm 'Cài Đặt' trước." };
   }
@@ -571,10 +634,12 @@ async function startServer(name) {
     MCP_ENV_FILE: inst.env,
     MCP_INSTANCE_NAME: name,
   });
+  invalidatePortPidCache();
   await writePidFile(inst.serverPid, pid);
-  const up = await waitFor(() => isPortOpen(st.port), 20000);
+  const up = await waitFor(async () => isLocalCoderHealth(await serverHealth(st.port), env), 20000);
   if (!up) {
-    // xóa pid file stale — không để stopServer giết nhầm process sau này
+    killPidTree(pid);
+    invalidatePortPidCache();
     await writePidFile(inst.serverPid, null);
     const tail = await tailFile(inst.serverLog);
     return { ok: false, error: "Server không khởi động được. Log cuối:\n" + tail.slice(-1500) };
@@ -603,7 +668,7 @@ async function stopServer(name) {
     });
     await response.arrayBuffer().catch(() => undefined);
     if (response.ok) {
-      const graceful = await waitFor(async () => !(await isPortOpen(st.port)), 6000, 150);
+      const graceful = await waitFor(async () => !(await isPortOpen(st.port)), 12000, 150);
       if (graceful) {
         await writePidFile(inst.serverPid, null);
         return { ok: true, port: st.port, stopped: true, graceful: true };
@@ -615,8 +680,9 @@ async function stopServer(name) {
 
   let killed = false;
   const pidFile = await readPidFile(inst.serverPid);
-  if (pidFile) killed = killPidTree(pidFile);
+  if (pidFile && pidFile === st.pid) killed = killPidTree(pidFile);
   if (!killed && st.pid) killed = killPidTree(st.pid);
+  invalidatePortPidCache();
   await writePidFile(inst.serverPid, null);
   await waitFor(async () => !(await isPortOpen(st.port)), 10000);
   return { ok: true, port: st.port, stopped: true, graceful: false, forced: killed };
@@ -626,39 +692,25 @@ async function stopServer(name) {
 async function tunnelStatus(name) {
   const env = await readInstanceEnv(name);
   const config = await readInstanceConfig(name);
-  const inst = instPaths(name);
   const tunnelId = env.OPENAI_TUNNEL_ID || "";
   const apiKey = env.OPENAI_TUNNEL_API_KEY || "";
   const mode = tunnelId && apiKey ? "openai" : "cloudflare";
-  const healthPort = config.healthPort || parseInt(env.OPENAI_TUNNEL_HEALTH_PORT || "8080", 10);
+  const healthPort = Number(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 0);
+  const healthPortValid = Number.isInteger(healthPort) && healthPort > 0 && healthPort < 65536;
   const controlPlaneUrl = tunnelId ? `https://api.openai.com/v1/tunnel/${tunnelId}` : null;
-
-  // Detection theo instance — KHÔNG dùng tasklist toàn cục (tunnel-client.exe của
-  // instance khác gây false-positive): openai = health port mở; cloudflare = pid file.
-  const oaRunning = await isPortOpen(healthPort);
-  const cfRunning = pidAlive(await readPidFile(inst.tunnelPid));
+  const oaPortOpen = healthPortValid ? await isPortOpen(healthPort) : false;
+  const oaRunning = oaPortOpen ? await tunnelClientHealth(healthPort) : false;
+  const serverPort = Number(env.PORT || 0);
+  const cfPids = mode === "cloudflare" && Number.isInteger(serverPort)
+    ? pidsWithCmdLine("cloudflared.exe", `localhost:${serverPort}`)
+    : [];
+  const cfRunning = cfPids.length > 0;
   const running = mode === "openai" ? oaRunning : cfRunning;
   const cloudflaredExists = fs.existsSync(CLOUDFLARED);
-
   if (mode === "openai") {
-    return {
-      running,
-      mode,
-      tunnelId,
-      kind: oaRunning ? "openai" : null,
-      url: oaRunning ? controlPlaneUrl : null,
-      healthPort,
-      cloudflaredExists,
-    };
+    return { running, mode, tunnelId, kind: oaRunning ? "openai" : null, url: oaRunning ? controlPlaneUrl : null, healthPort, cloudflaredExists, invalidConfig: !healthPortValid, portOccupied: oaPortOpen && !oaRunning };
   }
-  return {
-    running,
-    mode: "cloudflare",
-    kind: cfRunning ? "cloudflare" : null,
-    url: cfRunning ? config.lastTunnelUrl : null,
-    cloudflaredExists,
-    healthPort,
-  };
+  return { running, mode: "cloudflare", kind: cfRunning ? "cloudflare" : null, url: cfRunning ? config.lastTunnelUrl : null, cloudflaredExists, healthPort, pid: cfPids[0] || null, invalidConfig: !healthPortValid, portOccupied: false };
 }
 
 async function ensureTunnelClient() {
@@ -708,16 +760,20 @@ async function startTunnel(name) {
   const env = await readInstanceEnv(name);
   const st = await tunnelStatus(name);
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
+  if (st.invalidConfig) return { ok: false, error: "OPENAI_TUNNEL_HEALTH_PORT is invalid; fix configuration before starting Tunnel." };
+  if (st.portOccupied) return { ok: false, error: `Tunnel health port ${st.healthPort} is occupied by another process; refusing to start Tunnel.` };
   const inst = instPaths(name);
+  const port = Number(env.PORT || 0);
+  const serverState = await serverStatus(name);
+  if (!serverState.running) {
+    const reason = serverState.portOccupied ? "the server port is occupied by another process" : "Local Coder server is not running";
+    return { ok: false, error: `Cannot start Tunnel: ${reason} on port ${port}.` };
+  }
 
-  const port = parseInt(env.PORT || "3000", 10);
-  const serverUp = await isPortOpen(port);
-  if (!serverUp) return { ok: false, error: `Server chưa chạy (cổng ${port}) — bật 'Focus Server' trước.` };
-
-  // Dọn tunnel còn sót của CHÍNH instance này (theo profile / cổng) trước khi spawn mới
-  // — không đụng tới tunnel của instance khác
+  // Remove only stale tunnel processes belonging to this instance.
   for (const p of pidsWithCmdLine("tunnel-client.exe", inst.profile)) killPidTree(p);
   for (const p of pidsWithCmdLine("cloudflared.exe", `localhost:${port}`)) killPidTree(p);
+  invalidateProcessScanCache();
 
   if (st.mode === "openai") {
     const healthPort = st.healthPort;
@@ -751,17 +807,17 @@ async function startTunnel(name) {
       CONTROL_PLANE_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_TUNNEL_ID: env.OPENAI_TUNNEL_ID,
     });
-    const up = await waitFor(() => isPortOpen(healthPort), 45000);
+    invalidateProcessScanCache();
+    const up = await waitFor(() => tunnelClientHealth(healthPort), 45000);
     if (!up) {
       for (const p of pidsWithCmdLine(profileFile)) killPidTree(p); // tree-kill: cả codex worker nữa
       await writePidFile(inst.tunnelPid, null);
       const tail = await tailFile(inst.tunnelLog);
       return { ok: false, error: "OpenAI tunnel không khởi động được. Log cuối:\n" + tail.slice(-1500) };
     }
-    const config = await readInstanceConfig(name);
-    config.lastTunnelUrl = `https://api.openai.com/v1/tunnel/${env.OPENAI_TUNNEL_ID}`;
-    await writeInstanceConfig(name, config);
-    return { ok: true, mode: "openai", tunnelId: env.OPENAI_TUNNEL_ID, healthPort, url: config.lastTunnelUrl };
+    const tunnelUrl = `https://api.openai.com/v1/tunnel/${env.OPENAI_TUNNEL_ID}`;
+    await updateInstanceConfig(name, (config) => { config.lastTunnelUrl = tunnelUrl; });
+    return { ok: true, mode: "openai", tunnelId: env.OPENAI_TUNNEL_ID, healthPort, url: tunnelUrl };
   }
 
   // cloudflare
@@ -770,6 +826,7 @@ async function startTunnel(name) {
   }
   await fsp.writeFile(inst.tunnelLog, "");
   const pid = spawnDetached(CLOUDFLARED, ["tunnel", "--url", `http://localhost:${port}`], inst.tunnelLog);
+  invalidateProcessScanCache();
   await writePidFile(inst.tunnelPid, pid);
 
   let url = null;
@@ -786,9 +843,7 @@ async function startTunnel(name) {
     const tail = await tailFile(inst.tunnelLog);
     return { ok: false, error: "Không nhận được URL tunnel. Log cuối:\n" + tail.slice(-1500) };
   }
-  const config = await readInstanceConfig(name);
-  config.lastTunnelUrl = url;
-  await writeInstanceConfig(name, config);
+  await updateInstanceConfig(name, (config) => { config.lastTunnelUrl = url; });
   return { ok: true, mode: "cloudflare", url };
 }
 
@@ -808,17 +863,8 @@ async function stopTunnel(name) {
     killPidTree(p);
     killed = true;
   }
-  if (!killed) {
-    // Legacy adoption (tunnel sinh bởi manager cũ, profile ở profiles/): chỉ an toàn
-    // khi có đúng 1 instance — không thể nhầm sang instance khác
-    const names = await listInstances();
-    if (names.length === 1) {
-      const all = await pidOf(OPENAI_TUNNEL_CLIENT);
-      if (all) killPidTree(all);
-      const cf = await pidOf(CLOUDFLARED_PROC);
-      if (cf) killPidTree(cf);
-    }
-  }
+  invalidateProcessScanCache();
+  // No blind image-name fallback: a stale PID/name can belong to an unrelated tunnel.
   await writePidFile(inst.tunnelPid, null);
   return { ok: true, mode: st.mode, stopped: true };
 }
@@ -918,22 +964,27 @@ const SESSION_POLICY_DEFAULTS = {
  * left untouched and surfaced by validateSessionPolicy/checkConfig instead.
  */
 async function ensureSessionPolicyDefaults(name) {
-  try {
-    const raw = await readInstanceEnvRaw(name);
-    if (!raw.includes("=")) return { changed: false };
-    const env = parseDotEnv(raw);
-    const updates = {};
-    for (const [key, fallback] of Object.entries(SESSION_POLICY_DEFAULTS)) {
-      const current = String(env[key] ?? "").trim();
-      if (current === "") updates[key] = String(fallback);
+  const file = instPaths(name).env;
+  return enqueueFileMutation(file, async () => {
+    try {
+      // Re-read inside the same mutation queue used by saveInstanceEnv so an
+      // auto-start/default-fill cannot overwrite a concurrent config save.
+      const raw = await readInstanceEnvRaw(name);
+      if (!raw.includes("=")) return { changed: false };
+      const env = parseDotEnv(raw);
+      const updates = {};
+      for (const [key, fallback] of Object.entries(SESSION_POLICY_DEFAULTS)) {
+        const current = String(env[key] ?? "").trim();
+        if (current === "") updates[key] = String(fallback);
+      }
+      if (Object.keys(updates).length === 0) return { changed: false };
+      const next = serializeDotEnv({ ...env, ...updates }, raw);
+      await atomicWriteFile(file, next, "utf8");
+      return { changed: true, updates };
+    } catch {
+      return { changed: false };
     }
-    if (Object.keys(updates).length === 0) return { changed: false };
-    const next = serializeDotEnv({ ...env, ...updates }, raw);
-    await fsp.writeFile(instPaths(name).env, next, "utf-8");
-    return { changed: true, updates };
-  } catch {
-    return { changed: false };
-  }
+  });
 }
 
 function validateSessionPolicy(env) {
@@ -978,12 +1029,25 @@ async function checkConfig(name, overrides) {
     push(false, "WORKSPACE_PATH", `${ws} — không tồn tại`);
   }
 
-  const port = parseInt(env.PORT || "", 10);
+  const port = Number(env.PORT);
   push(Number.isInteger(port) && port > 0 && port < 65536, "PORT", env.PORT || "(trống)");
-  const adminPort = parseInt(env.ADMIN_PORT || "", 10);
+  const adminPort = Number(env.ADMIN_PORT);
   push(Number.isInteger(adminPort) && adminPort > 0 && adminPort < 65536, "ADMIN_PORT", env.ADMIN_PORT || "(trống)");
   if (port && adminPort && port === adminPort) {
     push(false, "Cổng trùng", "PORT và ADMIN_PORT không được giống nhau");
+  }
+  const healthPort = Number(env.OPENAI_TUNNEL_HEALTH_PORT || 8080);
+  push(
+    Number.isInteger(healthPort) && healthPort > 0 && healthPort < 65536,
+    "OPENAI_TUNNEL_HEALTH_PORT",
+    env.OPENAI_TUNNEL_HEALTH_PORT || "8080"
+  );
+  if (healthPort && (healthPort === port || healthPort === adminPort || healthPort === managerPortNum)) {
+    push(false, "Tunnel health port", "OPENAI_TUNNEL_HEALTH_PORT phải khác PORT, ADMIN_PORT và MANAGER_PORT");
+  }
+  const usedPorts = await allUsedPorts(name);
+  if (healthPort && usedPorts.has(healthPort)) {
+    push(false, "Tunnel health port", `Port ${healthPort} đã được instance khác dùng`);
   }
 
   const profile = env.CHATGPT_TOOL_PROFILE || "slim";
@@ -1048,7 +1112,21 @@ async function checkConfig(name, overrides) {
   push(fs.existsSync(SERVER_ENTRY), "Build", fs.existsSync(SERVER_ENTRY) ? "dist/index.js tồn tại" : "Chưa build — bấm 'Cài Đặt'");
 
   const st = await serverStatus(name);
-  push(true, "Server", st.running ? `Đang chạy trên cổng ${st.port}` : `Chưa chạy (cổng ${st.port})`);
+  push(
+    !st.portOccupied && !st.invalidConfig,
+    "Server",
+    st.running
+      ? `Đang chạy trên cổng ${st.port}`
+      : st.invalidConfig
+        ? "PORT không hợp lệ"
+        : st.portOccupied
+          ? `Cổng ${st.port} đang bị process khác chiếm${st.pid ? ` (PID ${st.pid})` : ""}`
+          : `Chưa chạy (cổng ${st.port})`
+  );
+  const tun = await tunnelStatus(name);
+  if (tun.mode === "openai" && tun.portOccupied) {
+    push(false, "Tunnel health port", `Port ${tun.healthPort} đang mở nhưng không phải tunnel-client`);
+  }
 
   return { ok: items.every((i) => i.ok), items };
 }
@@ -1111,28 +1189,33 @@ async function createInstance(body) {
   const used = await allUsedPorts();
   used.add(managerPortNum);
   // Nếu client gửi port/adminPort: phải là số nguyên trong 3000–3999 (không tự cấp thay cho giá trị lỗi)
-  const reqPort = body.port === undefined || body.port === null || body.port === "" ? 0 : parseInt(body.port, 10);
-  const reqAdmin = body.adminPort === undefined || body.adminPort === null || body.adminPort === "" ? 0 : parseInt(body.adminPort, 10);
+  const reqPort = body.port === undefined || body.port === null || body.port === "" ? 0 : Number(body.port);
+  const reqAdmin = body.adminPort === undefined || body.adminPort === null || body.adminPort === "" ? 0 : Number(body.adminPort);
   if (reqPort !== 0 && (!Number.isInteger(reqPort) || reqPort < 3000 || reqPort > 3999)) {
     return { ok: false, error: `PORT '${body.port}' không hợp lệ — phải là số nguyên 3000–3999 (để trống = tự chọn).` };
   }
   if (reqAdmin !== 0 && (!Number.isInteger(reqAdmin) || reqAdmin < 3000 || reqAdmin > 3999)) {
     return { ok: false, error: `ADMIN_PORT '${body.adminPort}' không hợp lệ — phải là số nguyên 3000–3999 (để trống = tự chọn).` };
   }
+  if (reqPort && (used.has(reqPort) || await isPortOpen(reqPort))) return { ok: false, error: `PORT ${reqPort} is already in use.` };
+  if (reqAdmin && (used.has(reqAdmin) || await isPortOpen(reqAdmin))) return { ok: false, error: `ADMIN_PORT ${reqAdmin} is already in use.` };
   let port = reqPort;
   if (!port) {
-    for (let p = 3000; p < 4000; p++) if (!used.has(p)) { port = p; break; }
+    for (let candidate = 3000; candidate < 4000; candidate++) if (!used.has(candidate) && !(await isPortOpen(candidate))) { port = candidate; break; }
   }
   let adminPort = reqAdmin;
   if (!adminPort) {
-    for (let p = 3000; p < 4000; p++) if (p !== port && !used.has(p)) { adminPort = p; break; }
+    for (let candidate = 3000; candidate < 4000; candidate++) if (candidate !== port && !used.has(candidate) && !(await isPortOpen(candidate))) { adminPort = candidate; break; }
   }
   if (!port || !adminPort) return { ok: false, error: "Không tìm được cổng trống trong 3000–3999." };
   if (port === adminPort) return { ok: false, error: "PORT và ADMIN_PORT không được giống nhau." };
   if (used.has(port)) return { ok: false, error: `Cổng ${port} đã được instance khác (hoặc manager) dùng.` };
   if (used.has(adminPort)) return { ok: false, error: `Cổng ${adminPort} đã được instance khác (hoặc manager) dùng.` };
-  let healthPort = 8080;
-  for (let h = 8080; h < 8200; h++) if (!used.has(h)) { healthPort = h; break; }
+  let healthPort = 0;
+  for (let candidate = 8080; candidate < 8200; candidate++) {
+    if (!used.has(candidate) && candidate !== port && candidate !== adminPort && candidate !== managerPortNum && !(await isPortOpen(candidate))) { healthPort = candidate; break; }
+  }
+  if (!healthPort) return { ok: false, error: "No free tunnel health port found in 8080-8199." };
   const inst = instPaths(name);
   await fsp.mkdir(inst.dir, { recursive: true });
   const ws = String(body.workspacePath || "").trim();
@@ -1153,7 +1236,7 @@ async function createInstance(body) {
     `MCP_MAX_SESSIONS=${SESSION_POLICY_DEFAULTS.MCP_MAX_SESSIONS}`,
     "",
   ].join("\n");
-  await fsp.writeFile(inst.env, envText, "utf-8");
+  await atomicWriteFile(inst.env, envText, "utf8");
   await writeInstanceConfig(name, {
     connectorName: body.connectorName ? String(body.connectorName).slice(0, 80) : "",
     lastTunnelUrl: "",
@@ -1213,15 +1296,12 @@ async function renameInstance(name, body) {
   }
   return { ok: true, name: newName, renamed: true };
 }
-async function saveInstanceEnv(name, body) {
+async function saveInstanceEnvUnlocked(name, body) {
   const inst = instPaths(name);
   const original = await readInstanceEnvRaw(name);
   const originalValues = parseDotEnv(original);
   let next;
   if (typeof body.raw === "string") {
-    // The raw editor round-trips masked lines (KEY=********). Restore each
-    // sentinel from the original so editing a non-secret line never erases
-    // credentials; every other line is kept verbatim (comments/order intact).
     next = body.raw
       .split(/\r?\n/)
       .map((line) => {
@@ -1233,58 +1313,58 @@ async function saveInstanceEnv(name, body) {
       .join("\n");
   } else {
     const values = { ...(body.values || {}) };
-    // ADMIN_PORT giờ tự cấp + ẩn khỏi UI — nếu không gửi thì giữ giá trị cũ
-    // (vẫn theo workspace, mỗi MCP server có admin riêng, truy cập qua manager proxy).
     if (!(body.values && Object.prototype.hasOwnProperty.call(body.values, "ADMIN_PORT"))) {
       if (originalValues.ADMIN_PORT) values.ADMIN_PORT = originalValues.ADMIN_PORT;
     }
-    for (const [k, v] of Object.entries(values)) {
-      if (v === undefined) values[k] = null;
-      else if (v === MASK_SENTINEL) {
-        const orig = originalValues[k];
-        values[k] = orig !== undefined ? orig : null;
-      }
+    for (const [key, value] of Object.entries(values)) {
+      if (value === undefined) values[key] = null;
+      else if (value === MASK_SENTINEL) values[key] = originalValues[key] !== undefined ? originalValues[key] : null;
     }
     next = serializeDotEnv(values, original);
   }
+
   const parsed = parseDotEnv(next);
   const sessionPolicy = validateSessionPolicy(parsed);
   if (!sessionPolicy.ok) return { ok: false, error: sessionPolicy.errors.join("; ") };
-  const port = parseInt(parsed.PORT || "", 10);
-  const adminPort = parseInt(parsed.ADMIN_PORT || "", 10);
-  if (!Number.isInteger(port) || !Number.isInteger(adminPort) || port <= 0 || adminPort <= 0) {
-    return { ok: false, error: "PORT và ADMIN_PORT phải là số nguyên dương." };
+
+  const port = Number(parsed.PORT);
+  const adminPort = Number(parsed.ADMIN_PORT);
+  if (!Number.isInteger(port) || port <= 0 || port >= 65536 || !Number.isInteger(adminPort) || adminPort <= 0 || adminPort >= 65536) {
+    return { ok: false, error: "PORT and ADMIN_PORT must be integers in 1-65535." };
   }
-  if (port === adminPort) return { ok: false, error: "PORT và ADMIN_PORT không được giống nhau." };
+  if (port === adminPort) return { ok: false, error: "PORT and ADMIN_PORT must differ." };
+
   const used = await allUsedPorts(name);
   used.add(managerPortNum);
-  if (used.has(port)) return { ok: false, error: `Cổng ${port} đã được instance khác (hoặc manager) dùng.` };
-  if (used.has(adminPort)) return { ok: false, error: `Cổng ${adminPort} đã được instance khác (hoặc manager) dùng.` };
-  const hp = parseInt(parsed.OPENAI_TUNNEL_HEALTH_PORT || "", 10);
-  // Mỗi workspace phải có tunnel riêng — chặn trùng ID/API key với instance khác
+  if (used.has(port)) return { ok: false, error: `PORT ${port} is already used by another instance or the manager.` };
+  if (used.has(adminPort)) return { ok: false, error: `ADMIN_PORT ${adminPort} is already used by another instance or the manager.` };
+
+  const hp = Number(parsed.OPENAI_TUNNEL_HEALTH_PORT || 8080);
+  if (!Number.isInteger(hp) || hp <= 0 || hp >= 65536) return { ok: false, error: "OPENAI_TUNNEL_HEALTH_PORT must be an integer in 1-65535." };
+  if (hp === port || hp === adminPort || hp === managerPortNum) return { ok: false, error: "OPENAI_TUNNEL_HEALTH_PORT must differ from PORT, ADMIN_PORT and MANAGER_PORT." };
+  if (used.has(hp)) return { ok: false, error: `Tunnel health port ${hp} is already used by another instance.` };
+
+  const oldPort = Number(originalValues.PORT || 0);
+  const oldAdminPort = Number(originalValues.ADMIN_PORT || 0);
+  const oldHealthPort = Number(originalValues.OPENAI_TUNNEL_HEALTH_PORT || 0);
+  if (port !== oldPort && await isPortOpen(port)) return { ok: false, error: `PORT ${port} is occupied by another process.` };
+  if (adminPort !== oldAdminPort && await isPortOpen(adminPort)) return { ok: false, error: `ADMIN_PORT ${adminPort} is occupied by another process.` };
+  if (hp !== oldHealthPort && await isPortOpen(hp)) return { ok: false, error: `Tunnel health port ${hp} is occupied by another process.` };
+
   const conflicts = await findTunnelConflicts(name, parsed.OPENAI_TUNNEL_ID, parsed.OPENAI_TUNNEL_API_KEY);
   if (conflicts.length) {
     const first = conflicts[0];
-    return {
-      ok: false,
-      error: `Tunnel ${first.field === "OPENAI_TUNNEL_ID" ? "ID" : "API key"} '${first.value}' đã được instance '${first.instance}' dùng — mỗi workspace phải có tunnel riêng.`,
-    };
+    return { ok: false, error: `Tunnel ${first.field === "OPENAI_TUNNEL_ID" ? "ID" : "API key"} '${first.value}' is already used by instance '${first.instance}'; each workspace must use its own tunnel.` };
   }
-  // Atomic write: ghi temp rồi rename (Windows rename overwrite cần unlink trước)
-  const tmp = inst.env + ".tmp";
-  await fsp.writeFile(tmp, next, "utf-8");
-  try {
-    await fsp.rename(tmp, inst.env);
-  } catch {
-    await fsp.rm(inst.env, { force: true });
-    await fsp.rename(tmp, inst.env);
-  }
-  const config = await readInstanceConfig(name);
-  if (hp && hp !== config.healthPort) {
-    config.healthPort = hp;
-    await writeInstanceConfig(name, config);
-  }
+
+  await atomicWriteFile(inst.env, next, "utf8");
+  await updateInstanceConfig(name, (config) => { config.healthPort = hp; });
   return { ok: true, path: inst.env };
+}
+
+async function saveInstanceEnv(name, body) {
+  const file = instPaths(name).env;
+  return enqueueFileMutation(file, () => saveInstanceEnvUnlocked(name, body));
 }
 
 /* ------------------------------------------------------------------ */
@@ -1471,11 +1551,11 @@ async function handleApi(req, res, url, body) {
 
     if (req.method === "GET" && sub === "/config") return json(res, 200, { ok: true, ...(await readInstanceConfig(name)) });
     if (req.method === "PUT" && sub === "/config") {
-      const config = await readInstanceConfig(name);
-      if (typeof body.connectorName === "string") config.connectorName = body.connectorName.slice(0, 80);
-      if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
-      if (typeof body.autoStart === "boolean") config.autoStart = body.autoStart;
-      await writeInstanceConfig(name, config);
+      const config = await updateInstanceConfig(name, (config) => {
+        if (typeof body.connectorName === "string") config.connectorName = body.connectorName.slice(0, 80);
+        if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
+        if (typeof body.autoStart === "boolean") config.autoStart = body.autoStart;
+      });
       return json(res, 200, { ok: true, config });
     }
 
@@ -1499,23 +1579,19 @@ async function handleApi(req, res, url, body) {
         1048576
       );
       const file = kind === "tunnel" ? inst.tunnelLog : inst.serverLog;
-      const [rawLog, st] = await Promise.all([
-        tailFile(file, max),
-        fsp.stat(file).catch(() => null),
-      ]);
-      // Tail cắt giữa chừng → bỏ phần đầu dòng dở dang (chỉ khi file lớn hơn max)
+      const st = await fsp.stat(file).catch(() => null);
+      const ifSize = Number(url.searchParams.get("if_size"));
+      const ifMtime = Number(url.searchParams.get("if_mtime"));
+      if (st && Number.isFinite(ifSize) && Number.isFinite(ifMtime) && ifSize === st.size && ifMtime === st.mtimeMs) {
+        return json(res, 200, { ok: true, kind, unchanged: true, log: "", size: st.size, mtime: st.mtimeMs });
+      }
+      const rawLog = st ? await tailFile(file, max) : "";
       let log = rawLog;
       if (st && st.size > max) {
         const nl = log.indexOf("\n");
         if (nl > 0) log = log.slice(nl + 1);
       }
-      return json(res, 200, {
-        ok: true,
-        kind,
-        log,
-        size: st ? st.size : 0,
-        mtime: st ? st.mtimeMs : 0,
-      });
+      return json(res, 200, { ok: true, kind, log, size: st ? st.size : 0, mtime: st ? st.mtimeMs : 0 });
     }
     return json(res, 404, { ok: false, error: "Not found" });
   }
@@ -1590,37 +1666,39 @@ async function handleApi(req, res, url, body) {
   }
 
   if (req.method === "PUT" && p === "/api/config") {
-    const config = await readInstanceConfig(dname);
-    if (typeof body.connectorName === "string") config.connectorName = body.connectorName.slice(0, 80);
-    if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
-    await writeInstanceConfig(dname, config);
+    const config = await updateInstanceConfig(dname, (config) => {
+      if (typeof body.connectorName === "string") config.connectorName = body.connectorName.slice(0, 80);
+      if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
+    });
     return json(res, 200, { ok: true, config });
   }
 
   if (req.method === "GET" && p === "/api/profiles") {
-    const profiles = await readJson(PROFILES_PATH, {});
+    const profiles = await mutateJson(PROFILES_PATH, {}, (profiles) => scrubProfiles(profiles));
     return json(res, 200, { ok: true, profiles });
   }
 
   if (req.method === "POST" && p === "/api/profiles") {
-    const profiles = await readJson(PROFILES_PATH, {});
-    const name = String(body.name || "").trim();
-    if (!name) return json(res, 400, { ok: false, error: "Tên profile trống" });
-    if (!/^[a-zA-Z0-9._-]{1,40}$/.test(name)) {
-      return json(res, 400, { ok: false, error: "Tên profile: 1–40 ký tự, chỉ chữ/số/dấu chấm/gạch ngang/gạch dưới." });
+    const profileName = String(body.name || "").trim();
+    if (!profileName) return json(res, 400, { ok: false, error: "Profile name is required." });
+    if (!/^[a-zA-Z0-9._-]{1,40}$/.test(profileName)) {
+      return json(res, 400, { ok: false, error: "Profile name must be 1-40 characters: letters, numbers, dot, dash or underscore." });
     }
-    profiles[name] = { savedAt: new Date().toISOString(), values: body.values || {} };
-    await writeJson(PROFILES_PATH, profiles);
+    const profiles = await mutateJson(PROFILES_PATH, {}, (profiles) => {
+      scrubProfiles(profiles);
+      profiles[profileName] = { savedAt: new Date().toISOString(), values: withoutSecrets(body.values || {}) };
+      return profiles;
+    });
     return json(res, 200, { ok: true, profiles });
   }
 
   if (req.method === "DELETE" && p === "/api/profiles") {
-    const profiles = await readJson(PROFILES_PATH, {});
-    const name = String(url.searchParams.get("name") || "").trim();
-    if (profiles[name]) {
-      delete profiles[name];
-      await writeJson(PROFILES_PATH, profiles);
-    }
+    const profileName = String(url.searchParams.get("name") || "").trim();
+    const profiles = await mutateJson(PROFILES_PATH, {}, (profiles) => {
+      scrubProfiles(profiles);
+      if (profiles[profileName]) delete profiles[profileName];
+      return profiles;
+    });
     return json(res, 200, { ok: true, profiles });
   }
 

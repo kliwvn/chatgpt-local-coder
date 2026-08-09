@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
+import { atomicWriteFile } from "./atomic-write.js";
 
 export type UpstreamTransport = "stdio" | "http";
 export type UpstreamExposeMode = "none" | "meta_only" | "allowlist" | "all";
@@ -137,8 +138,7 @@ export async function saveUpstreamConfig(
   configPath = resolveUpstreamConfigPath()
 ): Promise<void> {
   const normalized = normalizeUpstreamConfig(config);
-  await fs.mkdir(path.dirname(configPath), { recursive: true });
-  await fs.writeFile(configPath, JSON.stringify(normalized, null, 2), "utf-8");
+  await atomicWriteFile(configPath, JSON.stringify(normalized, null, 2), "utf8");
 }
 
 export type McpImportSource = "cursor" | "claude" | "opencode" | "file";

@@ -1,0 +1,43 @@
+﻿import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-state-concurrency-"));
+try {
+  process.env.CHECKPOINT_PATH = path.join(root, "checkpoints");
+  process.env.CHECKPOINT_ENABLED = "true";
+  process.env.CHECKPOINT_MAX_COUNT = "200";
+  const checkpoints = await import("../dist/lib/checkpoint.js");
+  await checkpoints.clearCheckpoints();
+  const files = [];
+  for (let i = 0; i < 30; i++) {
+    const file = path.join(root, `file-${i}.txt`);
+    await fs.writeFile(file, `v${i}`);
+    files.push(file);
+  }
+  const ids = await Promise.all(files.map((file, i) => checkpoints.checkpointBefore("write_file", [file], { summary: `cp-${i}` })));
+  const indexed = await checkpoints.listCheckpoints(100);
+  if (ids.filter(Boolean).length !== 30 || indexed.length !== 30 || new Set(indexed.map((x) => x.id)).size !== 30) {
+    throw new Error(`checkpoint lost update: ids=${ids.filter(Boolean).length} indexed=${indexed.length}`);
+  }
+
+  process.env.CODEX_HOME = path.join(root, "codex-home");
+  const memory = await import("../dist/lib/auto-memory.js");
+  await Promise.all(Array.from({ length: 30 }, (_, i) => memory.appendAutoMemory("C:/concurrent-memory", `unique-note-${String(i).padStart(2, "0")}`)));
+  const projectDirs = await fs.readdir(path.join(root, "codex-home", "projects"));
+  const memoryText = await fs.readFile(path.join(root, "codex-home", "projects", projectDirs[0], "MEMORY.md"), "utf8");
+  const noteLines = memoryText.split(/\r?\n/).filter((line) => line.startsWith("- "));
+  if (noteLines.length !== 30 || new Set(noteLines).size !== 30) throw new Error(`auto-memory lost update: ${noteLines.length}/30`);
+
+  process.env.MCP_SHELL_STATE_DIR = path.join(root, "shell-state");
+  const shell = await import("../dist/lib/global-shell-state.js");
+  await Promise.all(Array.from({ length: 30 }, (_, i) => shell.saveGlobalShellState("C:/concurrent-shell", "C:/concurrent-shell", `command-${String(i).padStart(2, "0")}`, null)));
+  const state = await shell.loadGlobalShellState("C:/concurrent-shell", "C:/concurrent-shell");
+  if (!state || state.recent_commands.length !== 20 || new Set(state.recent_commands).size !== 20) {
+    throw new Error(`shell-state lost update: ${state?.recent_commands?.length ?? 0}/20`);
+  }
+
+  console.log("state-concurrency: ok (checkpoint 30/30, memory 30/30, shell recent 20/20)");
+} finally {
+  await fs.rm(root, { recursive: true, force: true });
+}

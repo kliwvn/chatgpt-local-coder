@@ -14,6 +14,7 @@ import {
 } from "../lib/mcp-upstream-config.js";
 import { getDefaultCwd, getFullDiskAccess } from "../lib/path-security.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
+import { atomicWriteFile } from "../lib/atomic-write.js";
 import {
   getRecentActivity,
   loadAuditHistory,
@@ -106,6 +107,12 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 }): Router {
   const router = Router();
   const envPath = path.resolve(process.env.MCP_ENV_FILE || path.join(process.cwd(), ".env"));
+  let envMutationChain: Promise<void> = Promise.resolve();
+  function enqueueEnvMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = envMutationChain.then(operation, operation);
+    envMutationChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
   // Header names that carry credentials even though they don't match
   // SECRET_KEY_PATTERN (e.g. "authorization" — the AUTH alternative requires
   // `_`/end so it won't match "Authorization").
@@ -279,42 +286,41 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         res.status(400).json({ ok: false, error: "values object required" });
         return;
       }
-      // Loại bỏ giá trị mask trước khi serialize — nếu không sẽ ghi "********" đè secret thật
-      const filtered: Record<string, string> = {};
-      for (const [k, v] of Object.entries(values)) {
-        if (typeof v !== "string") {
-          res.status(400).json({ ok: false, error: `Environment value for ${k} must be a string` });
+      for (const [key, value] of Object.entries(values)) {
+        if (typeof value !== "string") {
+          res.status(400).json({ ok: false, error: `Environment value for ${key} must be a string` });
           return;
         }
-        if (v !== REDACTED_MASK) filtered[k] = v;
       }
-      let original = "";
-      try {
-        original = await fs.readFile(envPath, "utf-8");
-      } catch {}
-      const next = serializeDotEnv(filtered, original || "");
-      const validationError = validateAdminEnv(next);
-      if (validationError) {
-        res.status(400).json({ ok: false, error: validationError });
+
+      const result = await enqueueEnvMutation(async () => {
+        const filtered: Record<string, string> = {};
+        for (const [key, value] of Object.entries(values)) {
+          if (value !== REDACTED_MASK) filtered[key] = value;
+        }
+        let original = "";
+        try {
+          original = await fs.readFile(envPath, "utf-8");
+        } catch {}
+        const next = serializeDotEnv(filtered, original || "");
+        const validationError = validateAdminEnv(next);
+        if (validationError) return { ok: false as const, error: validationError };
+        await atomicWriteFile(envPath, next, "utf8");
+        return { ok: true as const };
+      });
+
+      if (!result.ok) {
+        res.status(400).json(result);
         return;
       }
-      const tmpPath = `${envPath}.tmp-${process.pid}`;
-      await fs.writeFile(tmpPath, next, "utf-8");
-      try {
-        await fs.rename(tmpPath, envPath);
-      } catch {
-        await fs.rm(envPath, { force: true });
-        await fs.rename(tmpPath, envPath);
-      }
-      // Do not mutate process.env here: session/workspace/tool-profile config is
-      // captured at startup while a few security helpers read env dynamically.
-      // Partial live application would create a mixed old/new runtime. Persist
-      // atomically and require one clean restart for all settings.
+      // Runtime settings are captured at startup; persist consistently and
+      // require one clean restart instead of mixing old/new process state.
       res.json({ ok: true, path: envPath, restart_required: true });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
   });
+
   router.get("/api/upstream", async (_req, res) => {
     res.json({ ok: true, config: maskUpstreamConfig(manager.getConfig()), path: manager.getConfigPath() });
   });

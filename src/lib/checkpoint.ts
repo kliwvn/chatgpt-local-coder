@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { randomUUID, createHash } from "node:crypto";
+import { atomicWriteFile } from "./atomic-write.js";
 
 export interface CheckpointFileSnapshot {
   path: string;
@@ -41,6 +42,18 @@ const DEFAULT_MAX_COUNT = 500;
 const DEFAULT_RETENTION_DAYS = 30;
 const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_DIRECTORY_DEPTH = 32;
+
+let checkpointMutationChain: Promise<void> = Promise.resolve();
+
+function enqueueCheckpointMutation<T>(operation: () => Promise<T>): Promise<T> {
+  const run = checkpointMutationChain.then(operation, operation);
+  checkpointMutationChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function waitForCheckpointMutations(): Promise<void> {
+  await checkpointMutationChain.catch(() => undefined);
+}
 
 function isEnabled(): boolean {
   const raw = (process.env.CHECKPOINT_ENABLED ?? "true").trim().toLowerCase();
@@ -103,7 +116,7 @@ async function readIndex(): Promise<CheckpointIndex> {
 async function writeIndex(index: CheckpointIndex): Promise<void> {
   const root = getStoreRoot();
   await fs.mkdir(root, { recursive: true });
-  await fs.writeFile(indexPath(), JSON.stringify(index, null, 2), "utf-8");
+  await atomicWriteFile(indexPath(), JSON.stringify(index, null, 2), "utf8");
 }
 
 async function readManifest(id: string): Promise<CheckpointManifest | null> {
@@ -204,7 +217,7 @@ async function restoreSnapshot(snapshot: CheckpointFileSnapshot): Promise<void> 
     snapshot.encoding === "base64"
       ? Buffer.from(snapshot.content || "", "base64")
       : Buffer.from(snapshot.content || "", "utf-8");
-  await fs.writeFile(target, buffer);
+  await atomicWriteFile(target, buffer);
 }
 
 async function removeCheckpointData(id: string): Promise<void> {
@@ -262,7 +275,7 @@ export function getCheckpointConfig(): Record<string, unknown> {
   };
 }
 
-export async function checkpointBefore(
+async function checkpointBeforeUnlocked(
   tool: string,
   paths: string[],
   options?: { summary?: string; dry_run?: boolean }
@@ -294,7 +307,7 @@ export async function checkpointBefore(
 
   const dir = checkpointDir(id);
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(manifestPath(id), JSON.stringify(manifest, null, 2), "utf-8");
+  await atomicWriteFile(manifestPath(id), JSON.stringify(manifest, null, 2), "utf8");
 
   const index = await readIndex();
   index.checkpoints.push(buildSummary(manifest));
@@ -304,12 +317,23 @@ export async function checkpointBefore(
   return id;
 }
 
+
+export async function checkpointBefore(
+  tool: string,
+  paths: string[],
+  options?: { summary?: string; dry_run?: boolean }
+): Promise<string | null> {
+  return enqueueCheckpointMutation(() => checkpointBeforeUnlocked(tool, paths, options));
+}
+
 export async function listCheckpoints(limit = 50): Promise<CheckpointSummary[]> {
+  await waitForCheckpointMutations();
   const index = await readIndex();
   return [...index.checkpoints].reverse().slice(0, Math.max(1, limit));
 }
 
 export async function getCheckpoint(id: string): Promise<CheckpointSummary | null> {
+  await waitForCheckpointMutations();
   const index = await readIndex();
   return index.checkpoints.find((cp) => cp.id === id) ?? null;
 }
@@ -358,6 +382,7 @@ export async function previewRestore(targetId: string): Promise<{
   }>;
   skipped_snapshots: Array<{ path: string; reason?: string }>;
 }> {
+  await waitForCheckpointMutations();
   const { target, files, skipped } = await collectRestorePlan(targetId);
   const changes: Array<{
     path: string;
@@ -407,7 +432,7 @@ export async function previewRestore(targetId: string): Promise<{
   };
 }
 
-export async function restoreToCheckpoint(targetId: string): Promise<{
+async function restoreToCheckpointUnlocked(targetId: string): Promise<{
   checkpoint: CheckpointSummary;
   restored: string[];
   deleted: string[];
@@ -453,7 +478,17 @@ export async function restoreToCheckpoint(targetId: string): Promise<{
   return { checkpoint: target, restored, deleted, skipped };
 }
 
-export async function clearCheckpoints(): Promise<number> {
+
+export async function restoreToCheckpoint(targetId: string): Promise<{
+  checkpoint: CheckpointSummary;
+  restored: string[];
+  deleted: string[];
+  skipped: Array<{ path: string; reason?: string }>;
+}> {
+  return enqueueCheckpointMutation(() => restoreToCheckpointUnlocked(targetId));
+}
+
+async function clearCheckpointsUnlocked(): Promise<number> {
   const index = await readIndex();
   const count = index.checkpoints.length;
   for (const cp of index.checkpoints) {
@@ -461,6 +496,11 @@ export async function clearCheckpoints(): Promise<number> {
   }
   await writeIndex({ version: INDEX_VERSION, checkpoints: [] });
   return count;
+}
+
+
+export async function clearCheckpoints(): Promise<number> {
+  return enqueueCheckpointMutation(clearCheckpointsUnlocked);
 }
 
 export function checkpointFingerprint(paths: string[]): string {

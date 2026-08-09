@@ -70,6 +70,7 @@ try {
       ...process.env,
       MANAGER_PORT: String(port),
       MANAGER_INSTANCES_DIR: path.join(dir, "instances"),
+      MANAGER_STATE_DIR: path.join(dir, "state"),
       // Ensure no legacy ROOT/.env migration surprises.
       MCP_ENV_FILE: path.join(dir, "env-legacy-do-not-use"),
     },

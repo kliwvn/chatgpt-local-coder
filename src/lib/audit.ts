@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { appendActivity } from "./activity-log.js";
+import { redactSensitiveValue } from "./redaction.js";
 
 export type AuditStatus = "ok" | "error" | "blocked" | "dry-run";
 
@@ -25,34 +26,45 @@ function resolveAuditPath(): string {
 }
 
 const auditPath = resolveAuditPath();
+const parsedAuditMaxBytes = Number.parseInt(process.env.AUDIT_LOG_MAX_BYTES || "", 10);
+const auditMaxBytes = Number.isFinite(parsedAuditMaxBytes) && parsedAuditMaxBytes >= 1024
+  ? parsedAuditMaxBytes
+  : 10 * 1024 * 1024;
+let auditWriteChain: Promise<void> = Promise.resolve();
+
+async function appendAuditRecord(record: Record<string, unknown>): Promise<void> {
+  await fs.mkdir(path.dirname(auditPath), { recursive: true });
+  const stat = await fs.stat(auditPath).catch(() => null);
+  if (stat && stat.size > auditMaxBytes) {
+    await fs.rm(`${auditPath}.1`, { force: true }).catch(() => undefined);
+    await fs.rename(auditPath, `${auditPath}.1`).catch(() => undefined);
+  }
+  await fs.appendFile(auditPath, JSON.stringify(record) + "\n", "utf-8");
+}
 
 export async function audit(event: AuditEvent): Promise<void> {
+  const safeEvent = redactSensitiveValue(event) as AuditEvent;
   const record = {
     time: new Date().toISOString(),
     pid: process.pid,
-    ...event,
+    ...safeEvent,
   };
 
-  try {
-    await fs.mkdir(path.dirname(auditPath), { recursive: true });
-    const stat = await fs.stat(auditPath).catch(() => null);
-    if (stat && stat.size > 10 * 1024 * 1024) {
-      await fs.rename(auditPath, `${auditPath}.1`).catch(() => undefined);
-    }
-    await fs.appendFile(auditPath, JSON.stringify(record) + "\n", "utf-8");
-  } catch {
-    // Audit must never break the requested tool call.
-  }
+  // Tool calls from multiple MCP sessions can finish concurrently. Serialize the
+  // stat/rotate/append critical section so two writers cannot race log rotation.
+  const write = auditWriteChain.then(() => appendAuditRecord(record));
+  auditWriteChain = write.catch(() => undefined);
+  await write.catch(() => undefined); // audit must never break the requested tool call
 
   try {
     appendActivity({
       kind: "tool",
-      tool: event.tool,
-      action: event.action,
-      target: event.target,
-      status: event.status ?? "ok",
-      summary: event.target || (event.details ? JSON.stringify(event.details).slice(0, 120) : undefined),
-      details: event.details,
+      tool: safeEvent.tool,
+      action: safeEvent.action,
+      target: safeEvent.target,
+      status: safeEvent.status ?? "ok",
+      summary: safeEvent.target || (safeEvent.details ? JSON.stringify(safeEvent.details).slice(0, 120) : undefined),
+      details: safeEvent.details,
     });
   } catch {}
 }

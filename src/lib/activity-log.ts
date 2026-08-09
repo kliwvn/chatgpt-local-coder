@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "fs/promises";
 import { getAuditPath } from "./audit.js";
+import { redactSensitiveText, redactSensitiveValue } from "./redaction.js";
 
 export function formatLogTime(d: Date | string = new Date()): string {
   const dt = typeof d === "string" ? new Date(d) : d;
@@ -32,7 +33,7 @@ const entries: ActivityEntry[] = [];
 const listeners = new Set<(entry: ActivityEntry) => void>();
 
 function trimSummary(text: string, max = 160): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
+  const oneLine = redactSensitiveText(text).replace(/\s+/g, " ").trim();
   return oneLine.length <= max ? oneLine : oneLine.slice(0, max - 1) + "…";
 }
 
@@ -57,10 +58,11 @@ export function summarizeToolArgs(tool: string, args: unknown): string {
 }
 
 export function appendActivity(partial: Omit<ActivityEntry, "id" | "time"> & { time?: string }): ActivityEntry {
+  const safePartial = redactSensitiveValue(partial) as typeof partial;
   const entry: ActivityEntry = {
     id: randomUUID(),
-    time: partial.time ?? new Date().toISOString(),
-    ...partial,
+    time: safePartial.time ?? new Date().toISOString(),
+    ...safePartial,
   };
 
   entries.push(entry);
@@ -155,7 +157,7 @@ export async function loadAuditHistory(limit = 80): Promise<ActivityEntry[]> {
     const slice = lines.slice(-limit);
     return slice.map((line) => {
       try {
-        const rec = JSON.parse(line) as Record<string, unknown>;
+        const rec = redactSensitiveValue(JSON.parse(line)) as Record<string, unknown>;
         return {
           id: randomUUID(),
           time: String(rec.time || new Date().toISOString()),
@@ -172,7 +174,7 @@ export async function loadAuditHistory(limit = 80): Promise<ActivityEntry[]> {
           id: randomUUID(),
           time: new Date().toISOString(),
           kind: "system" as const,
-          summary: line.slice(0, 200),
+          summary: redactSensitiveText(line.slice(0, 200)),
         };
       }
     }).reverse();

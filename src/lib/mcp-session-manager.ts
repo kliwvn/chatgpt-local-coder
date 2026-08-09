@@ -37,6 +37,9 @@ const SESSION_TTL_MS = positiveEnvInt("MCP_SESSION_TTL_MS", 2 * 60 * 1000);
 const SESSION_CLEANUP_INTERVAL_MS = positiveEnvInt("MCP_SESSION_CLEANUP_MS", 15 * 1000);
 const SESSION_DELETE_GRACE_MS = positiveEnvInt("MCP_SESSION_DELETE_GRACE_MS", 45 * 1000);
 const MAX_SESSION_COUNT = positiveEnvInt("MCP_MAX_SESSIONS", 64);
+// Internal shutdown safety bound. Keep this below the process-level graceful
+// shutdown deadline so one wedged SDK transport cannot stall all sessions.
+const SESSION_RESOURCE_CLOSE_TIMEOUT_MS = 2000;
 
 const lastTransportErrors: Record<string, string> = {};
 const sessionOpChains = new Map<string, Promise<void>>();
@@ -232,13 +235,28 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     return session;
   }
 
-  async function closeSessionResources(session: McpSession): Promise<void> {
-    // McpServer.close() owns the connected transport. Use transport.close only
-    // as a fallback; double-closing both concurrently can trip SDK callbacks.
+  async function settleWithin(operation: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await session.server.close();
-    } catch {
-      await session.transport.close().catch(() => undefined);
+      return await Promise.race([
+        operation.then(() => true, () => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+          timer.unref?.();
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  async function closeSessionResources(session: McpSession): Promise<void> {
+    // One wedged SDK transport must not hold the whole process shutdown until
+    // the global hard-exit deadline. Let McpServer own normal close, then fall
+    // back to the transport with a bounded wait if close rejects or times out.
+    const serverClosed = await settleWithin(session.server.close(), SESSION_RESOURCE_CLOSE_TIMEOUT_MS);
+    if (!serverClosed) {
+      await settleWithin(session.transport.close().catch(() => undefined), Math.min(1000, SESSION_RESOURCE_CLOSE_TIMEOUT_MS));
     }
   }
 

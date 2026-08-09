@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import fs from "fs/promises";
 import path from "path";
+import { atomicWriteFile } from "./atomic-write.js";
 
 export interface GlobalShellState {
   workspace_key: string;
@@ -16,6 +17,15 @@ function stateDir(): string {
 }
 
 const MAX_RECENT = 20;
+
+const shellStateWriteChains = new Map<string, Promise<void>>();
+
+function enqueueShellStateWrite<T>(file: string, operation: () => Promise<T>): Promise<T> {
+  const previous = shellStateWriteChains.get(file) ?? Promise.resolve();
+  const run = previous.then(operation, operation);
+  shellStateWriteChains.set(file, run.then(() => undefined, () => undefined));
+  return run;
+}
 
 function workspaceKey(workspaceRoot: string): string {
   return createHash("sha256").update(path.resolve(workspaceRoot)).digest("hex").slice(0, 16);
@@ -45,21 +55,27 @@ export async function saveGlobalShellState(
   command?: string,
   previous?: GlobalShellState | null
 ): Promise<void> {
-  const recent = [...(previous?.recent_commands ?? [])];
-  if (command) {
-    recent.push(command);
-    while (recent.length > MAX_RECENT) recent.shift();
-  }
+  const file = statePath(workspaceRoot);
+  await enqueueShellStateWrite(file, async () => {
+    // Re-read inside the serialized mutation so concurrent tool completions merge
+    // into the latest persisted history instead of overwriting each other.
+    const latest = await loadGlobalShellState(workspaceRoot, cwd);
+    const base = latest ?? previous ?? null;
+    const recent = [...(base?.recent_commands ?? [])];
+    if (command) {
+      recent.push(command);
+      while (recent.length > MAX_RECENT) recent.shift();
+    }
 
-  const state: GlobalShellState = {
-    workspace_key: workspaceKey(workspaceRoot),
-    cwd: path.resolve(cwd),
-    updated_at: new Date().toISOString(),
-    recent_commands: recent,
-  };
+    const state: GlobalShellState = {
+      workspace_key: workspaceKey(workspaceRoot),
+      cwd: path.resolve(cwd),
+      updated_at: new Date().toISOString(),
+      recent_commands: recent,
+    };
 
-  await fs.mkdir(stateDir(), { recursive: true });
-  await fs.writeFile(statePath(workspaceRoot), JSON.stringify(state, null, 2), "utf-8");
+    await atomicWriteFile(file, JSON.stringify(state, null, 2), "utf8");
+  });
 }
 
 export async function restoreShellFromDisk(

@@ -278,6 +278,11 @@ FULL_DISK_ACCESS=false
 CHECKPOINT_ENABLED=true
 CHECKPOINT_MAX_FILE_BYTES=5242880
 
+# Bounded audit/activity diagnostics
+AUDIT_LOG_PATH=.mcp-audit.log
+AUDIT_LOG_MAX_BYTES=10485760
+ACTIVITY_LOG_MAX=500
+
 # OpenAI Secure Tunnel (optional)
 OPENAI_TUNNEL_ID=
 OPENAI_TUNNEL_API_KEY=
@@ -298,13 +303,15 @@ OPENAI_TUNNEL_API_KEY=
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
 | `CHECKPOINT_ENABLED` / `CHECKPOINT_MAX_FILE_BYTES` | `true` / `5242880` | Checkpoint code trước khi sửa (rewind); file > 5MB bị skip |
 | `PROJECT_MEMORY_MAX_BYTES` / `PROJECT_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn CLAUDE.md/AGENTS.md inject vào instructions. Đặt `0` = không giới hạn |
+| `AUDIT_LOG_PATH` | `.mcp-audit.log` | JSONL audit log. Với managed instance, path tương đối được resolve trong `manager/instances/<name>/` để không trộn log giữa workspace |
+| `AUDIT_LOG_MAX_BYTES` | `10485760` | Giới hạn audit log hiện tại ~10MB; rotate sang `.1` trước khi append tiếp |
 | `ACTIVITY_LOG_MAX` | `500` | Số dòng activity giữ trong RAM cho feed admin (`/api/activity`) |
 | `MANAGER_PORT` | `3300` | Cổng manager dashboard (manager/server.mjs) |
 | `ADMIN_PORT` | `3001` | Admin GUI localhost-only (proxy qua manager) |
 
 > **Sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → mọi tool bị chặn tại `validatePath` nếu path nằm ngoài workspace roots (đổi ổ đĩa, `..\..` escape). Muốn truy cập toàn máy: đặt `FULL_DISK_ACCESS=true` trong `.env` (instance: `manager/instances/<name>/.env`).
 
-> **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và không tự reset lịch sử chat. Server giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Initialize response vẫn mang MCP server instructions, vì vậy server chỉ gửi **một** bản instruction document (không double-wrap) và dashboard hiển thị retention policy để phát hiện churn bất thường.
+> **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và không tự reset lịch sử chat. Server giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Các state dùng chung có tính bền vững (checkpoint index, auto-memory, shell history, `.env`/manager config) được serialize/ghi atomic để nhiều transport session chạy song song không ghi đè lẫn nhau. Initialize response vẫn mang MCP server instructions, vì vậy server chỉ gửi **một** bản instruction document (không double-wrap) và dashboard hiển thị retention policy để phát hiện churn bất thường.
 
 
 ## 🏗️ Architecture
@@ -344,7 +351,8 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 - Server chỉ nghe `127.0.0.1` — không phơi ra mạng nội bộ
 - Manager + admin GUI localhost-only; CORS hẹp
 - `.env` và secrets gitignored
-- Audit log: `.mcp-audit.log` (optional, configurable). Managed instances resolve relative paths inside their own `manager/instances/<name>/` directory to avoid cross-workspace log mixing.
+- Audit log: `.mcp-audit.log` (optional, configurable). Managed instances resolve relative paths inside their own `manager/instances/<name>/` directory to avoid cross-workspace log mixing. Tool/activity/audit data is secret-redacted before logging, and the audit file is bounded/rotated by `AUDIT_LOG_MAX_BYTES` (default ~10MB).
+- Manager identifies the expected Local Coder/tunnel process by health/command identity, not merely by an open port; wrong-process port conflicts are reported instead of being treated as "running".
 - Chỉ expose qua tunnel bạn kiểm soát. Không share connector URL / tunnel API key
 - Use on a trusted network / personal machine only
 
@@ -355,6 +363,7 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 | **"Error in message stream"** / **"Lỗi trong luồng tin nhắn"** right after *"Looking for tools"* — **no server log** | You did **not tag the connector**. New chat → **+** → **More** → enable connector, or type **`@Local Coder`** in the message. Then retry. |
 | **Resource not found** on tool call | Refresh connector + new chat. Server auto-recovers sessions — ensure latest build is running. |
 | **Connection failed** | Check `.\start.ps1` + tunnel are both running. URL must be HTTPS. |
+| **502 from tunnel during restart** | The tunnel can remain up while the local server is restarting; a brief 502 means `127.0.0.1:3000` was temporarily unavailable. Manager now drains MCP sessions with bounded graceful close before force fallback, reducing this window. |
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
 | **Tool blocked by OpenAI safety** | Not a server bug. Retry with `run_command` (response may include `run_command_fallback`). Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |

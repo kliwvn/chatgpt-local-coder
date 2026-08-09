@@ -103,47 +103,54 @@ function renderServerTunnel(s) {
 
   // server
   const srv = s.server;
-  setDot("server-dot", srv.running, srv.running ? "Đang chạy" : "Dừng");
-  setDot("inst-server-dot", srv.running, srv.running ? "Server: chạy" : "Server: dừng");
-  $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
+  const serverConflict = Boolean(srv.portOccupied);
+  setDot("server-dot", srv.running, srv.running ? "?ang ch?y" : serverConflict ? "Xung ??t c?ng" : "D?ng");
+  setDot("inst-server-dot", srv.running, srv.running ? "Server: ch?y" : serverConflict ? "Server: xung ??t c?ng" : "Server: d?ng");
+  $("btn-server").textContent = srv.running ? "T?t" : "B?t";
   $("btn-server").disabled = busy;
-  // workspace: hiển thị WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS nếu có
   const roots =
     (srv.health && srv.health.instructions && srv.health.instructions.workspace_roots) ||
     (s.env.WORKSPACE_PATH ? [s.env.WORKSPACE_PATH] : []);
   const wsLabel =
     roots.length > 1
-      ? `${roots[0]} (+${roots.length - 1} path mở rộng)`
-      : roots[0] || (srv.health && srv.health.defaultCwd) || "—";
+      ? `${roots[0]} (+${roots.length - 1} path m? r?ng)`
+      : roots[0] || (srv.health && srv.health.defaultCwd) || "?";
   $("server-detail").textContent = srv.running
-    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}`
-    : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
+    ? `PID ${srv.pid || "?"} ? c?ng ${srv.port} ? workspace: ${wsLabel} ? ${srv.health ? `${srv.health.activeSessions ?? 0} phi?n ?? ??ng k?${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} ?ang k?t n?i)` : ""}` : "health: ?"}`
+    : serverConflict
+      ? `C?ng ${srv.port} ?ang b? process kh?c chi?m${srv.pid ? ` (PID ${srv.pid})` : ""}. ??i PORT ho?c d?ng process ?? tr??c khi b?t Local Coder.`
+      : `Server ch?a ch?y ? c?ng ${srv.port}. B?m "B?t" ?? kh?i ??ng.`;
 
   // tunnel
   const tun = s.tunnel;
-  setDot("tunnel-dot", tun.running, tun.running ? "Đang chạy" : "Dừng");
-  setDot("inst-tunnel-dot", tun.running, tun.running ? "Tunnel: chạy" : "Tunnel: dừng");
-  $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
+  const tunnelConflict = Boolean(tun.portOccupied);
+  setDot("tunnel-dot", tun.running, tun.running ? "?ang ch?y" : tunnelConflict ? "Xung ??t c?ng" : "D?ng");
+  setDot("inst-tunnel-dot", tun.running, tun.running ? "Tunnel: ch?y" : tunnelConflict ? "Tunnel: xung ??t c?ng" : "Tunnel: d?ng");
+  $("btn-tunnel").textContent = tun.running ? "T?t" : "B?t";
   $("btn-tunnel").disabled = busy;
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
   if (tun.running && tun.url) {
-    $("tunnel-detail").innerHTML = `${esc(mode)} • URL: <b class="mono">${esc(tun.url)}</b>`;
+    $("tunnel-detail").innerHTML = `${esc(mode)} ? URL: <b class="mono">${esc(tun.url)}</b>`;
     $("btn-copy-url").classList.remove("hidden");
   } else if (tun.running && tun.mode === "openai") {
-    $("tunnel-detail").textContent = `${mode} đang chạy (Tunnel ID: ${tun.tunnelId || "?"}) — URL cố định dùng trong connector.`;
+    $("tunnel-detail").textContent = `${mode} ?ang ch?y (Tunnel ID: ${tun.tunnelId || "?"}) ? URL c? ??nh d?ng trong connector.`;
     $("btn-copy-url").classList.add("hidden");
   } else if (tun.running) {
-    $("tunnel-detail").textContent = `${mode} đang chạy (khởi động ngoài manager) — tắt rồi bật lại để lấy URL.`;
+    $("tunnel-detail").textContent = `${mode} ?ang ch?y (kh?i ??ng ngo?i manager) ? t?t r?i b?t l?i ?? l?y URL.`;
+    $("btn-copy-url").classList.add("hidden");
+  } else if (tunnelConflict) {
+    $("tunnel-detail").textContent = `Tunnel health port ${tun.healthPort} ?ang b? process kh?c chi?m. ??i OPENAI_TUNNEL_HEALTH_PORT ho?c d?ng process ??.`;
     $("btn-copy-url").classList.add("hidden");
   } else {
     $("tunnel-detail").textContent =
       tun.mode === "openai"
-        ? `Chưa chạy — dùng OpenAI Tunnel (ID: ${tun.tunnelId || "(thiếu)"}).`
+        ? `Ch?a ch?y ? d?ng OpenAI Tunnel (ID: ${tun.tunnelId || "(thi?u)"}).`
         : tun.cloudflaredExists
-          ? "Chưa chạy — Cloudflare quick tunnel. URL đổi mỗi lần khởi động."
-          : "Chưa có cloudflared.exe — bấm 'Tải cloudflared'.";
+          ? "Ch?a ch?y ? Cloudflare quick tunnel. URL ??i m?i l?n kh?i ??ng."
+          : "Ch?a c? cloudflared.exe ? b?m 'T?i cloudflared'.";
     $("btn-copy-url").classList.add("hidden");
   }
+
   $("btn-tunnel-dl").classList.toggle("hidden", tun.cloudflaredExists !== false || tun.running);
 
   $("mgr-version").textContent = `Manager 127.0.0.1:${location.port} • Node ${s.node}`;
@@ -151,7 +158,7 @@ function renderServerTunnel(s) {
 
 
 /* ---------------- log viewer ---------------- */
-const LOG_MCP_RE = /\[(MCP|TOOL|AUDIT)\]|MCP ERROR/i;
+const LOG_MCP_RE = /\[(MCP|TOOL|AUDIT)(?: ERROR)?\]/i;
 const LOG_STATE = { mode: "all", paused: false, sourceLog: "", lastLog: "", lastSize: 0, lastCount: 0, lastMtime: 0, fetchInFlight: false };
 let instancesFetchInFlight = false;
 
@@ -169,7 +176,7 @@ function renderLogLines(logText) {
     if (LOG_STATE.mode === "mcp" && !isMcp) continue;
     const e = esc(line);
     let cls = "";
-    if (/MCP ERROR|\[err|\[error\]|\[fail\]/i.test(line)) cls = "err";
+    if (/MCP ERROR|TOOL ERROR|\[err|\[error\]|\[fail\]/i.test(line)) cls = "err";
     else if (isMcp && /\[TOOL\]/.test(line)) cls = "tool";
     else if (isMcp) cls = "mcp";
     else if (/\[HTTP\]/.test(line)) cls = "http";
@@ -217,8 +224,14 @@ async function loadLog() {
   const name = state.current;
   LOG_STATE.fetchInFlight = true;
   try {
-    const r = await api(instUrl(name, "/log?kind=server&max=300000"));
-    if (state.current !== name) return; // user đã chuyển instance — bỏ kết quả cũ
+    const q = new URLSearchParams({ kind: "server", max: "300000" });
+    if (LOG_STATE.lastSize > 0 || LOG_STATE.lastMtime > 0) {
+      q.set("if_size", String(LOG_STATE.lastSize));
+      q.set("if_mtime", String(LOG_STATE.lastMtime));
+    }
+    const r = await api(instUrl(name, `/log?${q.toString()}`));
+    if (state.current !== name) return;
+    if (r.unchanged) return;
     const next = r.log || "";
     const delta = logSnapshotDelta(LOG_STATE.sourceLog, next);
     LOG_STATE.sourceLog = next;
@@ -328,6 +341,7 @@ async function selectInstance(name, initial) {
   state.current = name;
   LOG_STATE.sourceLog = "";
   LOG_STATE.lastLog = "";
+  LOG_STATE.lastSize = 0;
   LOG_STATE.lastMtime = 0;
   LOG_STATE.lastCount = 0;
   state.lastBundle = b;
