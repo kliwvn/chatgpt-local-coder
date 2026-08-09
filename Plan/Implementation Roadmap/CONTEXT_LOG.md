@@ -1,5 +1,25 @@
 # CONTEXT_LOG — chatgpt-local-coder
 
+## TX-2026-08-09-03 — cap-race fix, 429 mapping, manager start validation (SHIPPED `8bb68e2`)
+
+### Why
+The audit's cap-race fix and the manager restart surfaced two further correctness gaps that shipped in `8bb68e2`:
+- `reserveBuildSlot()` originally only trimmed published sessions (`trimSessionCapacity(1)`); concurrent initializes (build runs outside any op-queue) could all pass admission before publish and exceed `MCP_MAX_SESSIONS`. The first repair counted in-flight but still let the 65th build through when 0 published + 64 in-flight (`trimSessionCapacity(65)` clamps target to 0 and returns true).
+- Over-cap requests surfaced as HTTP 500 via the generic catch — client could not distinguish "over-cap, retry later" from a server fault.
+- `startServer` (manager) wrote invalid session-policy values to `.env` unchanged; the spawned server silently ran with process defaults while the UI kept showing the saved value.
+
+### Key decisions
+- **Exact admission = published + in-flight ≤ MAX.** `reserveBuildSlot()` hard-rejects when `inFlightBuilds >= MAX` (no eviction possible), else trims to `MAX - (inFlightBuilds + 1)` and requires `published + inFlight + 1 <= MAX` before incrementing. Reservation is held until **publish** (`onsessioninitialized`), shutdown-publish, `disposePendingSession`, or build failure — never at `buildSession` return (initialize dispatch happens after return).
+- **Transport-keyed `WeakMap` releaser** (`transportReservationReleases`) — keying a `Map` by `sid ?? randomUUID()` would leak because `transport.sessionId` is unset at build return on normal initializes, so the random key never matches the later SDK-generated sid.
+- **Over-cap = deliberate HTTP 429** (JSON-RPC `-32029`) via a typed `SessionCapacityError`, mapped in `handleMcpPost` before the generic 500. Deterministic test fills the cap with connected (non-evictable) sessions, asserts next initialize is exactly 429.
+- **Manager start validation:** `startServer` refuses to start on out-of-range policy instead of running with a hidden default.
+- **Manager restart was required for the validation fix to be live** (Node keeps the loaded module in memory): stopped old manager 54744, started current `server.mjs`, which auto-started the instance (new pids 57452 / 56536). Verified health + policy + tunnel + audit writes under new pids.
+
+### Evidence
+- Full suite post-fix: `set -o pipefail; node scripts/run-all-tests.mjs` → **15 passed, 0 failed** (`SUITE_EXIT=0`), integration spawns with `MCP_MAX_SESSIONS=8`; parallel test `16 ok / 0 over-cap` (16 ≤ cap+8, idles evicted) and deterministic `held 8 connected → next initialize → 429, retained 8/8`.
+- Reviewer subagents (core-server, manager/UI) found no blockers; two priority-2 findings fixed (`.env.example` missing `MCP_SESSION_DELETE_GRACE_MS`; startServer validation), others weighed and noted (audit-path nit was a false positive; `apiUrl` redundancy not a bug; `MCP_INSTANCE_NAME` dead-but-harmless).
+- Commit `8bb68e2` on `main`, pushed `44c29e5..8bb68e2` to `origin/main`.
+
 ## TX-2026-08-09-02 — why session initialize churn mattered
 
 ### Why

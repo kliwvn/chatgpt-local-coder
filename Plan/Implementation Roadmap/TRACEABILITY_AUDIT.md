@@ -2,7 +2,7 @@
 
 ## TX-2026-08-09-02 — session churn / performance / context-quality audit
 
-Claim scope: **MCP session retention, initialize payload, proxy-tool readiness, diagnostics/security, dashboard freshness, and live performance as of 2026-08-09 working tree (pre-commit)**.
+Claim scope: **MCP session retention, initialize payload, proxy-tool readiness, diagnostics/security, dashboard freshness, and live performance, committed as `8bb68e2` on `main` (pushed to `origin/main`)**.
 
 | Requirement | Evidence | Status |
 |---|---|---|
@@ -20,6 +20,19 @@ Claim scope: **MCP session retention, initialize payload, proxy-tool readiness, 
 | Build/readiness gates clean after all fixes | build + npm test + run-all + JS checks + diff check | PASS |
 
 ### Fix 1 — manager env-injection staleness (claim scope: audit isolation + fresh-spawn live verification)
+
+### TX-2026-08-09-03 — cap-race / 429 / manager validation (claim scope: shipped `8bb68e2` on `main`)
+
+| Requirement | Evidence | Status |
+|---|---|---|
+| Published + in-flight builds must never exceed `MCP_MAX_SESSIONS` | `reserveBuildSlot()` counts both; hard-rejects when in-flight fills the cap; integration `parallel init` 16 ok / retained 8/8 with `MCP_MAX_SESSIONS=8` | PASS |
+| Over-cap must be a deliberate bounded status, not a generic 500 | `SessionCapacityError` → HTTP 429 (JSON-RPC `-32029`) in `handleMcpPost`; deterministic test: fill cap with connected sessions → next initialize exactly 429 | PASS |
+| Recovery must not leak a built-but-unpublished session | `tryRecoverStale` hoists `pending` before `try`; catch disposes + releases via `disposePendingSession` (idempotent); single release point | PASS |
+| Manager must not start a server with an invalid session policy | `startServer` validates via `validateSessionPolicy` and returns an error listing the bad keys | PASS |
+| Session policy vars documented | `.env.example` + README now include `MCP_SESSION_DELETE_GRACE_MS` and `MCP_MAX_SESSIONS` | PASS |
+| Full suite green after fixes | `set -o pipefail; node scripts/run-all-tests.mjs` → 15/15, `SUITE_EXIT=0` (integration spawns `MCP_MAX_SESSIONS=8`) | PASS |
+| Manager restart actually loads new manager code | old manager 54744 stopped; current `server.mjs` started (new pid 57452 on :3300), auto-started instance 56536; health/policy/tunnel/audit verified | PASS |
+| Changes committed and pushed | `8bb68e2` on `main`, pushed `44c29e5..8bb68e2` to `origin/main` | PASS |
 
 | Requirement | Evidence | Status |
 |---|---|---|

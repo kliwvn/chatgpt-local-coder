@@ -2,7 +2,7 @@
 
 ## TX-2026-08-09-02 — session churn / performance / context-quality audit
 
-### Status: IMPLEMENTED + LIVE VERIFIED (pre-commit)
+### Status: SHIPPED — committed `8bb68e2` on `main`, pushed to `origin/main`
 
 ### Root causes found and fixed
 - **Unbounded practical retention:** ChatGPT/openai-mcp creates transport sessions very aggressively (observed almost one initialize per tool call). With the old 24h TTL and unreliable client DELETE, live state reached **1013 retained sessions**, ~**529 MB working set / 583 MB private memory**. Final default retention is **2m idle TTL**, **15s cleanup**, **64 hard cap**; connected SSE and in-flight sessions are never evicted. Oldest idle sessions are reclaimed first and stale IDs still use the existing recovery path.
@@ -13,16 +13,25 @@
 - **Stale dashboard telemetry:** session dashboard now refreshes every 5s only while visible, with a single-flight guard, and shows `active/max`, idle TTL and cleanup cadence.
 - **Test-harness drift:** `run-all-tests.mjs` spawned a random admin port but forgot to pass `ADMIN_PORT` to `test-mcp-session.mjs`, causing false failures against live :3001. Fixed; integration again exercises the sandbox instance it spawned.
 
+### This commit round (8bb68e2)
+- **Cap admission race (real, verified in code):** `buildSession()` counted only *published* sessions at admission; concurrent initializes (build runs outside any op-queue) all passed `trimSessionCapacity(1)` before `onsessioninitialized` published → could exceed `MCP_MAX_SESSIONS=64`. `reserveBuildSlot()` now counts **published + in-flight**; hard-rejects when in-flight already fills the cap (no eviction possible), evicts idle sessions otherwise. Reservation held until publish (or shutdown/dispose/build-fail) via a transport-keyed `WeakMap` releaser.
+- **Over-cap now deliberate HTTP 429:** `SessionCapacityError` maps to 429 (JSON-RPC `-32029`) instead of a generic 500, so clients can retry after over-cap.
+- **Recovery leak closed:** `tryRecoverStale` disposes a built-but-unpublished pending session on failure; `disposePendingSession` is the single idempotent release point.
+- **Manager start validation:** `startServer` refuses to start when the instance session policy is out of range, instead of silently running with process defaults while the UI shows the saved value.
+- **Docs:** `.env.example`/README surface `MCP_SESSION_DELETE_GRACE_MS`, hard-cap semantics, per-instance audit-path isolation, log-viewer scope.
+- **Tests:** deterministic over-cap test (fill cap with connected sessions → next initialize exactly 429); parallel-init cap test now actually exceeds the cap (no 48 clamp) with a batch timeout; integration spawns with `MCP_MAX_SESSIONS=8`; suite **15/15 green** (`SUITE_EXIT=0`).
+
 ### Evidence
 - Earlier TX-02 live verification (pre-Fix-1): server PID **56052** after managed restart; health policy `maxRetained=64`, `idleTtlMs=120000`, `cleanupIntervalMs=15000`; measured ~**93.8 MB working set / 84.6 MB private memory** shortly after connector reconnect; log had **0 MCP errors, 0 tool errors, 0 recovery errors, 0 session-not-found, 0 capacity errors, 0 `/health` log spam, 0 UTF-8 replacement characters**.
 - Live redaction probe: initialize → tools/list → Activity JSON/SSE; raw UUID absent, redacted `xxxxxxxx…` present; DELETE HTTP 200. Live `server.log` also contains only redacted session IDs.
 - **Fix 1 (this follow-up):** manager restart required to pick up the env-injection fix. The stale manager (PID 17072, started 04:00 pre-edit) spawned instances without `AUDIT_LOG_PATH`/`MCP_ENV_FILE`, so audit wrote to repo root. After restarting the manager from current `server.mjs` and explicitly stop/start the instance: fresh PID **55452**, `agent_status.audit_log` = `manager/instances/default/.mcp-audit.log` (instance-scoped), audit writes verified to instance file, root audit frozen. Health policy consistent on all three surfaces (MCP :3000, admin :3001, manager :3300). Session integration 13/13 + unit suite green (`set -o pipefail; node scripts/run-all-tests.mjs` → `EXIT=0`).
+- **This round live verification (post-commit restart):** stopped old instance + manager, restarted manager from current `server.mjs` (new pid **57452** on :3300), which auto-started the instance (new pid **56536** on :3000/:3001). Health `status:"ok"`, `activeSessions:4`, `sessionPolicy {maxRetained:64, idleTtlMs:120000, cleanupIntervalMs:15000}`, tunnel running (OpenAI). Audit log writes now under new pid; server.log shows fresh `Session initialized … client=manager-warmup … retained=1/64`.
+- Full suite post-fix: `set -o pipefail; node scripts/run-all-tests.mjs` → **15 passed, 0 failed**, `SUITE_EXIT=0` (integration spawns with `MCP_MAX_SESSIONS=8`).
 
 ### Remaining / external behavior
 - The connector still creates fresh MCP transport sessions very frequently; this is client behavior and is now bounded server-side. Do **not** merge sessions by IP/User-Agent because parallel chats/agents could cross-contaminate state.
 - The default live instance uses broad workspace `E:\` (`git.is_repo=false`), so repo-specific AGENTS/CLAUDE context is not automatically loaded for every target repo. For quality-critical work, use `project_context(<repo>)` when entering a repo or a per-project MCP instance; do not inject every repo's memory into every initialize.
 - **Credential-history status: UNVERIFIED** — `OPENAI_TUNNEL_API_KEY` value present in instance `.env` (gitignored); `git log -S <fragment>` found no committed value, but a full history sweep is not yet performed. Recommend rotation.
-- Commit/push remains pending.
 
 ## TX-2026-08-08-01 — MCP session op-chain deadlock fix
 
