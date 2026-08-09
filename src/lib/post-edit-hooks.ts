@@ -80,6 +80,8 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
   let stderrTruncated = false;
   let timedOut = false;
   let settled = false;
+  let childClosed = false;
+  let windowsKillerClosed = process.platform !== "win32";
   let forceSettleTimer: ReturnType<typeof setTimeout> | undefined;
   const settle = (fn: () => void) => {
     if (settled) return;
@@ -88,11 +90,27 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
     if (forceSettleTimer) clearTimeout(forceSettleTimer);
     fn();
   };
+  const settleTimedOutIfTreeClosed = () => {
+    if (!timedOut || !childClosed || !windowsKillerClosed) return;
+    settle(() => resolve({
+      stdout: stdout.trim(),
+      stderr: stderr.trim() || "hook timeout",
+      exit_code: null,
+      stdout_truncated: stdoutTruncated,
+      stderr_truncated: stderrTruncated,
+    }));
+  };
   const timer = setTimeout(() => {
     timedOut = true;
     if (process.platform === "win32" && child.pid) {
       const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-      killer.unref();
+      windowsKillerClosed = false;
+      const markKillerClosed = () => {
+        windowsKillerClosed = true;
+        settleTimedOutIfTreeClosed();
+      };
+      killer.once("close", markKillerClosed);
+      killer.once("error", markKillerClosed);
     } else {
       child.kill("SIGKILL");
     }
@@ -122,13 +140,20 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
     stderr = next.text;
     stderrTruncated = next.truncated;
   });
-  child.on("close", (code) => settle(() => resolve({
-    stdout: stdout.trim(),
-    stderr: timedOut ? (stderr.trim() || "hook timeout") : stderr.trim(),
-    exit_code: timedOut ? null : code,
-    stdout_truncated: stdoutTruncated,
-    stderr_truncated: stderrTruncated,
-  })));
+  child.on("close", (code) => {
+    childClosed = true;
+    if (timedOut) {
+      settleTimedOutIfTreeClosed();
+      return;
+    }
+    settle(() => resolve({
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      exit_code: code,
+      stdout_truncated: stdoutTruncated,
+      stderr_truncated: stderrTruncated,
+    }));
+  });
   child.on("error", () => settle(() => resolve({
     stdout: "",
     stderr: timedOut ? "hook timeout" : "hook spawn failed",

@@ -131,18 +131,16 @@ try {
   if (!admin.instructions) throw new Error("admin health missing instructions");
   console.log("OK  admin health");
 
-  // The local MCP endpoint publishes syntactically valid PRMD but intentionally
-  // has no OAuth authorization server. Managed tunnel startup separately disables
-  // Harpoon auto-registration for private/loopback hosts.
+  // No-auth MCP servers follow tunnel-client's documented sample behavior: all
+  // protected-resource metadata candidates return 404. Keep the response empty;
+  // a valid PRMD body would incorrectly advertise OAuth on a server that has none.
   for (const suffix of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
     const prmd = await fetch(`http://127.0.0.1:${mcpPort}${suffix}`);
-    if (prmd.status !== 200) throw new Error(`PRMD endpoint must be 200: ${suffix} -> ${prmd.status}`);
-    const metadata = await prmd.json();
-    if (metadata.resource !== `http://127.0.0.1:${mcpPort}/mcp` || !Array.isArray(metadata.authorization_servers) || metadata.authorization_servers.length !== 0) {
-      throw new Error(`unexpected no-auth PRMD metadata: ${JSON.stringify(metadata)}`);
-    }
+    if (prmd.status !== 404) throw new Error(`no-auth PRMD endpoint must be 404: ${suffix} -> ${prmd.status}`);
+    const body = await prmd.text();
+    if (body !== "") throw new Error(`no-auth PRMD 404 must have an empty body: ${suffix} -> ${JSON.stringify(body)}`);
   }
-  console.log("OK  no-auth PRMD metadata is valid");
+  console.log("OK  no-auth PRMD candidates return empty 404");
 
   const preview = await (await fetch(`http://127.0.0.1:${adminPort}/api/instructions/preview`)).json();
   if (!preview.preview?.includes("Agent workflow")) throw new Error("instructions preview missing agent prompt");

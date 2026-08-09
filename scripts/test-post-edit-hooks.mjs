@@ -8,6 +8,20 @@ const config = path.join(temp, "hooks.json");
 const target = path.join(temp, "sample.txt");
 await fs.writeFile(target, "x\n", "utf8");
 
+async function removeTempBounded(dir) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const transient = ["EBUSY", "ENOTEMPTY", "EPERM", "EACCES"].includes(err?.code);
+      if (!transient || Date.now() >= deadline) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 try {
   const noisyCommand = `node -e "process.stdout.write('x'.repeat(100000)); process.stderr.write('y'.repeat(50000))"`;
   await fs.writeFile(config, JSON.stringify({
@@ -42,5 +56,8 @@ try {
   console.log("post-edit-hooks: ok (bounded output, normalized timeout, process-tree termination)");
 } finally {
   delete process.env.POST_EDIT_HOOKS_CONFIG;
-  await fs.rm(temp, { recursive: true, force: true });
+  // Windows can briefly retain a directory handle after a forced process-tree
+  // termination (or AV/indexer inspection). Retry only known transient errors and
+  // keep a hard 5s deadline so a real leaked handle still fails the release gate.
+  await removeTempBounded(temp);
 }
