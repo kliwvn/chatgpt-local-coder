@@ -363,7 +363,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         config.projectMemoryInstructions
       );
       if (shuttingDown) {
-        await mcpServer.close().catch(() => undefined);
+        // Cleanup (unregister + close) happens in the catch below — single point.
         throw new Error("MCP session manager is shutting down");
       }
 
@@ -423,7 +423,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
 
       await mcpServer.connect(transport);
       if (shuttingDown) {
-        await mcpServer.close().catch(() => transport.close().catch(() => undefined));
+        // Cleanup (unregister + close) happens in the catch below — single point.
         throw new Error("MCP session manager is shutting down");
       }
 
@@ -437,9 +437,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       transportReservationReleases.set(transport, releaseReservation);
       return built;
     } catch (err) {
-      // createMcpServer/connect fail trước khi transport được publish → release
-      // reservation và đóng server/transport (nếu đã tạo) để không rò rỉ
-      // upstream registration / SDK transport.
+      // createMcpServer/connect fail (or shutdown flips mid-build) trước khi
+      // transport được publish → release reservation và dọn dẹp: unregister
+      // khỏi upstream manager, đóng server; chỉ đóng transport nếu server
+      // close fail (fallback) hoặc khi server chưa từng được tạo.
       releaseReservation();
       const failedSid = transport?.sessionId;
       if (failedSid) delete lastTransportErrors[failedSid];
