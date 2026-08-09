@@ -1,10 +1,8 @@
 import fs from "fs/promises";
+import os from "node:os";
 import path from "path";
-import { fileURLToPath } from "url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(__dirname, "..");
-const tmpDir = path.join(root, ".tool-test-tmp", "checkpoints");
+const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-checkpoints-"));
 const storeDir = path.join(tmpDir, "store");
 
 // checkpoint.ts resolves its store path while the module is evaluated. Set the

@@ -3,13 +3,15 @@
  * Self-contained — spawns child processes on random ports.
  */
 import fs from "fs/promises";
+import os from "node:os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "node:child_process";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
-const scratch = process.env.GOAL_SCRATCH || path.join(root, ".tool-test-tmp", "bridge-integration");
+const ownsScratch = !process.env.GOAL_SCRATCH;
+const scratch = process.env.GOAL_SCRATCH || await fs.mkdtemp(path.join(os.tmpdir(), "clc-bridge-integration-"));
 
 const mcpPort = 4100 + Math.floor(Math.random() * 200);
 const adminPort = mcpPort + 1;
@@ -22,6 +24,19 @@ function spawnNode(script, env = {}) {
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
+}
+
+async function stopChild(child) {
+  if (!child || child.exitCode != null) return;
+  child.kill("SIGTERM");
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, 2000);
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  if (child.exitCode == null) child.kill("SIGKILL");
 }
 
 async function waitFor(url, timeoutMs = 20000) {
@@ -71,6 +86,15 @@ async function callTool(base, sessionId, name, args = {}) {
   return json;
 }
 
+function parseToolPayload(name, response) {
+  const text = response?.result?.content?.[0]?.text ?? "";
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${name} returned non-JSON tool result: ${text.slice(0, 1200)}`);
+  }
+}
+
 await fs.mkdir(tmpDir, { recursive: true });
 
 const configPath = path.join(tmpDir, "mcp-upstream.json");
@@ -104,6 +128,9 @@ const hub = spawnNode(path.join(root, "dist/index.js"), {
   ADMIN_PORT: String(adminPort),
   MCP_UPSTREAM_CONFIG: configPath,
   WORKSPACE_PATH: root,
+  MCP_SHELL_STATE_DIR: path.join(tmpDir, "shell-state"),
+  CHECKPOINT_PATH: path.join(tmpDir, "checkpoints"),
+  AUDIT_LOG_PATH: path.join(tmpDir, "audit.log"),
 });
 
 let hubLog = "";
@@ -153,11 +180,11 @@ try {
   );
 
   const servers = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mcp_servers", {});
-  const serversPayload = JSON.parse(servers.result.content[0].text);
+  const serversPayload = parseToolPayload("mcp_servers", servers);
   if (!serversPayload.ok || serversPayload.data.count < 1) throw new Error(JSON.stringify(serversPayload));
 
   const tools = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mcp_tools", { server_id: "mockhttp" });
-  const toolsPayload = JSON.parse(tools.result.content[0].text);
+  const toolsPayload = parseToolPayload("mcp_tools", tools);
   if (!toolsPayload.ok || toolsPayload.data.count < 1) throw new Error(JSON.stringify(toolsPayload));
 
   const called = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mcp_call", {
@@ -165,7 +192,7 @@ try {
     tool: "add",
     arguments: { a: 4, b: 6 },
   });
-  const callPayload = JSON.parse(called.result.content[0].text);
+  const callPayload = parseToolPayload("mcp_call", called);
   if (!callPayload.ok) throw new Error(JSON.stringify(callPayload));
   const outputText = JSON.stringify(callPayload.data);
   if (!outputText.includes("10")) throw new Error(outputText);
@@ -216,7 +243,7 @@ try {
   log(`tools/list after allowlist: mockhttp__add present`);
 
   const proxied = await callTool(`http://127.0.0.1:${mcpPort}`, sessionId, "mockhttp__add", { a: 1, b: 2 });
-  const proxiedPayload = JSON.parse(proxied.result.content[0].text);
+  const proxiedPayload = parseToolPayload("mockhttp__add", proxied);
   if (!proxiedPayload.ok) throw new Error(JSON.stringify(proxiedPayload));
 
   const adminHtml = await (await fetch(`http://127.0.0.1:${adminPort}/ui/`)).text();
@@ -259,8 +286,8 @@ try {
   await fs.writeFile(path.join(scratch, "integration-error.log"), String(err?.stack || err));
   console.error("FAIL bridge integration:", err.message || err);
   console.error(hubLog.slice(-2000));
-  process.exit(1);
+  process.exitCode = 1;
 } finally {
-  hub.kill("SIGTERM");
-  mockHttp.kill("SIGTERM");
+  await Promise.all([stopChild(hub), stopChild(mockHttp)]);
+  if (ownsScratch) await fs.rm(scratch, { recursive: true, force: true });
 }

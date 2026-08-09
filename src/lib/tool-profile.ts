@@ -25,6 +25,8 @@ export const SLIM_CHATGPT_TOOLS = new Set([
   "load_path_rules",
   "rewind",
   "mcp_servers",
+  "mcp_tools",
+  "mcp_call",
 ]);
 
 export function getChatGptToolProfile(): ToolProfileName {

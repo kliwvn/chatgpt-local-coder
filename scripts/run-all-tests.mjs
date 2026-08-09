@@ -2,6 +2,8 @@
  * Full verification suite for ChatGPT MCP readiness.
  */
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
+import os from "node:os";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -95,6 +97,7 @@ await new Promise((resolve, reject) => {
 });
 
 console.log("\n=== Integration (spawn server) ===");
+const integrationStateDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-integration-state-"));
 const server = spawn(process.execPath, ["dist/index.js"], {
   cwd: root,
   env: {
@@ -102,6 +105,9 @@ const server = spawn(process.execPath, ["dist/index.js"], {
     PORT: String(mcpPort),
     ADMIN_PORT: String(adminPort),
     CHATGPT_TOOL_PROFILE: "slim",
+    MCP_SHELL_STATE_DIR: path.join(integrationStateDir, "shell-state"),
+    CHECKPOINT_PATH: path.join(integrationStateDir, "checkpoints"),
+    AUDIT_LOG_PATH: path.join(integrationStateDir, "audit.log"),
     // Low cap so the parallel/429 tests deterministically exercise admission
     // without needing 64 connected sessions in CI.
     MCP_MAX_SESSIONS: "8",
@@ -226,6 +232,15 @@ try {
   console.log("OK  test-mcp-session");
 } finally {
   server.kill();
+  await new Promise((resolve) => {
+    if (server.exitCode != null) return resolve();
+    const timer = setTimeout(resolve, 2000);
+    server.once("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  await fs.rm(integrationStateDir, { recursive: true, force: true });
 }
 
 console.log("\n=== ALL TESTS PASSED ===");

@@ -12,6 +12,7 @@
  *     .env          # PORT, ADMIN_PORT, WORKSPACE_PATH, OPENAI_TUNNEL_ID/KEY...
  *     config.json   # connectorName, lastTunnelUrl, healthPort, autoStart
  *     server.pid / tunnel.pid / profile.yaml / server.log / tunnel.log
+ *     checkpoints/ / shell-state/  # managed runtime state, isolated from repo root
  *
  * Usage:
  *   node manager/server.mjs            # start + auto-open browser
@@ -377,6 +378,36 @@ function instPaths(name) {
   };
 }
 
+async function migrateLegacyRuntimeState(name, env, inst) {
+  if (name !== "default") return;
+  const candidates = [
+    { envKey: "CHECKPOINT_PATH", legacy: path.join(ROOT, ".mcp-checkpoints"), target: path.join(inst.dir, "checkpoints") },
+    { envKey: "MCP_SHELL_STATE_DIR", legacy: path.join(ROOT, ".mcp-state"), target: path.join(inst.dir, "shell-state") },
+  ];
+  for (const item of candidates) {
+    if (String(env[item.envKey] || "").trim()) continue;
+    try {
+      await fsp.access(item.legacy);
+    } catch {
+      continue;
+    }
+    try {
+      await fsp.access(item.target);
+      console.warn(`[manager] Legacy runtime state left in place because target exists: ${item.legacy} -> ${item.target}`);
+      continue;
+    } catch {}
+    await fsp.mkdir(inst.dir, { recursive: true });
+    try {
+      await retryTransientFsMutation(() => fsp.rename(item.legacy, item.target));
+    } catch (err) {
+      if (err?.code !== "EXDEV") throw err;
+      await fsp.cp(item.legacy, item.target, { recursive: true, force: false, errorOnExist: true });
+      await fsp.rm(item.legacy, { recursive: true, force: true });
+    }
+    console.log(`[manager] Migrated legacy runtime state: ${item.legacy} -> ${item.target}`);
+  }
+}
+
 async function listInstances() {
   try {
     const names = [];
@@ -715,6 +746,7 @@ async function startServerUnlocked(name) {
   if (!runtimeLimits.ok) {
     return { ok: false, error: `Runtime limits không hợp lệ — sửa trong Cấu hình: ${runtimeLimits.errors.join("; ")}` };
   }
+  await migrateLegacyRuntimeState(name, env, inst);
   await rotateLogFile(inst.serverLog);
   const pid = spawnDetached(process.execPath, [SERVER_ENTRY], inst.serverLog, {
     ...env,
@@ -723,6 +755,8 @@ async function startServerUnlocked(name) {
     // because every managed server process is spawned with cwd=ROOT.
     MCP_ENV_FILE: inst.env,
     MCP_INSTANCE_NAME: name,
+    CHECKPOINT_PATH: String(env.CHECKPOINT_PATH || "").trim() || path.join(inst.dir, "checkpoints"),
+    MCP_SHELL_STATE_DIR: String(env.MCP_SHELL_STATE_DIR || "").trim() || path.join(inst.dir, "shell-state"),
   });
   invalidatePortPidCache();
   await writePidFile(inst.serverPid, pid);
@@ -947,7 +981,10 @@ async function startTunnelUnlocked(name) {
       `  tunnel_id: ${env.OPENAI_TUNNEL_ID}`,
       "  api_key: env:OPENAI_TUNNEL_API_KEY",
       "log:",
-      "  level: info",
+      // INFO emits one line per control-plane/MCP event and grows tunnel.log
+      // continuously even when the Manager/Gateway stay healthy for days.
+      // WARN keeps actionable diagnostics while avoiding idle log churn.
+      "  level: warn",
       "  format: struct-text",
       "health:",
       `  listen_addr: 127.0.0.1:${healthPort}`,

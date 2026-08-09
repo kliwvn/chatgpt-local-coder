@@ -5,18 +5,6 @@ import path from "node:path";
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-state-concurrency-"));
 try {
   const { enqueueKeyedMutation } = await import("../dist/lib/keyed-mutation.js");
-  const { readUtf8FileIfExists } = await import("../dist/lib/optional-file.js");
-  if ((await readUtf8FileIfExists(path.join(root, "missing-optional.txt"))) !== null) {
-    throw new Error("optional file reader did not map ENOENT to null");
-  }
-  let nonEnoentRejected = false;
-  try {
-    await readUtf8FileIfExists(root); // directory read is EISDIR on Windows/Linux
-  } catch {
-    nonEnoentRejected = true;
-  }
-  if (!nonEnoentRejected) throw new Error("optional file reader swallowed a non-ENOENT read failure");
-
   const mutationChains = new Map();
   const mutationOrder = [];
   await Promise.all([

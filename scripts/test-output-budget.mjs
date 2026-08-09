@@ -3,12 +3,16 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-output-budget-"));
+
 // Set tight test budgets before importing modules that capture env at load time.
 process.env.MCP_TOOL_RESULT_MAX_BYTES = "262144";
 process.env.MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES = "16384";
 process.env.SHELL_OUTPUT_MAX_CHARS = "4096";
 process.env.READ_TEXT_MAX_BYTES = "65536";
 process.env.EDIT_TEXT_MAX_BYTES = "65536";
+process.env.CHECKPOINT_PATH = path.join(temp, "checkpoints");
+process.env.MCP_SHELL_STATE_DIR = path.join(temp, "shell-state");
 
 const { toolResult } = await import("../dist/lib/tool-result.js");
 const { execInShellSession, initShellSession } = await import("../dist/lib/persistent-shell.js");
@@ -45,7 +49,6 @@ await assert.rejects(
 );
 assert.ok(Date.now() - timeoutStarted < 2500, "persistent shell timeout waited indefinitely for child close");
 
-const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-output-budget-"));
 try {
   const largeFile = path.join(temp, "large.txt");
   await fs.writeFile(largeFile, "z".repeat(80 * 1024), "utf8");

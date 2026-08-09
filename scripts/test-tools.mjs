@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import os from "node:os";
 import path from "path";
 import { fileURLToPath } from "url";
 import { globFiles } from "../dist/lib/glob-search.js";
@@ -9,7 +10,7 @@ import { applyMultiFilePatch, applyUnifiedPatchToText, isMultiFilePatch } from "
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
-const tmpDir = path.join(root, ".tool-test-tmp");
+const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-tools-"));
 
 let passed = 0;
 let failed = 0;

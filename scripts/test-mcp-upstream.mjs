@@ -1,4 +1,5 @@
 import fs from "fs/promises";
+import os from "node:os";
 import path from "path";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "url";
@@ -22,7 +23,7 @@ import { registerMcpBridgeTools } from "../dist/tools/mcp-bridge.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
-const tmpDir = path.join(root, ".tool-test-tmp", "mcp-upstream");
+const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-mcp-upstream-"));
 
 let passed = 0;
 let failed = 0;

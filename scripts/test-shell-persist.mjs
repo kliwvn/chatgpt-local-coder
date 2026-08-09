@@ -2,12 +2,13 @@
  * Global shell cwd persists across bootstrap (simulates ChatGPT new MCP sessions).
  */
 import fs from "fs/promises";
+import os from "node:os";
 import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
-const stateDir = path.join(root, ".tool-test-tmp", "shell-persist");
+const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-shell-persist-"));
 
 // The state-path module resolves MCP_SHELL_STATE_DIR at import time. Set the
 // test sandbox before importing it so this regression can never write the real
@@ -151,6 +152,8 @@ try {
 } catch (e) {
   fail("shell persist", e.message || e);
 }
+
+await fs.rm(stateDir, { recursive: true, force: true });
 
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
