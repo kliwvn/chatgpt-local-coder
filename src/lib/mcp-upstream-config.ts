@@ -15,6 +15,7 @@ export interface UpstreamServerConfig {
   env?: Record<string, string>;
   cwd?: string;
   url?: string;
+  headers?: Record<string, string>;
   tool_prefix?: string;
   expose: UpstreamExposeMode;
   tools?: string[];
@@ -54,6 +55,29 @@ function normalizeServer(raw: UpstreamServerConfig): UpstreamServerConfig {
     throw new Error(`http server ${id} requires url`);
   }
 
+  const expose = raw.expose ?? "meta_only";
+  if (!["none", "meta_only", "allowlist", "all"].includes(expose)) {
+    throw new Error(`Invalid expose mode for ${id}: ${String(raw.expose)}`);
+  }
+
+  const idleTimeout = raw.idle_timeout_sec ?? 600;
+  if (!Number.isFinite(idleTimeout) || idleTimeout < 0 || idleTimeout > 86400) {
+    throw new Error(`Invalid idle_timeout_sec for ${id}: ${String(raw.idle_timeout_sec)}`);
+  }
+
+  const normalizeStringMap = (value: Record<string, string> | undefined, label: string) => {
+    if (!value) return {};
+    if (typeof value !== "object" || Array.isArray(value)) {
+      throw new Error(`${label} for ${id} must be an object`);
+    }
+    const out: Record<string, string> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (typeof entry !== "string") throw new Error(`${label}.${key} for ${id} must be a string`);
+      out[key] = entry;
+    }
+    return out;
+  };
+
   return {
     id,
     name: raw.name?.trim() || id,
@@ -61,14 +85,35 @@ function normalizeServer(raw: UpstreamServerConfig): UpstreamServerConfig {
     transport,
     command: raw.command?.trim(),
     args: raw.args ?? [],
-    env: raw.env ?? {},
+    env: normalizeStringMap(raw.env, "env"),
     cwd: raw.cwd?.trim(),
     url: raw.url?.trim(),
+    headers: normalizeStringMap(raw.headers, "headers"),
     tool_prefix: (raw.tool_prefix?.trim() || id).replace(/[^a-zA-Z0-9_-]/g, "_"),
-    expose: raw.expose ?? "meta_only",
+    expose,
     tools: raw.tools ?? [],
-    idle_timeout_sec: raw.idle_timeout_sec ?? 600,
+    idle_timeout_sec: idleTimeout,
   };
+}
+
+export function normalizeUpstreamConfig(config: UpstreamConfigFile): UpstreamConfigFile {
+  if (!config || !Array.isArray(config.servers)) throw new Error("servers must be an array");
+  const servers = config.servers.map(normalizeServer);
+  const ids = new Set<string>();
+  const exposedPrefixes = new Map<string, string>();
+  for (const server of servers) {
+    if (ids.has(server.id)) throw new Error(`Duplicate upstream server id: ${server.id}`);
+    ids.add(server.id);
+    if (server.enabled && (server.expose === "all" || server.expose === "allowlist")) {
+      const prefix = server.tool_prefix ?? server.id;
+      const owner = exposedPrefixes.get(prefix);
+      if (owner) {
+        throw new Error(`Duplicate exposed tool_prefix '${prefix}' for ${owner} and ${server.id}`);
+      }
+      exposedPrefixes.set(prefix, server.id);
+    }
+  }
+  return { version: CONFIG_VERSION, servers };
 }
 
 export async function loadUpstreamConfig(configPath = resolveUpstreamConfigPath()): Promise<UpstreamConfigFile> {
@@ -76,10 +121,7 @@ export async function loadUpstreamConfig(configPath = resolveUpstreamConfigPath(
     const raw = await fs.readFile(configPath, "utf-8");
     const parsed = JSON.parse(raw) as UpstreamConfigFile;
     if (!Array.isArray(parsed.servers)) throw new Error("servers must be an array");
-    return {
-      version: CONFIG_VERSION,
-      servers: parsed.servers.map(normalizeServer),
-    };
+    return normalizeUpstreamConfig(parsed);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       const defaults = defaultUpstreamConfig();
@@ -94,10 +136,7 @@ export async function saveUpstreamConfig(
   config: UpstreamConfigFile,
   configPath = resolveUpstreamConfigPath()
 ): Promise<void> {
-  const normalized: UpstreamConfigFile = {
-    version: CONFIG_VERSION,
-    servers: config.servers.map(normalizeServer),
-  };
+  const normalized = normalizeUpstreamConfig(config);
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   await fs.writeFile(configPath, JSON.stringify(normalized, null, 2), "utf-8");
 }
@@ -175,6 +214,7 @@ function entryToServer(id: string, entry: McpServersEntry, enabledDefault = fals
     env: Object.keys(env).length ? env : undefined,
     cwd: entry.cwd,
     url: entry.url,
+    headers: entry.headers,
     expose: "meta_only",
     tools: [],
   });
@@ -238,6 +278,7 @@ export function parseOpenCodeConfig(raw: OpenCodeConfigFile, enabledDefault = fa
       url: entry.url,
       cwd: entry.cwd,
       environment: entry.environment,
+      headers: entry.headers,
       enabled: entry.enabled,
     };
     const server = entryToServer(id, mapped, enabledDefault);

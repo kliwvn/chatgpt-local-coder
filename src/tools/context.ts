@@ -113,7 +113,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       const upstreamManager = getUpstreamManager();
       let upstream: Awaited<ReturnType<typeof upstreamManager.listStatuses>> = [];
       try {
-        upstream = await upstreamManager.listStatuses();
+        upstream = await upstreamManager.listStatuses({ probe: false });
       } catch {}
       return toolResult("agent_status", {
         permission_profile: getPermissionProfile(),

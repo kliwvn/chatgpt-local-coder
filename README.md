@@ -105,7 +105,7 @@ npm start
 | **Cài Đặt** | Kiểm tra Node/TS, `npm install` + `npm run build` một nút — đã cài thì báo "Trạng thái: Đã cài đặt OK" |
 | **Cấu hình workspace** | `WORKSPACE_PATH` + folder picker (chọn thư mục bằng dialog Windows), đổi tên, xóa, profile |
 | **Focus Server / Tunnel** | Start/stop server, nhân nuôi process/tunnel đang chạy, tunnel OpenAI ổn định (không phải cập nhật URL connector mỗi lần restart) |
-| **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear |
+| **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear. "Tất cả" = toàn bộ server.log (MCP + TOOL + lỗi); chi tiết tool/audit đầy đủ nằm trong audit file `.mcp-audit.log` |
 | **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel (dot xanh), path đầy đủ, `WORKSPACE_PATH → EXTRA_WORKSPACE_PATHS → FULL_DISK_ACCESS`, port + PID |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Focus Tunnel |
 | **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
@@ -265,6 +265,10 @@ WORKSPACE_PATH=C:\Users\You\projects\my-app
 CHATGPT_AUTO_APPROVE=true
 SHELL_TIMEOUT=120
 MCP_SESSION_RECOVERY=true
+MCP_SESSION_TTL_MS=120000
+MCP_SESSION_CLEANUP_MS=15000
+MCP_SESSION_DELETE_GRACE_MS=45000
+MCP_MAX_SESSIONS=64
 FULL_DISK_ACCESS=false
 
 # Workspace bổ sung (phân cách bằng ; trên Windows)
@@ -286,7 +290,10 @@ OPENAI_TUNNEL_API_KEY=
 | `FULL_DISK_ACCESS` | `false` | **Fail-closed sandbox.** `false` = chỉ truy cập trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`); `true` = mở toàn máy |
 | `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
 | `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
+| `MCP_SESSION_TTL_MS` | `120000` | Xóa session **idle** sau 2 phút. Session đang SSE-connected hoặc đang chạy tool không bị evict; stale POST được auto-recover |
+| `MCP_SESSION_CLEANUP_MS` | `15000` | Chu kỳ cleanup session idle (15 giây) |
 | `MCP_SESSION_DELETE_GRACE_MS` | `45000` | Giữ session vừa ngắt 45s trước khi xóa (chống lỗi "luồng tin nhắn" khi reconnect) |
+| `MCP_MAX_SESSIONS` | `64` | Hard cap session giữ trong RAM; evict session idle cũ nhất trước, không đụng session connected/in-flight |
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
 | `CHECKPOINT_ENABLED` / `CHECKPOINT_MAX_FILE_BYTES` | `true` / `5242880` | Checkpoint code trước khi sửa (rewind); file > 5MB bị skip |
 | `PROJECT_MEMORY_MAX_BYTES` / `PROJECT_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn CLAUDE.md/AGENTS.md inject vào instructions. Đặt `0` = không giới hạn |
@@ -294,6 +301,8 @@ OPENAI_TUNNEL_API_KEY=
 | `ADMIN_PORT` | `3001` | Admin GUI localhost-only (proxy qua manager) |
 
 > **Sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → mọi tool bị chặn tại `validatePath` nếu path nằm ngoài workspace roots (đổi ổ đĩa, `..\..` escape). Muốn truy cập toàn máy: đặt `FULL_DISK_ACCESS=true` trong `.env` (instance: `manager/instances/<name>/.env`).
+
+> **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và không tự reset lịch sử chat. Server giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Initialize response vẫn mang MCP server instructions, vì vậy server chỉ gửi **một** bản instruction document (không double-wrap) và dashboard hiển thị retention policy để phát hiện churn bất thường.
 
 
 ## 🏗️ Architecture
@@ -333,7 +342,7 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 - Server chỉ nghe `127.0.0.1` — không phơi ra mạng nội bộ
 - Manager + admin GUI localhost-only; CORS hẹp
 - `.env` và secrets gitignored
-- Audit log: `.mcp-audit.log` (optional, configurable)
+- Audit log: `.mcp-audit.log` (optional, configurable). Managed instances resolve relative paths inside their own `manager/instances/<name>/` directory to avoid cross-workspace log mixing.
 - Chỉ expose qua tunnel bạn kiểm soát. Không share connector URL / tunnel API key
 - Use on a trusted network / personal machine only
 

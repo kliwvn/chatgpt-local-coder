@@ -19,7 +19,7 @@ export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamMa
     },
     async ({ refresh }) => {
       if (refresh) await manager.reloadConfig();
-      const servers = await manager.listStatuses();
+      const servers = await manager.listStatuses({ probe: Boolean(refresh) });
       await audit({ tool: "mcp_servers", action: "list", status: "ok", details: { count: servers.length } });
       return toolResult("mcp_servers", { servers, count: servers.length });
     }

@@ -80,14 +80,6 @@
           <button id="btn-profile-del" class="btn btn-ghost danger">Xóa Profile</button>
         </div>
 
-        <div class="field">
-          <label for="f-workspace">WORKSPACE_PATH</label>
-          <div class="inline">
-            <input id="f-workspace" class="input grow mono" placeholder="VD: D:\Coding\my-app" spellcheck="false" />
-            <button id="btn-workspace-pick" class="btn btn-ghost">Chọn...</button>
-          </div>
-          <p class="hint">Thư mục project ChatGPT được phép thao tác mặc định (đọc CLAUDE.md / AGENTS.md như Claude Code).</p>
-        </div>
 
         <div class="grid2">
           <div class="field">
@@ -116,6 +108,29 @@
             </div>
             <p class="hint" id="key-hint">Runtime key của connector.</p>
           </div>
+          <div class="field field-wide">
+            <label for="f-workspace">WORKSPACE_PATH</label>
+            <div class="inline">
+              <input id="f-workspace" class="input grow mono" placeholder="VD: D:\Coding\my-app" spellcheck="false" />
+              <button id="btn-workspace-pick" class="btn btn-ghost">Chọn...</button>
+            </div>
+            <p class="hint">Thư mục project ChatGPT được phép thao tác mặc định (đọc CLAUDE.md / AGENTS.md như Claude Code).</p>
+          </div>
+          <div class="field">
+            <label for="f-full-disk">FULL_DISK_ACCESS</label>
+            <select id="f-full-disk" class="input">
+              <option value="false">false — sandbox (chỉ trong workspace, mặc định)</option>
+              <option value="true">true — truy cập toàn máy</option>
+            </select>
+            <p class="hint">false = chặn mọi path ngoài WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS.</p>
+          </div>
+          <div class="field">
+            <label for="f-extra-ws">EXTRA_WORKSPACE_PATHS</label>
+            <div class="inline">
+              <input id="f-extra-ws" class="input grow mono" placeholder="D:\Coding\other-repo;E:\Data" spellcheck="false" />
+            </div>
+            <p class="hint">Workspace bổ sung được phép truy cập (phân cách bằng ;).</p>
+          </div>
           <div class="field">
             <label for="f-profile">CHATGPT_TOOL_PROFILE</label>
             <select id="f-profile" class="input">
@@ -142,19 +157,24 @@
             </select>
           </div>
           <div class="field">
-            <label for="f-full-disk">FULL_DISK_ACCESS</label>
-            <select id="f-full-disk" class="input">
-              <option value="false">false — sandbox (chỉ trong workspace, mặc định)</option>
-              <option value="true">true — truy cập toàn máy</option>
-            </select>
-            <p class="hint">false = chặn mọi path ngoài WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS.</p>
+            <label for="f-session-ttl">MCP_SESSION_TTL_MS</label>
+            <input id="f-session-ttl" class="input mono" inputmode="numeric" placeholder="120000" />
+            <p class="hint">Idle TTL; mặc định 2 phút. Session đang SSE/in-flight không bị evict; stale POST tự recover.</p>
           </div>
           <div class="field">
-            <label for="f-extra-ws">EXTRA_WORKSPACE_PATHS</label>
-            <div class="inline">
-              <input id="f-extra-ws" class="input grow mono" placeholder="D:\Coding\other-repo;E:\Data" spellcheck="false" />
-            </div>
-            <p class="hint">Workspace bổ sung được phép truy cập (phân cách bằng ;).</p>
+            <label for="f-session-cleanup">MCP_SESSION_CLEANUP_MS</label>
+            <input id="f-session-cleanup" class="input mono" inputmode="numeric" placeholder="15000" />
+            <p class="hint">Chu kỳ dọn session idle; mặc định 15 giây.</p>
+          </div>
+          <div class="field">
+            <label for="f-session-grace">MCP_SESSION_DELETE_GRACE_MS</label>
+            <input id="f-session-grace" class="input mono" inputmode="numeric" placeholder="45000" />
+            <p class="hint">Grace sau DELETE để request đang chạy kết thúc; mặc định 45 giây.</p>
+          </div>
+          <div class="field">
+            <label for="f-session-max">MCP_MAX_SESSIONS</label>
+            <input id="f-session-max" class="input mono" inputmode="numeric" placeholder="64" />
+            <p class="hint">Hard cap session giữ trong RAM; chỉ evict session idle cũ nhất.</p>
           </div>
           <div class="field">
             <label for="f-mem-bytes">PROJECT_MEMORY_MAX_BYTES</label>

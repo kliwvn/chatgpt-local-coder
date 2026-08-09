@@ -3,6 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import type { Server } from "http";
 import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
+import type { McpSessionSummary, SessionCounts } from "../lib/mcp-session-manager.js";
 import { createAdminRouter } from "./routes.js";
 import { adminAuth, localhostOnly } from "./localhost-guard.js";
 
@@ -15,8 +16,11 @@ export interface AdminServerOptions {
   pid: number;
   manager: McpUpstreamManager;
   sessionCount: () => number;
+  sessionList?: () => McpSessionSummary[];
+  sessionCounts?: () => SessionCounts;
   instructionSummary?: () => Record<string, unknown>;
   instructionsPreview?: () => string;
+  requestShutdown?: () => void;
 }
 
 export function startAdminServer(options: AdminServerOptions): Server {
@@ -34,8 +38,11 @@ export function startAdminServer(options: AdminServerOptions): Server {
     mcpPort: options.mcpPort,
     pid: options.pid,
     sessionCount: options.sessionCount,
+    sessionList: options.sessionList,
+    sessionCounts: options.sessionCounts,
     instructionSummary: options.instructionSummary,
     instructionsPreview: options.instructionsPreview,
+    requestShutdown: options.requestShutdown,
   }));
 
   return app.listen(options.port, host, () => {

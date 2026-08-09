@@ -99,13 +99,21 @@ function writeConsole(entry: ActivityEntry): void {
       entry.tool ? `tools/call ${entry.tool}` : entry.action || entry.kind || "mcp";
     const detail = entry.summary || entry.target || "";
     const http = entry.details?.http_status != null ? ` HTTP ${entry.details.http_status}` : "";
+    // Tool failures (non-zero command, patch miss, test failure) can happen while
+    // the MCP request itself succeeds with HTTP 200. Keep them distinct from
+    // protocol/transport errors so operators do not chase the wrong subsystem.
+    const errorTag = entry.kind === "tool" ? "TOOL ERROR" : "MCP ERROR";
     console.warn(
-      `${ts} [MCP ERROR]${http} ${label}${detail ? ` — ${detail}` : ""}${dur}${sid}`
+      `${ts} [${errorTag}]${http} ${label}${detail ? ` — ${detail}` : ""}${dur}${sid}`
     );
     return;
   }
 
   const status = entry.status ? ` [${entry.status}]` : "";
+  // Successful tool activity is already represented by the canonical MCP
+  // tools/call line (duration + session ID). Keep it in the in-memory/audit feed,
+  // but avoid a duplicate console/server.log line. Dry-run remains visible.
+  if (entry.kind === "tool" && (entry.status ?? "ok") === "ok") return;
 
   if (entry.kind === "tool" && entry.tool) {
     const extra = entry.summary || entry.target || "";
@@ -121,6 +129,14 @@ function writeConsole(entry: ActivityEntry): void {
         ? ` (${entry.details.tool_count} tools)`
         : "";
     console.log(`${ts} [MCP]${status} ${label}${discovery}${extra}${dur}${sid}`);
+    return;
+  }
+
+  // SessionManager already emits the canonical initialize line with the real
+  // MCP client name/version after the SDK has populated clientInfo. Keep the
+  // activity entry for the admin feed, but do not print a second generic
+  // "session initialize" line for every short-lived ChatGPT transport session.
+  if (entry.kind === "session" && entry.action === "initialize") {
     return;
   }
 
@@ -165,6 +181,19 @@ export async function loadAuditHistory(limit = 80): Promise<ActivityEntry[]> {
   }
 }
 
+function classifyMcpStatus(httpStatus: number, errorMessage?: string): "ok" | "warn" | "error" {
+  if (httpStatus < 400) return "ok";
+  // These are expected state/client-probe conditions, not server failures:
+  // - stateful GET/DELETE without Mcp-Session-Id
+  // - a second concurrent SSE GET on the same session (409 by design)
+  if (
+    httpStatus === 409 ||
+    (httpStatus === 400 && /Mcp-Session-Id header is required/i.test(errorMessage || ""))
+  ) {
+    return "warn";
+  }
+  return "error";
+}
 export function logMcpHttpEvent(opts: {
   method: string;
   path: string;
@@ -176,6 +205,7 @@ export function logMcpHttpEvent(opts: {
   errorMessage?: string;
   summary?: string;
 }): void {
+  const status = classifyMcpStatus(opts.httpStatus, opts.errorMessage);
   const isError = opts.httpStatus >= 400;
   const label = opts.tool
     ? `tools/call ${opts.tool}`
@@ -191,7 +221,7 @@ export function logMcpHttpEvent(opts: {
     action: opts.rpcMethod || `${opts.method} ${opts.path}`,
     session_id: opts.sessionId,
     client: "chatgpt",
-    status: isError ? "error" : "ok",
+    status,
     duration_ms: opts.durationMs,
     summary,
     details: { http_status: opts.httpStatus, method: opts.method, path: opts.path },
@@ -219,6 +249,7 @@ export function logMcpRequest(
     return;
   }
   const rpc = body as { method?: string; params?: { name?: string; arguments?: unknown; protocolVersion?: string } };
+  const status = classifyMcpStatus(httpStatus, errorMessage);
   const isError = httpStatus >= 400;
   const argSummary =
     rpc.method === "tools/call" && rpc.params?.name
@@ -234,7 +265,7 @@ export function logMcpRequest(
       action: "tools/call",
       session_id: sessionId,
       client: "chatgpt",
-      status: isError ? "error" : "ok",
+      status,
       duration_ms: durationMs,
       summary,
       details: {
@@ -252,7 +283,7 @@ export function logMcpRequest(
       action: "initialize",
       session_id: sessionId,
       client: "chatgpt",
-      status: isError ? "error" : "ok",
+      status,
       duration_ms: durationMs,
       summary: errorMessage,
       details: { http_status: httpStatus },
@@ -266,7 +297,7 @@ export function logMcpRequest(
       action: "tools/list",
       session_id: sessionId,
       client: "chatgpt",
-      status: isError ? "error" : "ok",
+      status,
       duration_ms: durationMs,
       summary: errorMessage || (isError ? `HTTP ${httpStatus}` : "discovery"),
       details: { http_status: httpStatus, phase: "connector_discovery" },
@@ -280,7 +311,7 @@ export function logMcpRequest(
       action: rpc.method,
       session_id: sessionId,
       client: "chatgpt",
-      status: isError ? "error" : "ok",
+      status,
       duration_ms: durationMs,
       summary: errorMessage,
       details: { http_status: httpStatus },

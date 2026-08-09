@@ -50,6 +50,10 @@ const FIELD_ENV = {
   "f-auto-approve": "CHATGPT_AUTO_APPROVE",
   "f-timeout": "SHELL_TIMEOUT",
   "f-recovery": "MCP_SESSION_RECOVERY",
+  "f-session-ttl": "MCP_SESSION_TTL_MS",
+  "f-session-cleanup": "MCP_SESSION_CLEANUP_MS",
+  "f-session-grace": "MCP_SESSION_DELETE_GRACE_MS",
+  "f-session-max": "MCP_MAX_SESSIONS",
   "f-tunnel-id": "OPENAI_TUNNEL_ID",
   "f-full-disk": "FULL_DISK_ACCESS",
   "f-extra-ws": "EXTRA_WORKSPACE_PATHS",
@@ -112,7 +116,7 @@ function renderServerTunnel(s) {
       ? `${roots[0]} (+${roots.length - 1} path mở rộng)`
       : roots[0] || (srv.health && srv.health.defaultCwd) || "—";
   $("server-detail").textContent = srv.running
-    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel}`
+    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}`
     : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
 
   // tunnel
@@ -148,7 +152,8 @@ function renderServerTunnel(s) {
 
 /* ---------------- log viewer ---------------- */
 const LOG_MCP_RE = /\[(MCP|TOOL|AUDIT)\]|MCP ERROR/i;
-const LOG_STATE = { mode: "all", paused: false, cleared: false, lastLog: "", lastSize: 0, lastCount: 0, lastMtime: 0 };
+const LOG_STATE = { mode: "all", paused: false, sourceLog: "", lastLog: "", lastSize: 0, lastCount: 0, lastMtime: 0, fetchInFlight: false };
+let instancesFetchInFlight = false;
 
 function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
@@ -191,25 +196,47 @@ function setLogMode(mode) {
   renderLogView();
 }
 
+function logSnapshotDelta(previous, next) {
+  if (!previous) return { append: next, reset: true };
+  if (previous === next) return { append: "", reset: false };
+  const prev = previous.split(/\r?\n/).filter(Boolean);
+  const curr = next.split(/\r?\n/).filter(Boolean);
+  const max = Math.min(prev.length, curr.length);
+  for (let n = max; n > 0; n--) {
+    let same = true;
+    for (let i = 0; i < n; i++) {
+      if (prev[prev.length - n + i] !== curr[i]) { same = false; break; }
+    }
+    if (same) return { append: curr.slice(n).join("\n"), reset: false };
+  }
+  return { append: next, reset: true };
+}
+
 async function loadLog() {
-  if (!state.current || LOG_STATE.paused) return;
+  if (!state.current || LOG_STATE.paused || LOG_STATE.fetchInFlight || document.visibilityState !== "visible") return;
   const name = state.current;
+  LOG_STATE.fetchInFlight = true;
   try {
     const r = await api(instUrl(name, "/log?kind=server&max=300000"));
     if (state.current !== name) return; // user đã chuyển instance — bỏ kết quả cũ
-    if (LOG_STATE.cleared) {
-      LOG_STATE.cleared = false;
-      LOG_STATE.lastMtime = 0;
-    }
-    LOG_STATE.lastLog = r.log || "";
+    const next = r.log || "";
+    const delta = logSnapshotDelta(LOG_STATE.sourceLog, next);
+    LOG_STATE.sourceLog = next;
+    if (delta.reset) LOG_STATE.lastLog = delta.append;
+    else if (delta.append) LOG_STATE.lastLog = [LOG_STATE.lastLog, delta.append].filter(Boolean).join("\n");
     LOG_STATE.lastSize = r.size || 0;
-    LOG_STATE.lastCount = (r.log || "").split(/\r?\n/).filter((l) => l.trim()).length;
-    if (LOG_STATE.lastMtime !== r.mtime) {
-      LOG_STATE.lastMtime = r.mtime || 0;
-      renderLogView();
+    LOG_STATE.lastCount = next.split(/\r?\n/).filter((l) => l.trim()).length;
+    // Bound the on-screen buffer to the authoritative tail size so repeated
+    // overlap appends cannot grow beyond what the server actually returns.
+    if (LOG_STATE.lastCount > 0) {
+      LOG_STATE.lastLog = LOG_STATE.lastLog.split(/\r?\n/).filter(Boolean).slice(-LOG_STATE.lastCount).join("\n");
     }
+    LOG_STATE.lastMtime = r.mtime || 0;
+    renderLogView();
   } catch {
     /* instance chưa có log file — giữ nguyên view */
+  } finally {
+    LOG_STATE.fetchInFlight = false;
   }
 }
 /* ---------------- instance list / selection ---------------- */
@@ -224,6 +251,8 @@ function getInstance(name) {
 }
 
 async function loadInstances(initial) {
+  if (instancesFetchInFlight || (!initial && document.visibilityState !== "visible")) return;
+  instancesFetchInFlight = true;
   try {
     const r = await api("/api/instances");
     state.node = r.node || null;
@@ -248,7 +277,7 @@ async function loadInstances(initial) {
           `<span class="inst-ws" title="${esc(ws)}">${esc(ws)}</span>` +
           (extra ? `<span class="inst-extra" title="${esc(extra)}">EXTRA: ${esc(shortPath(extra))}</span>` : "") +
           `<span class="inst-access">FULL_DISK_ACCESS: ${access}</span>` +
-          `<span class="inst-meta">:${esc(String(port))} · pid ${esc(String(i.server.pid || "—"))}</span>` +
+          `<span class="inst-meta">:${esc(String(port))} · pid ${esc(String(i.server.pid || "—"))}${srv && i.server.health ? ` · ${i.server.health.activeSessions ?? 0} đăng ký${i.server.health.connectedSessions != null ? ` · ${i.server.health.connectedSessions} kết nối` : ""}` : ""}</span>` +
           `</div>` +
           `</li>`
         );
@@ -285,6 +314,8 @@ async function loadInstances(initial) {
     $("mgr-version").textContent = "Manager không phản hồi — kiểm tra cửa sổ manager.bat";
     if (initial) setBusy(false);
     console.error(err);
+  } finally {
+    instancesFetchInFlight = false;
   }
 }
 
@@ -295,6 +326,10 @@ async function selectInstance(name, initial) {
     return;
   }
   state.current = name;
+  LOG_STATE.sourceLog = "";
+  LOG_STATE.lastLog = "";
+  LOG_STATE.lastMtime = 0;
+  LOG_STATE.lastCount = 0;
   state.lastBundle = b;
   const env = b.env;
   const cfg = b.config;
@@ -802,10 +837,11 @@ function init() {
     if (!LOG_STATE.paused) loadLog();
   });
   $("log-clear").addEventListener("click", () => {
-    LOG_STATE.cleared = true;
-    LOG_STATE.lastMtime = 0;
+    // Visual clear only: preserve sourceLog as the checkpoint, otherwise the
+    // next poll would rehydrate the whole historical tail.
+    LOG_STATE.lastLog = "";
     $("log-view").textContent = "";
-    $("log-meta").textContent = "";
+    renderLogView();
   });
 
   // periodic refresh (không đụng form — chỉ sidebar + trạng thái)
@@ -813,6 +849,12 @@ function init() {
   loadProfiles().catch(() => {});
   setInterval(() => !busy && loadInstances(false), 3000);
   setInterval(loadLog, 2500);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      if (!busy) void loadInstances(false);
+      void loadLog();
+    }
+  });
 }
 
 document.addEventListener("DOMContentLoaded", init);

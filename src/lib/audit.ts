@@ -12,7 +12,19 @@ export interface AuditEvent {
   details?: Record<string, unknown>;
 }
 
-const auditPath = process.env.AUDIT_LOG_PATH || path.resolve(process.cwd(), ".mcp-audit.log");
+function resolveAuditPath(): string {
+  const configured = process.env.AUDIT_LOG_PATH?.trim();
+  if (!configured) return path.resolve(process.cwd(), ".mcp-audit.log");
+  if (path.isAbsolute(configured)) return path.normalize(configured);
+  // Managed instances are spawned with cwd=repo root, so resolving a relative
+  // AUDIT_LOG_PATH against cwd would mix every instance into one shared file.
+  // MCP_ENV_FILE is injected by manager and gives each instance a stable base.
+  const envFile = process.env.MCP_ENV_FILE?.trim();
+  const base = envFile ? path.dirname(path.resolve(envFile)) : process.cwd();
+  return path.resolve(base, configured);
+}
+
+const auditPath = resolveAuditPath();
 
 export async function audit(event: AuditEvent): Promise<void> {
   const record = {

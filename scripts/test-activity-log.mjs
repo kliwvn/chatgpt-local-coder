@@ -1,10 +1,33 @@
 import assert from "node:assert/strict";
-import { appendActivity, getRecentActivity, logMcpRequest, summarizeToolArgs } from "../dist/lib/activity-log.js";
+import { appendActivity, getRecentActivity, logMcpHttpEvent, logMcpRequest, summarizeToolArgs } from "../dist/lib/activity-log.js";
 
 // summarizeToolArgs
 assert.equal(summarizeToolArgs("run_command", { command: "npm test" }), "npm test");
 assert.equal(summarizeToolArgs("read_text_file", { path: "C:\\foo.ts" }), "C:\\foo.ts");
 
+// console taxonomy: tool/business failures are not MCP transport failures
+const warnLines = [];
+const originalWarn = console.warn;
+console.warn = (...args) => warnLines.push(args.join(" "));
+try {
+  appendActivity({ kind: "tool", tool: "run_command", status: "error", summary: "exit 1" });
+  appendActivity({ kind: "mcp", action: "POST /mcp", status: "error", summary: "transport failed" });
+} finally {
+  console.warn = originalWarn;
+}
+assert.match(warnLines[0], /\[TOOL ERROR\]/);
+assert.doesNotMatch(warnLines[0], /\[MCP ERROR\]/);
+assert.match(warnLines[1], /\[MCP ERROR\]/);
+// successful TOOL entry stays in activity but does not duplicate the MCP console line
+const infoLines = [];
+const originalLog = console.log;
+console.log = (...args) => infoLines.push(args.join(" "));
+try {
+  appendActivity({ kind: "tool", tool: "grep", status: "ok", summary: "pattern: duplicate-check" });
+} finally {
+  console.log = originalLog;
+}
+assert.equal(infoLines.length, 0);
 // append + retrieve
 const before = getRecentActivity(500).length;
 appendActivity({ kind: "tool", tool: "grep", status: "ok", summary: "pattern: foo" });
@@ -34,6 +57,23 @@ if (since) {
   assert.ok(newer.length < all.length);
 }
 
+// expected client-state errors should be warnings, not server errors
+logMcpRequest(
+  { method: "tools/list", params: {} },
+  undefined,
+  1,
+  400,
+  "Bad Request: Mcp-Session-Id header is required"
+);
+assert.equal(getRecentActivity(1)[0].status, "warn");
+logMcpHttpEvent({
+  method: "GET",
+  path: "/mcp",
+  httpStatus: 409,
+  durationMs: 1,
+  errorMessage: "Conflict: Only one SSE stream is allowed per session",
+});
+assert.equal(getRecentActivity(1)[0].status, "warn");
 // error logging with message
 logMcpRequest(
   { method: "tools/call", params: { name: "write_file", arguments: { path: "/x" } } },

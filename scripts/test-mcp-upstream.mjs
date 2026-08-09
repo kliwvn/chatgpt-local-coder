@@ -2,6 +2,8 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "node:child_process";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   importCursorMcpConfig,
@@ -13,6 +15,7 @@ import {
 } from "../dist/lib/mcp-upstream-config.js";
 import { McpUpstreamManager } from "../dist/lib/mcp-upstream-manager.js";
 import { refreshProxiedTools, jsonSchemaToZodShape } from "../dist/lib/mcp-tool-proxy.js";
+import { createMcpServer } from "../dist/server-factory.js";
 import { registerMcpBridgeTools } from "../dist/tools/mcp-bridge.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -89,6 +92,7 @@ await run("save and load upstream config", async () => {
           enabled: true,
           transport: "http",
           url: "http://127.0.0.1:3999/mcp",
+          headers: { Authorization: "Bearer test" },
           expose: "meta_only",
         },
       ],
@@ -98,6 +102,43 @@ await run("save and load upstream config", async () => {
   const loaded = await loadUpstreamConfig(configPath);
   if (loaded.servers.length !== 1 || loaded.servers[0].id !== "demo") {
     throw new Error(JSON.stringify(loaded));
+  }
+  if (loaded.servers[0].headers?.Authorization !== "Bearer test") {
+    throw new Error(`headers lost: ${JSON.stringify(loaded.servers[0].headers)}`);
+  }
+});
+
+await run("upstream config rejects duplicate exposed prefixes", async () => {
+  let rejected = false;
+  try {
+    await saveUpstreamConfig(
+      {
+        version: 1,
+        servers: [
+          { id: "a", enabled: true, transport: "http", url: "http://127.0.0.1:1/mcp", expose: "all", tool_prefix: "dup" },
+          { id: "b", enabled: true, transport: "http", url: "http://127.0.0.1:2/mcp", expose: "allowlist", tools: ["x"], tool_prefix: "dup" },
+        ],
+      },
+      configPath
+    );
+  } catch (err) {
+    rejected = /Duplicate exposed tool_prefix/.test(String(err));
+  }
+  if (!rejected) throw new Error("duplicate exposed prefix was accepted");
+});
+
+await run("upstream config rejects non-string env/header values", async () => {
+  for (const server of [
+    { id: "bad-env", enabled: true, transport: "stdio", command: "node", env: { X: 123 }, expose: "none" },
+    { id: "bad-header", enabled: true, transport: "http", url: "http://127.0.0.1:1/mcp", headers: { X: 123 }, expose: "none" },
+  ]) {
+    let rejected = false;
+    try {
+      await saveUpstreamConfig({ version: 1, servers: [server] }, configPath);
+    } catch (err) {
+      rejected = /must be a string/.test(String(err));
+    }
+    if (!rejected) throw new Error(`invalid map accepted: ${server.id}`);
   }
 });
 
@@ -174,6 +215,52 @@ try {
     const raw = await manager.callTool("mockhttp", "add", { a: 2, b: 3 });
     const text = JSON.stringify(raw);
     if (!text.includes("5")) throw new Error(text);
+    await manager.shutdown();
+  });
+
+  await run("passive status does not connect cold upstream", async () => {
+    const manager = new McpUpstreamManager(configPath);
+    await manager.init();
+    await manager.updateConfig({
+      version: 1,
+      servers: [{ id: "cold", enabled: true, transport: "http", url: `http://127.0.0.1:${httpPort}/mcp`, expose: "meta_only" }],
+    });
+    const passive = await manager.listStatuses({ probe: false });
+    if (passive[0]?.connected || passive[0]?.health !== "unknown") throw new Error(JSON.stringify(passive));
+    const active = await manager.listStatuses({ probe: true });
+    if (!active[0]?.connected || active[0]?.health !== "connected") throw new Error(JSON.stringify(active));
+    await manager.shutdown();
+  });
+
+  await run("concurrent cold connects share one upstream connection", async () => {
+    const manager = new McpUpstreamManager(configPath);
+    await manager.init();
+    await manager.updateConfig({
+      version: 1,
+      servers: [{ id: "race", enabled: true, transport: "http", url: `http://127.0.0.1:${httpPort}/mcp`, expose: "meta_only" }],
+    });
+    const [a, b, c] = await Promise.all([manager.connect("race"), manager.connect("race"), manager.connect("race")]);
+    if (a !== b || b !== c) throw new Error("concurrent connect returned multiple connection objects");
+    await manager.shutdown();
+  });
+
+  await run("config change invalidates active upstream connection", async () => {
+    const manager = new McpUpstreamManager(configPath);
+    await manager.init();
+    await manager.updateConfig({
+      version: 1,
+      servers: [{ id: "swap", enabled: true, transport: "http", url: `http://127.0.0.1:${httpPort}/mcp`, expose: "meta_only" }],
+    });
+    await manager.connect("swap");
+    let passive = await manager.listStatuses({ probe: false });
+    if (!passive[0]?.connected) throw new Error("expected active connection before config change");
+    await manager.updateConfig({
+      version: 1,
+      servers: [{ id: "swap", enabled: true, transport: "http", url: `http://127.0.0.1:${httpPort}/mcp?rev=2`, expose: "meta_only" }],
+    });
+    passive = await manager.listStatuses({ probe: false });
+    if (passive[0]?.connected) throw new Error("stale connection survived config change");
+    await manager.shutdown();
   });
 
   await run("allowlist proxy registers prefixed tool", async () => {
@@ -200,6 +287,47 @@ try {
     if (!proxied.includes("mockhttp__add")) throw new Error(JSON.stringify(proxied));
     const names = manager.getProxiedToolNames(manager.getServerConfig("mockhttp"), await manager.listTools("mockhttp"));
     if (!names.includes("mockhttp__add")) throw new Error(JSON.stringify(names));
+    await manager.shutdown();
+  });
+
+  await run("slim profile keeps configured proxy but hides heavy local tools", async () => {
+    const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
+    process.env.CHATGPT_TOOL_PROFILE = "slim";
+    const manager = new McpUpstreamManager(configPath);
+    let server;
+    let client;
+    try {
+      await manager.init();
+      await manager.updateConfig({
+        version: 1,
+        servers: [
+          {
+            id: "mockhttp",
+            name: "Mock HTTP",
+            enabled: true,
+            transport: "http",
+            url: `http://127.0.0.1:${httpPort}/mcp`,
+            expose: "allowlist",
+            tools: ["add"],
+            tool_prefix: "mockhttp",
+          },
+        ],
+      });
+      server = await createMcpServer(root, 30, [root], false, manager, "test instructions");
+      client = new Client({ name: "slim-proxy-test", version: "1" });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+      const list = await client.listTools();
+      const names = new Set((list.tools || []).map((t) => t.name));
+      if (!names.has("mockhttp__add")) throw new Error(`proxy missing from slim: ${[...names].join(",")}`);
+      if (names.has("read_multiple_files")) throw new Error("heavy local tool leaked into slim profile");
+    } finally {
+      await client?.close().catch(() => undefined);
+      await server?.close().catch(() => undefined);
+      await manager.shutdown();
+      if (oldProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
+      else process.env.CHATGPT_TOOL_PROFILE = oldProfile;
+    }
   });
 } finally {
   mockHttp.kill("SIGTERM");
@@ -228,6 +356,7 @@ await run("manager connects to stdio mock upstream", async () => {
   const text = JSON.stringify(raw);
   if (!text.includes("echo:hi")) throw new Error(text);
   await manager.disconnect("mockstdio");
+  await manager.shutdown();
 });
 
 await fs.rm(tmpDir, { recursive: true, force: true });

@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { Router, type Request, type Response } from "express";
 import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
+import type { McpSessionSummary, SessionCounts } from "../lib/mcp-session-manager.js";
 import {
   defaultUpstreamConfig,
   discoverMcpConfigs,
@@ -22,6 +23,13 @@ import {
 const SECRET_KEY_PATTERN =
   /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
 const REDACTED_MASK = "********";
+
+const SESSION_POLICY_LIMITS: Record<string, [number, number]> = {
+  MCP_SESSION_TTL_MS: [15_000, 86_400_000],
+  MCP_SESSION_CLEANUP_MS: [1_000, 600_000],
+  MCP_SESSION_DELETE_GRACE_MS: [1_000, 600_000],
+  MCP_MAX_SESSIONS: [8, 4096],
+};
 
 function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(key);
@@ -69,24 +77,66 @@ function serializeDotEnv(values: Record<string, string>, original: string): stri
   return result.join("\n");
 }
 
+function validateAdminEnv(text: string): string | null {
+  const parsed = parseDotEnv(text);
+  for (const [key, [min, max]] of Object.entries(SESSION_POLICY_LIMITS)) {
+    if (!(key in parsed) || parsed[key] === "") continue;
+    const n = Number(parsed[key]);
+    if (!Number.isInteger(n) || n < min || n > max) {
+      return `${key} must be an integer between ${min} and ${max}`;
+    }
+  }
+  const ttl = parsed.MCP_SESSION_TTL_MS ? Number(parsed.MCP_SESSION_TTL_MS) : null;
+  const cleanup = parsed.MCP_SESSION_CLEANUP_MS ? Number(parsed.MCP_SESSION_CLEANUP_MS) : null;
+  if (ttl && cleanup && cleanup > ttl) {
+    return "MCP_SESSION_CLEANUP_MS must not exceed MCP_SESSION_TTL_MS";
+  }
+  return null;
+}
+
 export function createAdminRouter(manager: McpUpstreamManager, options: {
   mcpPort: number;
   pid: number;
   sessionCount: () => number;
+  sessionList?: () => McpSessionSummary[];
+  sessionCounts?: () => SessionCounts;
   instructionSummary?: () => Record<string, unknown>;
   instructionsPreview?: () => string;
+  requestShutdown?: () => void;
 }): Router {
   const router = Router();
-  const envPath = path.resolve(process.cwd(), ".env");
-
+  const envPath = path.resolve(process.env.MCP_ENV_FILE || path.join(process.cwd(), ".env"));
+  // Single source for session counts so /health, /api/sessions and any future
+  // route expose the same numbers under the same key names.
+  const sessionCounts = (): { total: number; connected: number; policy: Record<string, number | null> } => {
+    const counts = options.sessionCounts?.() ?? {
+      registered: options.sessionCount(),
+      connected: 0,
+    };
+    return {
+      total: counts.registered,
+      connected: counts.connected,
+      policy: {
+        max_retained: counts.maxRetained ?? null,
+        idle_ttl_ms: counts.idleTtlMs ?? null,
+        cleanup_interval_ms: counts.cleanupIntervalMs ?? null,
+      },
+    };
+  };
   router.get("/health", async (_req: Request, res: Response) => {
-    const upstream = await manager.listStatuses();
+    // Passive snapshot only. Admin UI polls /health; an active probe here would
+    // reconnect/touch every upstream every few seconds and defeat idle_timeout.
+    const upstream = await manager.listStatuses({ probe: false });
+    const counts = sessionCounts();
     res.json({
       status: "ok",
       name: "codex-mcp-admin",
       pid: options.pid,
+      active_sessions: counts.total,
+      connected_sessions: counts.connected,
+      session_policy: counts.policy,
       mcp_port: options.mcpPort,
-      active_sessions: options.sessionCount(),
+      sessions: options.sessionList?.() ?? [],
       default_cwd: getDefaultCwd(),
       full_disk_access: getFullDiskAccess(),
       upstream,
@@ -95,6 +145,31 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     });
   });
 
+  // Danh sách phiên kết nối đang mở — chỉ shortId (không lộ session ID thật,
+  // vì ID đó là credential replay được qua /mcp). Route này nằm sau
+  // localhostOnly + adminAuth nên chỉ quản trị viên local xem được.
+  router.get("/api/sessions", (_req: Request, res: Response) => {
+    const counts = sessionCounts();
+    res.json({
+      ok: true,
+      total: counts.total,
+      connected: counts.connected,
+      policy: counts.policy,
+      sessions: options.sessionList?.() ?? [],
+    });
+  });
+
+
+  router.post("/api/process/shutdown", (_req: Request, res: Response) => {
+    if (!options.requestShutdown) {
+      res.status(501).json({ ok: false, error: "Graceful shutdown is not configured" });
+      return;
+    }
+    // Acknowledge first so the manager receives a complete response before the
+    // admin listener and MCP/SSE transports are closed.
+    res.status(202).json({ ok: true, shutting_down: true });
+    setImmediate(() => options.requestShutdown?.());
+  });
   router.get("/api/instructions/preview", (_req, res) => {
     const text = options.instructionsPreview?.() ?? "";
     const summary = options.instructionSummary?.() ?? {};
@@ -135,6 +210,10 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       // Loại bỏ giá trị mask trước khi serialize — nếu không sẽ ghi "********" đè secret thật
       const filtered: Record<string, string> = {};
       for (const [k, v] of Object.entries(values)) {
+        if (typeof v !== "string") {
+          res.status(400).json({ ok: false, error: `Environment value for ${k} must be a string` });
+          return;
+        }
         if (v !== REDACTED_MASK) filtered[k] = v;
       }
       let original = "";
@@ -142,11 +221,24 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         original = await fs.readFile(envPath, "utf-8");
       } catch {}
       const next = serializeDotEnv(filtered, original || "");
-      await fs.writeFile(envPath, next, "utf-8");
-      for (const [k, v] of Object.entries(filtered)) {
-        process.env[k] = v;
+      const validationError = validateAdminEnv(next);
+      if (validationError) {
+        res.status(400).json({ ok: false, error: validationError });
+        return;
       }
-      res.json({ ok: true, path: envPath });
+      const tmpPath = `${envPath}.tmp-${process.pid}`;
+      await fs.writeFile(tmpPath, next, "utf-8");
+      try {
+        await fs.rename(tmpPath, envPath);
+      } catch {
+        await fs.rm(envPath, { force: true });
+        await fs.rename(tmpPath, envPath);
+      }
+      // Do not mutate process.env here: session/workspace/tool-profile config is
+      // captured at startup while a few security helpers read env dynamically.
+      // Partial live application would create a mixed old/new runtime. Persist
+      // atomically and require one clean restart for all settings.
+      res.json({ ok: true, path: envPath, restart_required: true });
     } catch (err) {
       res.status(500).json({ ok: false, error: String(err) });
     }
@@ -296,6 +388,17 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     return out;
   }
 
+  function redactActivitySession(entry: ActivityEntry): ActivityEntry {
+    if (!entry.session_id) return entry;
+    return {
+      ...entry,
+      // MCP session IDs are bearer-like replay credentials. Keep only enough
+      // characters for operator correlation; never expose the raw ID through
+      // admin JSON/SSE even though the admin server itself is localhost-only.
+      session_id: `${entry.session_id.slice(0, 8)}…`,
+    };
+  }
+
   router.get("/api/activity", (req, res) => {
     const limit = Math.min(parseInt(String(req.query.limit || "100"), 10) || 100, 500);
     const since = typeof req.query.since === "string" ? req.query.since : undefined;
@@ -305,14 +408,14 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       tool: typeof req.query.tool === "string" ? req.query.tool : undefined,
       q: typeof req.query.q === "string" ? req.query.q : undefined,
     });
-    res.json({ ok: true, entries, count: entries.length });
+    res.json({ ok: true, entries: entries.map(redactActivitySession), count: entries.length });
   });
 
   router.get("/api/activity/history", async (req, res) => {
     try {
       const limit = Math.min(parseInt(String(req.query.limit || "80"), 10) || 80, 500);
       const entries = await loadAuditHistory(limit);
-      res.json({ ok: true, entries, source: "audit_file" });
+      res.json({ ok: true, entries: entries.map(redactActivitySession), source: "audit_file" });
     } catch (err) {
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -325,7 +428,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     res.flushHeaders?.();
 
     const send = (entry: ActivityEntry) => {
-      res.write(`data: ${JSON.stringify(entry)}\n\n`);
+      res.write(`data: ${JSON.stringify(redactActivitySession(entry))}\n\n`);
     };
 
     for (const entry of getRecentActivity(30).reverse()) send(entry);

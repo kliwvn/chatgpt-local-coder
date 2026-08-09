@@ -20,25 +20,32 @@ const NOOP_TOOL = {
   enabled: false,
 } as unknown as RegisteredTool;
 
-function applyToolProfile(server: McpServer): void {
+function applyToolProfile(server: McpServer): () => void {
   const profile = getChatGptToolProfile();
-  if (profile === "full") return;
+  if (profile === "full") return () => {};
 
   const original = server.registerTool.bind(server);
   server.registerTool = ((name, ...rest) => {
     if (!shouldExposeTool(String(name), profile)) return NOOP_TOOL;
     return original(name, ...rest);
   }) as typeof server.registerTool;
+  return () => {
+    // The slim profile filters built-in/bridge tools only. Explicit upstream
+    // allowlist/all proxy tools are already controlled by upstream config and
+    // must remain callable, otherwise refreshProxiedTools records NOOP entries
+    // that never appear in tools/list.
+    server.registerTool = original as typeof server.registerTool;
+  };
 }
 
-export function createMcpServer(
+export async function createMcpServer(
   workspaceRoot: string,
   shellTimeout: number,
   workspaceRoots: string[] = [workspaceRoot],
   fullDiskAccess = false,
   upstreamManager?: McpUpstreamManager,
-  projectMemoryInstructions?: string
-): McpServer {
+  serverInstructions?: string
+): Promise<McpServer> {
   const server = new McpServer(
     {
       name: "codex-mcp-server",
@@ -49,16 +56,18 @@ export function createMcpServer(
         logging: {},
         tools: { listChanged: true },
       },
-      instructions: buildServerInstructions(
-        workspaceRoot,
-        workspaceRoots,
-        fullDiskAccess,
-        projectMemoryInstructions
-      ),
+      // instruction-context already builds the complete server instruction
+      // document (agent workflow + env/git/project memory + quick pointers).
+      // Re-wrapping that document with buildServerInstructions() duplicated the
+      // header/footer on every initialize response. Only synthesize the minimal
+      // default here when the caller did not provide a complete document.
+      instructions:
+        serverInstructions?.trim() ||
+        buildServerInstructions(workspaceRoot, workspaceRoots, fullDiskAccess),
     }
   );
 
-  applyToolProfile(server);
+  const restoreRegisterTool = applyToolProfile(server);
 
   registerFilesystemTools(server);
   registerShellTools(server, workspaceRoot, shellTimeout);
@@ -68,8 +77,21 @@ export function createMcpServer(
 
   if (upstreamManager) {
     registerMcpBridgeTools(server, upstreamManager);
+    restoreRegisterTool();
     upstreamManager.registerMcpServer(server);
-    void refreshProxiedTools(server, upstreamManager);
+    // A client may issue tools/list immediately after initialize. Do not expose
+    // the session until all configured proxy tools have been registered, or the
+    // first tools/list becomes timing-dependent. Upstream tool discovery itself
+    // is cached by McpUpstreamManager, so warm-session cost stays low.
+    try {
+      await refreshProxiedTools(server, upstreamManager);
+    } catch (err) {
+      upstreamManager.unregisterMcpServer(server);
+      await server.close().catch(() => undefined);
+      throw err;
+    }
+  } else {
+    restoreRegisterTool();
   }
 
   return server;

@@ -6,6 +6,11 @@ const ENV_KEYS = [
   "CHATGPT_AUTO_APPROVE",
   "CHATGPT_TOOL_PROFILE",
   "SHELL_TIMEOUT",
+  "MCP_SESSION_RECOVERY",
+  "MCP_SESSION_TTL_MS",
+  "MCP_SESSION_CLEANUP_MS",
+  "MCP_SESSION_DELETE_GRACE_MS",
+  "MCP_MAX_SESSIONS",
   "CHECKPOINT_ENABLED",
   "MCP_UPSTREAM_CONFIG",
   "POST_EDIT_HOOKS_CONFIG",
@@ -30,9 +35,29 @@ const SOURCE_LABELS = {
 let upstreamConfig = { servers: [] };
 let editingServerId = null;
 let activityPollTimer = null;
+let activityPollInFlight = false;
 let activityEventSource = null;
 let activitySeenIds = new Set();
 let activityPaused = false;
+let dashboardRefreshInFlight = false;
+let dashboardPollTimer = null;
+
+// Khi admin UI được nhúng qua manager (http://127.0.0.1:<MANAGER_PORT>/admin/ui/),
+// mọi request API tương đối phải đi qua /admin để manager proxy chuyển tiếp tới
+// admin server thật của instance (proxy sẵn có strip tiền tố /admin).
+// Khi mở trực tiếp (http://127.0.0.1:<ADMIN_PORT>/ui/), base rỗng.
+const IS_PROXIED = location.pathname.startsWith("/admin/");
+const API_BASE = IS_PROXIED ? "/admin" : "";
+// Trong chế độ proxy, giữ instance hiện tại trên mọi URL API (manager proxy
+// chọn instance theo query ?instance=... khi không có header x-instance-name).
+const API_INSTANCE = new URLSearchParams(location.search).get("instance") || "";
+const apiUrl = (path) => {
+  let url = API_BASE + path;
+  if (IS_PROXIED && API_INSTANCE) {
+    url += (url.includes("?") ? "&" : "?") + `instance=${encodeURIComponent(API_INSTANCE)}`;
+  }
+  return url;
+};
 
 function toast(msg, isError = false) {
   const el = document.getElementById("toast");
@@ -42,9 +67,8 @@ function toast(msg, isError = false) {
   clearTimeout(toast._t);
   toast._t = setTimeout(() => (el.hidden = true), 3200);
 }
-
 async function api(path, options = {}) {
-  const res = await fetch(path, {
+  const res = await fetch(apiUrl(path), {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   });
@@ -98,21 +122,60 @@ function serversTable(rows, { actions = true } = {}) {
 
 async function loadDashboard() {
   const health = await api("/health");
-  document.getElementById("conn-status").textContent = `MCP :${health.mcp_port} · ${health.active_sessions} sessions`;
+  const connected = health.connected_sessions ?? 0;
+  const sessionPolicy = health.session_policy || {};
+  const sessionMax = sessionPolicy.max_retained ?? "—";
+  const idleTtlMs = Number(sessionPolicy.idle_ttl_ms || 0);
+  const cleanupMs = Number(sessionPolicy.cleanup_interval_ms || 0);
+  const idleTtlLabel = idleTtlMs >= 60000 ? `${Math.round(idleTtlMs / 60000)}m` : `${Math.round(idleTtlMs / 1000)}s`;
+  const cleanupLabel = cleanupMs >= 60000 ? `${Math.round(cleanupMs / 60000)}m` : `${Math.round(cleanupMs / 1000)}s`;
+  document.getElementById("conn-status").textContent =
+    `MCP :${health.mcp_port} · ${health.active_sessions} sessions · ${connected} đang kết nối`;
   const instr = health.instructions || {};
   const memCount = instr.memory_files?.length ?? 0;
   const gitBranch = instr.git?.branch || (instr.git?.is_repo === false ? "—" : "?");
   document.getElementById("stat-grid").innerHTML = `
     <div class="stat"><div class="stat-label">MCP Port</div><div class="stat-value">${health.mcp_port}</div></div>
-    <div class="stat"><div class="stat-label">Sessions</div><div class="stat-value">${health.active_sessions}</div></div>
+    <div class="stat"><div class="stat-label">Sessions (đã đăng ký)</div><div class="stat-value">${health.active_sessions}</div></div>
+    <div class="stat"><div class="stat-label">Đang kết nối (SSE)</div><div class="stat-value">${connected}</div></div>
+    <div class="stat"><div class="stat-label">Session retention</div><div class="stat-value">${health.active_sessions}/${sessionMax}</div>
+      <div class="stat-sub">idle TTL ${idleTtlLabel} · cleanup ${cleanupLabel}</div></div>
     <div class="stat"><div class="stat-label">Project memory</div><div class="stat-value">${memCount} file(s)</div>
       <div class="stat-sub">${instr.instruction_bytes ? Math.round(instr.instruction_bytes / 1024) + " KB instructions" : ""}</div></div>
     <div class="stat"><div class="stat-label">Git branch</div><div class="stat-value" style="font-size:0.85rem">${esc(gitBranch)}</div></div>
     <div class="stat"><div class="stat-label">Workspace</div><div class="stat-value" style="font-size:0.85rem">${esc(health.default_cwd?.split(/[/\\]/).pop())}</div>
       <div class="stat-sub">${esc(health.default_cwd)}</div></div>`;
   document.getElementById("dash-servers").innerHTML = serversTable(health.upstream || [], { actions: false });
+  renderSessions(health.sessions || []);
   document.getElementById("status-json").textContent = JSON.stringify(health, null, 2);
 }
+
+function renderSessions(sessions) {
+  const el = document.getElementById("dash-sessions");
+  if (!sessions.length) {
+    el.innerHTML = '<div class="empty">Chưa có phiên nào được đăng ký.</div>';
+    return;
+  }
+  const rows = sessions
+    .map((s) => {
+      let statusBadge;
+      if (s.connected) statusBadge = '<span class="badge ok">đang kết nối</span>';
+      else if (s.status === "closing") statusBadge = '<span class="badge bad">closing</span>';
+      else statusBadge = '<span class="badge">registered</span>';
+      return `<tr>
+        <td>${s.index}</td>
+        <td><code>${esc(s.shortId)}</code></td>
+        <td>${statusBadge}</td>
+        <td>${s.ageSeconds}s</td>
+        <td>${s.idleSeconds}s</td>
+      </tr>`;
+    })
+    .join("");
+  el.innerHTML = `<table><thead><tr>
+    <th>#</th><th>Session (rút gọn)</th><th>Trạng thái</th><th>Tuổi</th><th>Idle</th>
+  </tr></thead><tbody>${rows}</tbody></table>`;
+}
+
 
 async function loadProject() {
   const preview = await api("/api/instructions/preview");
@@ -308,12 +371,24 @@ function stopActivityStream() {
   }
 }
 
+async function pollActivityQuietly() {
+  if (activityPollInFlight || document.visibilityState !== "visible" || activityPaused) return;
+  activityPollInFlight = true;
+  try {
+    await loadActivity();
+  } catch {
+    // SSE fallback is best-effort; manual/filter refresh still surfaces errors.
+  } finally {
+    activityPollInFlight = false;
+  }
+}
+
 function startActivityStream() {
   stopActivityStream();
   const live = document.getElementById("activity-live").checked;
   if (!live || activityPaused) return;
 
-  activityEventSource = new EventSource("/api/activity/stream");
+  activityEventSource = new EventSource(apiUrl("/api/activity/stream"));
   activityEventSource.onmessage = (ev) => {
     try {
       const entry = JSON.parse(ev.data);
@@ -333,7 +408,7 @@ function startActivityStream() {
     activityEventSource?.close();
     activityEventSource = null;
     if (!activityPollTimer) {
-      activityPollTimer = setInterval(() => loadActivity().catch(() => {}), 2000);
+      activityPollTimer = setInterval(pollActivityQuietly, 2000);
     }
   };
 }
@@ -387,6 +462,7 @@ function openServerDialog(server) {
     serverForm.args.value = JSON.stringify(server.args || []);
     serverForm.cwd.value = server.cwd || "";
     serverForm.url.value = server.url || "";
+    serverForm.headers.value = JSON.stringify(server.headers || {});
     serverForm.tool_prefix.value = server.tool_prefix || server.id;
     serverForm.expose.value = server.expose || "meta_only";
     serverForm.tools.value = (server.tools || []).join(", ");
@@ -430,10 +506,23 @@ document.getElementById("fetch-tools").addEventListener("click", async () => {
 serverForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   let args = [];
+  let headers = {};
   try {
     args = serverForm.args.value.trim() ? JSON.parse(serverForm.args.value) : [];
   } catch {
     return toast("Args phải là JSON array hợp lệ", true);
+  }
+  if (!Array.isArray(args)) return toast("Args phải là JSON array", true);
+  try {
+    headers = serverForm.headers.value.trim() ? JSON.parse(serverForm.headers.value) : {};
+  } catch {
+    return toast("HTTP headers phải là JSON object hợp lệ", true);
+  }
+  if (!headers || Array.isArray(headers) || typeof headers !== "object") {
+    return toast("HTTP headers phải là JSON object", true);
+  }
+  if (Object.values(headers).some((value) => typeof value !== "string")) {
+    return toast("Mọi HTTP header value phải là string", true);
   }
   const server = {
     id: serverForm.id.value.trim(),
@@ -444,6 +533,7 @@ serverForm.addEventListener("submit", async (e) => {
     args,
     cwd: serverForm.cwd.value.trim() || undefined,
     url: serverForm.url.value.trim() || undefined,
+    headers,
     tool_prefix: serverForm.tool_prefix.value.trim() || undefined,
     expose: serverForm.expose.value,
     tools: serverForm.tools.value.split(",").map((s) => s.trim()).filter(Boolean),
@@ -485,7 +575,8 @@ document.getElementById("activity-live").addEventListener("change", () => {
   else stopActivityStream();
 });
 document.getElementById("activity-clear").addEventListener("click", () => {
-  activitySeenIds.clear();
+  // Keep the source checkpoint. If SSE falls back to polling after Clear,
+  // historical entries must not reappear; only unseen future IDs are appended.
   document.getElementById("activity-feed").innerHTML =
     '<div class="empty">Đã xóa hiển thị. Log mới vẫn sẽ xuất hiện khi Live bật.</div>';
 });
@@ -496,7 +587,7 @@ document.getElementById("save-env").addEventListener("click", async () => {
   document.querySelectorAll("#env-form input").forEach((el) => (values[el.name] = el.value));
   try {
     await api("/api/config/env", { method: "PUT", body: JSON.stringify({ values }) });
-    toast("Đã lưu .env");
+    toast("Đã lưu .env — restart server để áp dụng thay đổi runtime");
   } catch (err) {
     toast(err.message, true);
   }
@@ -522,6 +613,27 @@ async function refreshAll() {
   await Promise.all([loadDashboard(), loadServers(), loadImport(), loadEnvForm(), loadProject().catch(() => {})]);
 }
 
+async function refreshDashboardQuietly() {
+  if (document.visibilityState !== "visible" || dashboardRefreshInFlight) return;
+  dashboardRefreshInFlight = true;
+  try {
+    await loadDashboard();
+  } catch {
+    // The connector/server may be restarting. Manual refresh still surfaces
+    // errors; background polling stays silent and retries next interval.
+  } finally {
+    dashboardRefreshInFlight = false;
+  }
+}
+
 document.getElementById("refresh-all").addEventListener("click", () => refreshAll().catch((e) => toast(e.message, true)));
+document.getElementById("sessions-refresh").addEventListener("click", () =>
+  loadDashboard().catch((e) => toast(e.message, true))
+);
 
 refreshAll().catch((err) => toast(err.message, true));
+dashboardPollTimer = setInterval(refreshDashboardQuietly, 5000);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") void refreshDashboardQuietly();
+});
+window.addEventListener("beforeunload", () => clearInterval(dashboardPollTimer));

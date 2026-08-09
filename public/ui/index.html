@@ -44,6 +44,13 @@
           <div class="panel-head"><h2>Upstream nhanh</h2></div>
           <div id="dash-servers" class="table-wrap"></div>
         </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Phiên MCP đã đăng ký</h2>
+            <button type="button" class="btn ghost" id="sessions-refresh">Làm mới</button>
+          </div>
+          <div id="dash-sessions" class="table-wrap"></div>
+        </div>
       </section>
 
       <section id="servers" class="view">
@@ -152,6 +159,7 @@
         <label class="field stdio-field span-2"><span>Args (JSON array)</span><input name="args" placeholder='["path/to/server.js"]' /></label>
         <label class="field stdio-field span-2"><span>Working directory</span><input name="cwd" /></label>
         <label class="field http-field span-2"><span>URL</span><input name="url" placeholder="http://127.0.0.1:3100/mcp" /></label>
+        <label class="field http-field span-2"><span>HTTP headers (JSON object)</span><input name="headers" placeholder='{"Authorization":"Bearer …"}' /></label>
         <label class="field"><span>Tool prefix</span><input name="tool_prefix" /></label>
         <label class="field"><span>Expose</span>
           <select name="expose">

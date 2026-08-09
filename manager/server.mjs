@@ -25,6 +25,7 @@ import path from "node:path";
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { rotateLogFile, tailFile } from "./log-utils.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -290,22 +291,7 @@ function spawnHiddenDetached(cmd, args, logFile, extraEnv = null) {
   return child.pid; // wscript exits at once; the real tunnel pid is tracked via tasklist/port
 }
 
-async function tailFile(file, maxBytes = 8000) {
-  try {
-    const st = await fsp.stat(file);
-    const size = Math.min(st.size, maxBytes);
-    const fh = await fsp.open(file, "r");
-    const buf = Buffer.alloc(size);
-    await fh.read(buf, 0, size, st.size - size);
-    await fh.close();
-    // Cắt ở biên UTF-8 (không cắt nửa ký tự đa byte)
-    let end = buf.length;
-    while (end > 0 && (buf[end - 1] & 0xc0) === 0x80) end--;
-    return buf.slice(0, end).toString("utf8");
-  } catch {
-    return "";
-  }
-}
+
 
 /* ------------------------------------------------------------------ */
 /* instance paths / helpers                                            */
@@ -560,8 +546,26 @@ async function startServer(name) {
     return { ok: false, error: "dist/index.js chưa tồn tại — bấm 'Cài Đặt' trước." };
   }
   const inst = instPaths(name);
+  // Persist documented session-policy defaults for instances created before
+  // these keys existed (e.g. "default"), so policy survives manager restarts
+  // instead of silently relying on the server process fallback.
+  await ensureSessionPolicyDefaults(name);
+  // Chặn start nếu policy không hợp lệ: server sẽ chạy với process-default
+  // (vd TTL=120000) trong khi UI hiển thị giá trị đã lưu → UI khác thực tế.
+  const policy = validateSessionPolicy(await readInstanceEnv(name));
+  if (!policy.ok) {
+    return { ok: false, error: `Session policy không hợp lệ — sửa trong Cấu hình: ${policy.errors.join("; ")}` };
+  }
   const env = await readInstanceEnv(name);
-  const pid = spawnDetached(process.execPath, [SERVER_ENTRY], inst.serverLog, env);
+  await rotateLogFile(inst.serverLog);
+  const pid = spawnDetached(process.execPath, [SERVER_ENTRY], inst.serverLog, {
+    ...env,
+    // Runtime metadata only (not persisted into the user's .env): direct admin
+    // config editing must target this instance file, not repo-root .env merely
+    // because every managed server process is spawned with cwd=ROOT.
+    MCP_ENV_FILE: inst.env,
+    MCP_INSTANCE_NAME: name,
+  });
   await writePidFile(inst.serverPid, pid);
   const up = await waitFor(() => isPortOpen(st.port), 20000);
   if (!up) {
@@ -578,13 +582,39 @@ async function stopServer(name) {
   const st = await serverStatus(name);
   if (!st.running) return { ok: true, alreadyStopped: true, port: st.port };
   const inst = instPaths(name);
+  const env = await readInstanceEnv(name);
+
+  // Prefer an in-process graceful shutdown on Windows too. OS-level SIGTERM /
+  // taskkill bypasses Node signal handlers there; the localhost admin endpoint
+  // can close MCP sessions/SSE + upstream transports before listeners exit.
+  const adminPort = parseInt(env.ADMIN_PORT || "3001", 10);
+  try {
+    const headers = {};
+    if (env.ADMIN_TOKEN) headers["x-admin-token"] = env.ADMIN_TOKEN;
+    const response = await fetch(`http://127.0.0.1:${adminPort}/api/process/shutdown`, {
+      method: "POST",
+      headers,
+      signal: AbortSignal.timeout(2500),
+    });
+    await response.arrayBuffer().catch(() => undefined);
+    if (response.ok) {
+      const graceful = await waitFor(async () => !(await isPortOpen(st.port)), 6000, 150);
+      if (graceful) {
+        await writePidFile(inst.serverPid, null);
+        return { ok: true, port: st.port, stopped: true, graceful: true };
+      }
+    }
+  } catch {
+    // Old builds / wedged admin listener fall through to the hard-stop path.
+  }
+
   let killed = false;
   const pidFile = await readPidFile(inst.serverPid);
   if (pidFile) killed = killPidTree(pidFile);
   if (!killed && st.pid) killed = killPidTree(st.pid);
   await writePidFile(inst.serverPid, null);
-  await waitFor(() => !isPortOpen(st.port), 10000);
-  return { ok: true, port: st.port, stopped: true };
+  await waitFor(async () => !(await isPortOpen(st.port)), 10000);
+  return { ok: true, port: st.port, stopped: true, graceful: false, forced: killed };
 }
 
 
@@ -869,6 +899,65 @@ async function pickFolder(initialDir = "") {
   }
 }
 
+const SESSION_POLICY_DEFAULTS = {
+  MCP_SESSION_TTL_MS: 120000,
+  MCP_SESSION_CLEANUP_MS: 15000,
+  MCP_SESSION_DELETE_GRACE_MS: 45000,
+  MCP_MAX_SESSIONS: 64,
+};
+
+/**
+ * Fill missing/empty session-policy keys in an existing instance .env so the
+ * documented defaults are persisted (survive manager restarts) instead of
+ * silently relying on the server's process-level fallback. Invalid values are
+ * left untouched and surfaced by validateSessionPolicy/checkConfig instead.
+ */
+async function ensureSessionPolicyDefaults(name) {
+  try {
+    const raw = await readInstanceEnvRaw(name);
+    if (!raw.includes("=")) return { changed: false };
+    const env = parseDotEnv(raw);
+    const updates = {};
+    for (const [key, fallback] of Object.entries(SESSION_POLICY_DEFAULTS)) {
+      const current = String(env[key] ?? "").trim();
+      if (current === "") updates[key] = String(fallback);
+    }
+    if (Object.keys(updates).length === 0) return { changed: false };
+    const next = serializeDotEnv({ ...env, ...updates }, raw);
+    await fsp.writeFile(instPaths(name).env, next, "utf-8");
+    return { changed: true, updates };
+  } catch {
+    return { changed: false };
+  }
+}
+
+function validateSessionPolicy(env) {
+  const specs = [
+    ["MCP_SESSION_TTL_MS", SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS, 15000, 86400000],
+    ["MCP_SESSION_CLEANUP_MS", SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS, 1000, 600000],
+    ["MCP_SESSION_DELETE_GRACE_MS", SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS, 1000, 600000],
+    ["MCP_MAX_SESSIONS", SESSION_POLICY_DEFAULTS.MCP_MAX_SESSIONS, 8, 4096],
+  ];
+  const values = {};
+  const errors = [];
+  for (const [key, fallback, min, max] of specs) {
+    const raw = String(env[key] ?? "").trim();
+    const value = raw === "" ? fallback : Number(raw);
+    values[key] = value;
+    if (!Number.isInteger(value) || value < min || value > max) {
+      errors.push(`${key} phải là số nguyên ${min}–${max} (hiện tại: ${raw || `(mặc định ${fallback})`})`);
+    }
+  }
+  if (
+    Number.isInteger(values.MCP_SESSION_CLEANUP_MS) &&
+    Number.isInteger(values.MCP_SESSION_TTL_MS) &&
+    values.MCP_SESSION_CLEANUP_MS > values.MCP_SESSION_TTL_MS
+  ) {
+    errors.push("MCP_SESSION_CLEANUP_MS không nên lớn hơn MCP_SESSION_TTL_MS");
+  }
+  return { ok: errors.length === 0, errors, values };
+}
+
 async function checkConfig(name, overrides) {
   const env = { ...(await readInstanceEnv(name)), ...(overrides || {}) };
   const items = [];
@@ -894,6 +983,14 @@ async function checkConfig(name, overrides) {
 
   const profile = env.CHATGPT_TOOL_PROFILE || "slim";
   push(["slim", "full"].includes(profile), "CHATGPT_TOOL_PROFILE", profile);
+
+  const sessionPolicy = validateSessionPolicy(env);
+  for (const [key, value] of Object.entries(sessionPolicy.values)) {
+    const error = sessionPolicy.errors.find((msg) => msg.startsWith(key));
+    push(!error, key, error || String(value));
+  }
+  const cleanupRelationError = sessionPolicy.errors.find((msg) => msg.startsWith("MCP_SESSION_CLEANUP_MS không"));
+  if (cleanupRelationError) push(false, "Session cleanup/TTL", cleanupRelationError);
 
   // FULL_DISK_ACCESS — sandbox fail-closed
   const fda = (env.FULL_DISK_ACCESS ?? "false").toLowerCase();
@@ -952,15 +1049,17 @@ async function checkConfig(name, overrides) {
 }
 
 /** Bundle đầy đủ trạng thái một instance (cho UI). */
-async function instanceBundle(name) {
-  const [env, config, srv, tun, chk, installed] = await Promise.all([
+async function instanceBundle(name, { includeCheck = false } = {}) {
+  const [env, config, srv, tun, installed] = await Promise.all([
     readInstanceEnv(name),
     readInstanceConfig(name),
     serverStatus(name),
     tunnelStatus(name),
-    checkConfig(name).catch((e) => ({ ok: false, items: [], error: String((e && e.message) || e) })),
     Promise.resolve({ dist: fs.existsSync(SERVER_ENTRY), nodeModules: fs.existsSync(path.join(ROOT, "node_modules")) }),
   ]);
+  const chk = includeCheck
+    ? await checkConfig(name).catch((e) => ({ ok: false, items: [], error: String((e && e.message) || e) }))
+    : null;
   return {
     name,
     node: process.version,
@@ -972,6 +1071,10 @@ async function instanceBundle(name) {
       CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
       SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
       MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
+      MCP_SESSION_TTL_MS: env.MCP_SESSION_TTL_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS),
+      MCP_SESSION_CLEANUP_MS: env.MCP_SESSION_CLEANUP_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS),
+      MCP_SESSION_DELETE_GRACE_MS: env.MCP_SESSION_DELETE_GRACE_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS),
+      MCP_MAX_SESSIONS: env.MCP_MAX_SESSIONS || String(SESSION_POLICY_DEFAULTS.MCP_MAX_SESSIONS),
       FULL_DISK_ACCESS: env.FULL_DISK_ACCESS ?? "false",
       EXTRA_WORKSPACE_PATHS: env.EXTRA_WORKSPACE_PATHS || "",
       PROJECT_MEMORY_MAX_BYTES: env.PROJECT_MEMORY_MAX_BYTES || "",
@@ -1039,6 +1142,10 @@ async function createInstance(body) {
     "CHATGPT_AUTO_APPROVE=true",
     "SHELL_TIMEOUT=120",
     "MCP_SESSION_RECOVERY=true",
+    `MCP_SESSION_TTL_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS}`,
+    `MCP_SESSION_CLEANUP_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS}`,
+    `MCP_SESSION_DELETE_GRACE_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS}`,
+    `MCP_MAX_SESSIONS=${SESSION_POLICY_DEFAULTS.MCP_MAX_SESSIONS}`,
     "",
   ].join("\n");
   await fsp.writeFile(inst.env, envText, "utf-8");
@@ -1122,6 +1229,8 @@ async function saveInstanceEnv(name, body) {
     next = serializeDotEnv(values, original);
   }
   const parsed = parseDotEnv(next);
+  const sessionPolicy = validateSessionPolicy(parsed);
+  if (!sessionPolicy.ok) return { ok: false, error: sessionPolicy.errors.join("; ") };
   const port = parseInt(parsed.PORT || "", 10);
   const adminPort = parseInt(parsed.ADMIN_PORT || "", 10);
   if (!Number.isInteger(port) || !Number.isInteger(adminPort) || port <= 0 || adminPort <= 0) {
@@ -1263,13 +1372,13 @@ async function defaultInstanceName() {
 async function handleApi(req, res, url, body) {
   const p = url.pathname;
   if (req.method === "GET" && p === "/api/instances") {
-    const instances = [];
-    for (const n of await listInstances()) {
+    const names = await listInstances();
+    const instances = await Promise.all(names.map(async (n) => {
       try {
-        instances.push(await instanceBundle(n));
+        return await instanceBundle(n, { includeCheck: false });
       } catch (err) {
         // một instance lỗi (vd env bị xóa) không được làm 500 toàn bộ list
-        instances.push({
+        return {
           name: n,
           node: process.version,
           error: String((err && err.message) || err),
@@ -1279,9 +1388,9 @@ async function handleApi(req, res, url, body) {
           tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
           check: { ok: false, items: [], error: String((err && err.message) || err) },
           installed: { dist: fs.existsSync(SERVER_ENTRY), nodeModules: fs.existsSync(path.join(ROOT, "node_modules")) },
-        });
+        };
       }
-    }
+    }));
     return json(res, 200, { ok: true, instances });
   }
   if (!(await listInstances()).length) {
@@ -1320,7 +1429,7 @@ async function handleApi(req, res, url, body) {
     }
     const inst = instPaths(name);
 
-    if (req.method === "POST" && sub === "") return json(res, 200, await instanceBundle(name));
+    if (req.method === "POST" && sub === "") return json(res, 200, await instanceBundle(name, { includeCheck: true }));
     if (req.method === "DELETE" && sub === "") return json(res, 200, await deleteInstance(name));
     if (req.method === "POST" && sub === "/rename") return json(res, 200, await renameInstance(name, body));
 
@@ -1424,6 +1533,10 @@ async function handleApi(req, res, url, body) {
         CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
         SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
         MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
+        MCP_SESSION_TTL_MS: env.MCP_SESSION_TTL_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS),
+        MCP_SESSION_CLEANUP_MS: env.MCP_SESSION_CLEANUP_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS),
+        MCP_SESSION_DELETE_GRACE_MS: env.MCP_SESSION_DELETE_GRACE_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS),
+        MCP_MAX_SESSIONS: env.MCP_MAX_SESSIONS || String(SESSION_POLICY_DEFAULTS.MCP_MAX_SESSIONS),
         OPENAI_TUNNEL_ID: env.OPENAI_TUNNEL_ID || "",
         OPENAI_TUNNEL_API_KEY_SET: Boolean(env.OPENAI_TUNNEL_API_KEY),
         OPENAI_TUNNEL_HEALTH_PORT: String(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || "8080"),

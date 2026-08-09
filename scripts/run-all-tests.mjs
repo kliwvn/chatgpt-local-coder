@@ -58,6 +58,8 @@ const unitScripts = [
   "scripts/test-tools.mjs",
   "scripts/test-checkpoints.mjs",
   "scripts/test-activity-log.mjs",
+  "scripts/test-audit-path.mjs",
+  "scripts/test-manager-log-utils.mjs",
   "scripts/test-project-memory.mjs",
   "scripts/test-tool-profile.mjs",
   "scripts/test-shell-persist.mjs",
@@ -77,6 +79,9 @@ const server = spawn(process.execPath, ["dist/index.js"], {
     PORT: String(mcpPort),
     ADMIN_PORT: String(adminPort),
     CHATGPT_TOOL_PROFILE: "slim",
+    // Low cap so the parallel/429 tests deterministically exercise admission
+    // without needing 64 connected sessions in CI.
+    MCP_MAX_SESSIONS: "8",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -126,12 +131,72 @@ try {
   const listJson = JSON.parse(listText);
   const tools = listJson?.result?.tools || [];
   const bytes = Buffer.byteLength(listText, "utf-8");
-  console.log(`OK  tools/list: ${tools.length} tools, ${Math.round(bytes / 1024)}KB`);
   if (tools.length > 30) console.warn(`WARN tools/list has ${tools.length} tools — consider slim profile`);
   if (!tools.some((t) => t.name === "apply_patch")) throw new Error("apply_patch missing");
+  // ChatGPT/openai-mcp transport churn should be sampled in console logs rather
+  // than producing one noisy initialize line per tool call/session.
+  const sampleLogStart = serverLog.length;
+  for (let i = 0; i < 25; i++) {
+    const r = await fetch(`http://127.0.0.1:${mcpPort}/mcp`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: `openai-sample-${i}`,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-03-26",
+          capabilities: {},
+          clientInfo: { name: "openai-mcp", version: "1.0.0" },
+        },
+      }),
+    });
+    if (r.status !== 200 || !r.headers.get("mcp-session-id")) {
+      throw new Error(`openai-mcp sample initialize ${i} failed: HTTP ${r.status}`);
+    }
+    await r.text();
+  }
+  await new Promise((r) => setTimeout(r, 50));
+  const sampledInitLines = serverLog
+    .slice(sampleLogStart)
+    .split(/\r?\n/)
+    .filter((line) => /Session initialized:.*client=openai-mcp/.test(line));
+  if (sampledInitLines.length !== 1) {
+    throw new Error(`expected 1 sampled openai-mcp initialize line for 25 sessions, got ${sampledInitLines.length}`);
+  }
+  console.log("OK  openai-mcp initialize logging sampled 1/25");
+
+  // /api/sessions: redacted shortIds, count >= 1 after initialize
+  const sessions = await (await fetch(`http://127.0.0.1:${adminPort}/api/sessions`)).json();
+  if (!sessions.ok || sessions.total < 1 || sessions.sessions.length !== sessions.total) {
+    throw new Error(`sessions endpoint wrong: ${JSON.stringify(sessions)}`);
+  }
+  const s0 = sessions.sessions[0];
+  if (!s0.shortId.endsWith("…") || s0.shortId.length > 9) throw new Error("shortId not redacted");
+  if (!["registered", "closing"].includes(s0.status)) throw new Error(`unexpected status ${s0.status}`);
+  if (typeof s0.connected !== "boolean") throw new Error(`connected not boolean: ${s0.connected}`);
+  if (!Number.isInteger(s0.ageSeconds) || !Number.isInteger(s0.idleSeconds)) throw new Error("age/idle not integers");
+  if (typeof sessions.connected !== "number" || sessions.connected < 0) throw new Error(`bad sessions.connected: ${sessions.connected}`);
+  const leaked = sessions.sessions.some((s) => s.id || (s.sid && s.sid !== s.shortId));
+  if (leaked) throw new Error("raw session id leaked in /api/sessions");
+  console.log(`OK  /api/sessions: total=${sessions.total}, shortId redacted, status=${s0.status}`);
+
+  // initialize itself has no session-id request header yet. The immediately
+  // following tools/list does, so it is the right boundary check for ensuring
+  // admin activity JSON never exposes the replay-capable raw session ID.
+  const activity = await (await fetch(`http://127.0.0.1:${adminPort}/api/activity?limit=30`)).json();
+  const sessionActivity = activity.entries?.find((e) => e.session_id?.startsWith(sid.slice(0, 8)));
+  if (!sessionActivity) throw new Error("session activity not found");
+  if (sessionActivity.session_id === sid || !sessionActivity.session_id.endsWith("…") || sessionActivity.session_id.length > 9) {
+    throw new Error(`raw session id leaked in /api/activity: ${sessionActivity.session_id}`);
+  }
+  console.log("OK  /api/activity: session id redacted");
 
   process.env.PORT = String(mcpPort);
-  await runNode("scripts/test-mcp-session.mjs", { PORT: String(mcpPort) });
+  await runNode("scripts/test-mcp-session.mjs", {
+    PORT: String(mcpPort),
+    ADMIN_PORT: String(adminPort),
+  });
   console.log("OK  test-mcp-session");
 } finally {
   server.kill();

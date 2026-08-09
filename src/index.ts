@@ -16,6 +16,7 @@ import {
   createSessionManager,
   extractRequestId,
   isInitializeRequest,
+  SessionCapacityError,
 } from "./lib/mcp-session-manager.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { startAdminServer } from "./admin/server.js";
@@ -162,7 +163,10 @@ app.use((req, res, next) => {
       return;
     }
 
-    if (!isMcpRoute) {
+    // /health is polled by the manager/tunnel several times per cycle. Logging
+    // every successful liveness probe dominated server.log and added avoidable
+    // disk I/O without diagnostic value; errors still surface at the caller.
+    if (!isMcpRoute && req.path !== "/health") {
       console.log(`${formatLogTime()} [HTTP] ${req.method} ${req.path} ${res.statusCode} ${duration}ms${sessionInfo}`);
     }
   });
@@ -173,14 +177,21 @@ app.use((req, res, next) => {
 const MCP_PATHS = ["/", "/mcp"];
 
 app.get("/health", (_req, res) => {
+  const counts = sessionManager.counts();
   res.json({
     status: "ok",
     name: "codex-mcp-server",
     workspace: workspaceRoot,
     defaultCwd: getDefaultCwd(),
-    fullMachineAccess: true,
+    fullMachineAccess: getFullDiskAccess(),
     fullDiskAccess: getFullDiskAccess(),
-    activeSessions: sessionManager.count(),
+    activeSessions: counts.registered,
+    connectedSessions: counts.connected,
+    sessionPolicy: {
+      maxRetained: counts.maxRetained,
+      idleTtlMs: counts.idleTtlMs,
+      cleanupIntervalMs: counts.cleanupIntervalMs,
+    },
     sessionRecovery: SESSION_RECOVERY,
     mcpEndpoints: MCP_PATHS,
     instructions: summarizeInstructionContext(instructionContext),
@@ -227,7 +238,7 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
 
     if (isInitializeRequest(req.body)) {
       if (sessionId) {
-        console.log(`${formatLogTime()} [MCP] Re-initialize with stale session header: ${sessionId}`);
+        console.log(`${formatLogTime()} [MCP] Re-initialize with stale session header: ${sessionId.slice(0, 8)}…`);
       }
       await sessionManager.createNew(req, res, req.body);
       return;
@@ -253,6 +264,19 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
       requestId
     );
   } catch (error) {
+    // Capacity admission fail → HTTP 429 (deliberate, bounded) thay vì 500:
+    // client biết là over-cap (retry sau) chứ không phải lỗi server.
+    if (error instanceof SessionCapacityError) {
+      console.log(`${formatLogTime()} [MCP] Session capacity reached; rejecting initialize`);
+      if (!res.headersSent) {
+        res.status(429).json({
+          jsonrpc: "2.0",
+          error: { code: -32029, message: "MCP session capacity reached; all sessions are busy" },
+          id: extractRequestId(req.body),
+        });
+      }
+      return;
+    }
     console.log(`${formatLogTime()} [MCP] Error:`, error);
     if (!res.headersSent) {
       res.status(500).json({
@@ -292,7 +316,38 @@ async function handleMcpGet(req: express.Request, res: express.Response): Promis
       return;
     }
 
-    await sessionManager.handleExisting(session, req, res, undefined);
+    // Chỉ 1 SSE stream/session (giống SDK: standalone SSE stream duy nhất).
+    // Nếu chặn ở đây trước enqueueSessionOp, GET thứ 2 sẽ không bị xếp hàng sau
+    // stream đang mở — nếu không, nó chờ tới khi client abort rồi stream vào socket
+    // chết, làm kẹt vĩnh viễn hàng đợi op của session (mọi request sau đều treo).
+    if (sessionManager.isSessionConnected(sessionId)) {
+      res.status(409).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32000,
+          message: "Conflict: Only one SSE stream is allowed per session",
+        },
+        id: null,
+      });
+      return;
+    }
+
+    // SSE GET là kết nối bền duy nhất của MCP — đếm nó là "đang kết nối thực tế".
+    // Cleanup gắn trên cả 'finish' lẫn 'close', chạy đúng 1 lần:
+    // - 'finish'  → response kết thúc bình thường.
+    // - 'close'   → client ngắt stream (hono cancel → reader.cancel) hoặc DELETE
+    //               đóng transport (SDK close() → cleanup stream).
+    sessionManager.registerLiveConnection(sessionId);
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      sessionManager.unregisterLiveConnection(sessionId);
+    };
+    res.once("finish", cleanup);
+    res.once("close", cleanup);
+
+    await sessionManager.handleExisting(session, req, res, undefined, true);
   } catch (error) {
     console.log(`${formatLogTime()} [MCP] GET error:`, error);
     if (!res.headersSent) {
@@ -349,8 +404,11 @@ const adminServer = startAdminServer({
   pid: process.pid,
   manager: upstreamManager,
   sessionCount: () => sessionManager.count(),
+  sessionList: () => sessionManager.list(),
+  sessionCounts: () => sessionManager.counts(),
   instructionSummary: () => summarizeInstructionContext(instructionContext),
   instructionsPreview: () => instructionContext.instructionsText,
+  requestShutdown: () => void gracefulShutdown("admin"),
 });
 
 const server = app.listen(PORT, "127.0.0.1", () => {
@@ -365,7 +423,9 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`  ${ts} Health:    http://localhost:${PORT}/health`);
   console.log(`  ${ts} Admin UI:  http://127.0.0.1:${ADMIN_PORT}/ui`);
   console.log(`  ${ts} Default cwd: ${workspaceRoot}`);
-  console.log(`  ${ts} Full machine access: ON (no path restrictions)`);
+  console.log(
+    `  ${ts} Full machine access: ${getFullDiskAccess() ? "ON (no path restrictions)" : "OFF (workspace sandbox)"}`
+  );
   console.log(`  ${ts} Session recovery: ${SESSION_RECOVERY ? "ON" : "OFF"}`);
   console.log(`  ${ts} PID:       ${process.pid}`);
   console.log("========================================");
@@ -386,13 +446,39 @@ server.on("error", (err: NodeJS.ErrnoException) => {
   process.exit(1);
 });
 
-process.on("SIGINT", () => {
-  console.log("\n[DUNG] Server dang tat...");
-  sessionManager.stopCleanup();
-  void upstreamManager.shutdown();
-  adminServer.close();
-  server.close(() => process.exit(0));
-});
+let shutdownStarted = false;
+async function gracefulShutdown(signal: string): Promise<void> {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  console.log(`\n[DUNG] Server dang tat (${signal})...`);
+
+  // Close MCP sessions first: this terminates long-lived SSE responses so
+  // http.Server.close() is not stranded waiting for open connector streams.
+  const hardExit = setTimeout(() => {
+    console.error("[DUNG] Graceful shutdown timeout — force exit");
+    process.exit(1);
+  }, 10_000);
+  hardExit.unref?.();
+
+  try {
+    await sessionManager.shutdown();
+    await upstreamManager.shutdown();
+    await Promise.all([
+      new Promise<void>((resolve) => adminServer.close(() => resolve())),
+      new Promise<void>((resolve) => server.close(() => resolve())),
+    ]);
+    clearTimeout(hardExit);
+    process.exit(0);
+  } catch (err) {
+    clearTimeout(hardExit);
+    console.error("[DUNG] Shutdown error:", err);
+    process.exit(1);
+  }
+}
+
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, () => void gracefulShutdown(signal));
+}
 
 // Tranh process tu tat khi stdin dong (Windows + .bat)
 if (process.stdin.isTTY) {
