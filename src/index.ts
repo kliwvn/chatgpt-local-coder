@@ -232,6 +232,20 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
 
     const existing = sessionId ? sessionManager.get(sessionId) : undefined;
     if (existing) {
+      // A client that DELETE'd (grace active) then immediately re-initializes
+      // with the same session id is reconnecting, not resuming. The SDK
+      // transport is already closed (handleDeleteRequest → close()), so
+      // routing the initialize to it returns HTTP 400 "Server already
+      // initialized" and the reconnect fails for the whole 45s grace window.
+      // Dispose the closing session first and build a fresh one.
+      if (isInitializeRequest(req.body) && sessionManager.isInDeleteGrace(sessionId!)) {
+        console.log(
+          `${formatLogTime()} [MCP] Re-initialize during DELETE grace: disposing closing session ${sessionId!.slice(0, 8)}…`
+        );
+        await sessionManager.disposeClosingSession(sessionId!);
+        await sessionManager.createNew(req, res, req.body);
+        return;
+      }
       await sessionManager.handleExisting(existing, req, res, req.body);
       return;
     }

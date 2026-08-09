@@ -97,6 +97,9 @@ export interface SessionManager {
   registerLiveConnection(sessionId: string): void;
   unregisterLiveConnection(sessionId: string): void;
   isSessionConnected(sessionId: string): boolean;
+  isInDeleteGrace(sessionId: string): boolean;
+  /** Atomically cancel the DELETE grace, detach and close a closing session. */
+  disposeClosingSession(sessionId: string): Promise<void>;
   tryRecoverStale(
     staleSessionId: string,
     req: Request,
@@ -259,6 +262,8 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     // no-op nếu session đã publish và reservation đã giải phóng ở onsessioninitialized).
     releaseUnpublishedSession(session);
     getUpstreamManager().unregisterMcpServer(session.server);
+    const sid = session.transport.sessionId;
+    if (sid) delete lastTransportErrors[sid];
     await closeSessionResources(session);
   }
 
@@ -340,10 +345,13 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       throw new SessionCapacityError();
     }
     // Reservation giữ cho tới khi transport được publish (hoặc dispose/fail) —
-    // xem makeReservationReleaser ở trên.
     const releaseReservation = makeReservationReleaser();
+    // Hoisted so the catch can clean up a transport/server whose sessionId was
+    // assigned or whose connect failed mid-build.
+    let transport!: StreamableHTTPServerTransport;
+    let mcpServer: McpServer | undefined;
     try {
-      const mcpServer = await createMcpServer(
+      mcpServer = await createMcpServer(
         config.workspaceRoot,
         config.shellTimeout,
         config.workspaceRoots,
@@ -356,7 +364,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         throw new Error("MCP session manager is shutting down");
       }
 
-      const transport = new StreamableHTTPServerTransport({
+      transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: preferredSessionId
           ? () => preferredSessionId
           : () => randomUUID(),
@@ -367,13 +375,16 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
             transportReservationReleases.delete(transport);
             releaseReservation();
             clearPendingRecovery(sid);
-            setImmediate(() => void mcpServer.close().catch(() => transport.close().catch(() => undefined)));
+            setImmediate(() => {
+              getUpstreamManager().unregisterMcpServer(mcpServer!);
+              void mcpServer!.close().catch(() => transport.close().catch(() => undefined));
+            });
             return;
           }
           const existing = sessions[sid];
           sessions[sid] = {
             transport,
-            server: mcpServer,
+            server: mcpServer!, // set before connect() below; callback fires post-connect
             lastAccessedAt: Date.now(),
             createdAt: existing?.createdAt ?? Date.now(),
           };
@@ -416,15 +427,25 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       const sid = transport.sessionId ?? preferredSessionId ?? randomUUID();
       const built = sessions[sid] ?? {
         transport,
-        server: mcpServer,
+        server: mcpServer!, // connect() returned above; server is set
         lastAccessedAt: Date.now(),
         createdAt: Date.now(),
       };
       transportReservationReleases.set(transport, releaseReservation);
       return built;
     } catch (err) {
-      // createMcpServer/connect fail trước khi transport được dùng → release ngay.
+      // createMcpServer/connect fail trước khi transport được publish → release
+      // reservation và đóng server/transport (nếu đã tạo) để không rò rỉ
+      // upstream registration / SDK transport.
       releaseReservation();
+      const failedSid = transport?.sessionId;
+      if (failedSid) delete lastTransportErrors[failedSid];
+      if (mcpServer) {
+        getUpstreamManager().unregisterMcpServer(mcpServer);
+        await mcpServer.close().catch(() => transport?.close().catch(() => undefined));
+      } else {
+        await transport?.close().catch(() => undefined);
+      }
       throw err;
     }
   }
@@ -524,6 +545,17 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       return (liveConnections.get(sessionId) ?? 0) > 0;
     },
 
+    isInDeleteGrace(sessionId: string) {
+      return Boolean(deleteGraceTimers[sessionId]);
+    },
+
+    // Atomic cancel+detach+close for a session whose DELETE grace is active.
+    // Used by handleMcpPost to dispose a closing session before re-initializing
+    // it, so the reconnect gets a fresh transport instead of the closed SDK one.
+    async disposeClosingSession(sessionId: string): Promise<void> {
+      await disposeSessionAndWait(sessionId);
+    },
+
     touch,
 
     count() {
@@ -578,8 +610,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         // "Session initialized".
         if (wasUninitialized && activeSid) {
           const client = session.server.server.getClientVersion();
-          const name = client?.name ?? "unknown";
-          const version = client?.version;
+          // Client-supplied name is logged verbatim; strip control characters
+          // and truncate so a hostile initialize cannot inject log lines.
+          const name = (client?.name ?? "unknown").replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 120) || "unknown";
+          const version = client?.version ? String(client.version).replace(/[\u0000-\u001f\u007f]/g, "").slice(0, 60) : undefined;
           // ChatGPT currently creates nearly one short-lived openai-mcp transport
           // session per tool call. Logging each initialize dominated server.log.
           // Tool-call lines still carry the short session ID and the dashboard

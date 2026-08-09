@@ -267,10 +267,13 @@ export function logMcpRequest(
       client: "chatgpt",
       status,
       duration_ms: durationMs,
+      // Deliberately NOT the raw tool arguments: they can embed file contents
+      // and commands. `summary` carries a short shape (run_command → the command,
+      // path tools → the path); the admin feed and audit file stay readable
+      // without shipping every argument verbatim.
       summary,
       details: {
         http_status: httpStatus,
-        arguments: rpc.params.arguments,
         ...(errorMessage ? { error: errorMessage } : {}),
       },
     });

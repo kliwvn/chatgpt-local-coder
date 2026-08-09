@@ -75,6 +75,11 @@ const CLOUDFLARED_DOWNLOAD_URL =
 
 const TUNNEL_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 const ENV_LINE_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
+/* Secret keys masked on the wire. ADMIN_TOKEN also gates the instance admin
+ * API, so it must never reach the browser either. */
+const SECRET_KEY_RE =
+  /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
+const MASK_SENTINEL = "********";
 
 /* ------------------------------------------------------------------ */
 /* dotenv helpers (preserve comments/order, like src/admin/routes.ts)  */
@@ -1208,23 +1213,37 @@ async function renameInstance(name, body) {
   }
   return { ok: true, name: newName, renamed: true };
 }
-
 async function saveInstanceEnv(name, body) {
   const inst = instPaths(name);
   const original = await readInstanceEnvRaw(name);
+  const originalValues = parseDotEnv(original);
   let next;
   if (typeof body.raw === "string") {
-    next = body.raw;
+    // The raw editor round-trips masked lines (KEY=********). Restore each
+    // sentinel from the original so editing a non-secret line never erases
+    // credentials; every other line is kept verbatim (comments/order intact).
+    next = body.raw
+      .split(/\r?\n/)
+      .map((line) => {
+        const m = ENV_LINE_RE.exec(line.trim());
+        if (!m || m[2].trim() !== MASK_SENTINEL) return line;
+        const orig = originalValues[m[1]];
+        return orig !== undefined ? `${m[1]}=${orig}` : line;
+      })
+      .join("\n");
   } else {
     const values = { ...(body.values || {}) };
     // ADMIN_PORT giờ tự cấp + ẩn khỏi UI — nếu không gửi thì giữ giá trị cũ
     // (vẫn theo workspace, mỗi MCP server có admin riêng, truy cập qua manager proxy).
     if (!(body.values && Object.prototype.hasOwnProperty.call(body.values, "ADMIN_PORT"))) {
-      const old = parseDotEnv(original);
-      if (old.ADMIN_PORT) values.ADMIN_PORT = old.ADMIN_PORT;
+      if (originalValues.ADMIN_PORT) values.ADMIN_PORT = originalValues.ADMIN_PORT;
     }
     for (const [k, v] of Object.entries(values)) {
       if (v === undefined) values[k] = null;
+      else if (v === MASK_SENTINEL) {
+        const orig = originalValues[k];
+        values[k] = orig !== undefined ? orig : null;
+      }
     }
     next = serializeDotEnv(values, original);
   }
@@ -1438,10 +1457,15 @@ async function handleApi(req, res, url, body) {
       const values = parseDotEnv(raw);
       const masked = {};
       for (const [k, v] of Object.entries(values)) {
+        // Never ship the plaintext .env to the browser. Secret keys are replaced
+        // with a sentinel; saveInstanceEnv restores the original value when the
+        // UI round-trips the sentinel unchanged. OPENAI_TUNNEL_API_KEY keeps its
+        // set/last4 shape for the structured form's key hint.
         if (k === "OPENAI_TUNNEL_API_KEY" && v) masked[k] = { set: true, last4: v.slice(-4) };
+        else if (SECRET_KEY_RE.test(k) && v) masked[k] = MASK_SENTINEL;
         else masked[k] = v;
       }
-      return json(res, 200, { ok: true, path: inst.env, values: masked, raw });
+      return json(res, 200, { ok: true, path: inst.env, values: masked });
     }
     if (req.method === "PUT" && sub === "/env") return json(res, 200, await saveInstanceEnv(name, body));
 
@@ -1524,7 +1548,6 @@ async function handleApi(req, res, url, body) {
       installed,
       node: process.version,
       server: srv,
-      tunnel: tun,
       env: {
         PORT: env.PORT || "3000",
         ADMIN_PORT: env.ADMIN_PORT || "3001",
@@ -1550,14 +1573,13 @@ async function handleApi(req, res, url, body) {
     const values = parseDotEnv(raw);
     const masked = {};
     for (const [k, v] of Object.entries(values)) {
-      if (k === "OPENAI_TUNNEL_API_KEY" && v) {
-        masked[k] = { set: true, last4: v.slice(-4) };
-      } else {
-        masked[k] = v;
-      }
+      if (k === "OPENAI_TUNNEL_API_KEY" && v) masked[k] = { set: true, last4: v.slice(-4) };
+      else if (SECRET_KEY_RE.test(k) && v) masked[k] = MASK_SENTINEL;
+      else masked[k] = v;
     }
-    return json(res, 200, { ok: true, path: instPaths(dname).env, values: masked, raw });
+    return json(res, 200, { ok: true, path: instPaths(dname).env, values: masked });
   }
+
 
   if (req.method === "PUT" && p === "/api/env") {
     return json(res, 200, await saveInstanceEnv(dname, body));

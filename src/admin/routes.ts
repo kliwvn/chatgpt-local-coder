@@ -9,6 +9,7 @@ import {
   findMcpConfigForSource,
   importMcpConfigFromFile,
   type McpImportSource,
+  type UpstreamConfigFile,
   type UpstreamServerConfig,
 } from "../lib/mcp-upstream-config.js";
 import { getDefaultCwd, getFullDiskAccess } from "../lib/path-security.js";
@@ -34,7 +35,6 @@ const SESSION_POLICY_LIMITS: Record<string, [number, number]> = {
 function isSecretKey(key: string): boolean {
   return SECRET_KEY_PATTERN.test(key);
 }
-
 function parseDotEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of text.split("\n")) {
@@ -106,6 +106,78 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 }): Router {
   const router = Router();
   const envPath = path.resolve(process.env.MCP_ENV_FILE || path.join(process.cwd(), ".env"));
+  // Header names that carry credentials even though they don't match
+  // SECRET_KEY_PATTERN (e.g. "authorization" — the AUTH alternative requires
+  // `_`/end so it won't match "Authorization").
+  const SENSITIVE_HEADER_NAMES = new Set([
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+  ]);
+
+  function isSensitiveHeader(name: string): boolean {
+    return SENSITIVE_HEADER_NAMES.has(name.toLowerCase()) || isSecretKey(name);
+  }
+
+  // Mask secrets in an upstream config so the admin API never echoes
+  // credentials. Values that are already the sentinel pass through unchanged
+  // (they mean "keep the stored value").
+  function maskUpstreamConfig(config: UpstreamConfigFile): UpstreamConfigFile {
+    return {
+      ...config,
+      servers: config.servers.map((server) => {
+        const masked: UpstreamServerConfig = { ...server };
+        if (server.headers && typeof server.headers === "object") {
+          masked.headers = Object.fromEntries(
+            Object.entries(server.headers).map(([k, v]) => [
+              k,
+              isSensitiveHeader(k) && v ? REDACTED_MASK : v,
+            ])
+          );
+        }
+        if (server.env && typeof server.env === "object") {
+          masked.env = Object.fromEntries(
+            Object.entries(server.env).map(([k, v]) => [k, isSecretKey(k) && v ? REDACTED_MASK : v])
+          );
+        }
+        return masked;
+      }),
+    };
+  }
+
+  // Before persisting a config that may contain sentinel values from the UI,
+  // merge each server with its currently-stored headers/env so `********`
+  // placeholders resolve to the real stored secrets.
+  function restoreUpstreamSecrets(config: UpstreamConfigFile): UpstreamConfigFile {
+    const stored = manager.getConfig();
+    return {
+      ...config,
+      servers: config.servers.map((server) => {
+        const prev = stored.servers.find((s) => s.id === server.id);
+        if (!prev) return server;
+        const restored: UpstreamServerConfig = { ...server };
+        if (server.headers && prev.headers) {
+          restored.headers = { ...server.headers };
+          for (const k of Object.keys(restored.headers)) {
+            if (restored.headers[k] === REDACTED_MASK && prev.headers[k] !== undefined) {
+              restored.headers[k] = prev.headers[k];
+            }
+          }
+        }
+        if (server.env && prev.env) {
+          restored.env = { ...server.env };
+          for (const k of Object.keys(restored.env)) {
+            if (restored.env[k] === REDACTED_MASK && prev.env[k] !== undefined) {
+              restored.env[k] = prev.env[k];
+            }
+          }
+        }
+        return restored;
+      }),
+    };
+  }
   // Single source for session counts so /health, /api/sessions and any future
   // route expose the same numbers under the same key names.
   const sessionCounts = (): { total: number; connected: number; policy: Record<string, number | null> } => {
@@ -243,16 +315,15 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       res.status(500).json({ ok: false, error: String(err) });
     }
   });
-
   router.get("/api/upstream", async (_req, res) => {
-    res.json({ ok: true, config: manager.getConfig(), path: manager.getConfigPath() });
+    res.json({ ok: true, config: maskUpstreamConfig(manager.getConfig()), path: manager.getConfigPath() });
   });
 
   router.put("/api/upstream", async (req, res) => {
     try {
-      const config = req.body?.config ?? defaultUpstreamConfig();
+      const config = restoreUpstreamSecrets(req.body?.config ?? defaultUpstreamConfig());
       const saved = await manager.updateConfig(config);
-      res.json({ ok: true, config: saved });
+      res.json({ ok: true, config: maskUpstreamConfig(saved) });
     } catch (err) {
       res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -260,13 +331,16 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 
   router.post("/api/upstream", async (req, res) => {
     try {
-      const server = req.body?.server as UpstreamServerConfig;
+      const server = restoreUpstreamSecrets({
+        version: 1,
+        servers: [req.body?.server as UpstreamServerConfig],
+      }).servers[0] as UpstreamServerConfig;
       if (!server?.id) {
         res.status(400).json({ ok: false, error: "server.id required" });
         return;
       }
       await manager.upsertServer(server);
-      res.json({ ok: true, config: manager.getConfig() });
+      res.json({ ok: true, config: maskUpstreamConfig(manager.getConfig()) });
     } catch (err) {
       res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -278,7 +352,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       res.status(404).json({ ok: false, error: "not found" });
       return;
     }
-    res.json({ ok: true, config: manager.getConfig() });
+    res.json({ ok: true, config: maskUpstreamConfig(manager.getConfig()) });
   });
 
   router.post("/api/upstream/:id/test", async (req, res) => {
@@ -344,7 +418,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         enableImported: Boolean(req.body?.enable),
       });
       await manager.reloadConfig();
-      res.json({ ok: true, ...result });
+      res.json({ ok: true, ...result, config: maskUpstreamConfig(result.config) });
     } catch (err) {
       res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -354,7 +428,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     try {
       const result = await handleImport("cursor", req.body ?? {});
       await manager.reloadConfig();
-      res.json({ ok: true, ...result });
+      res.json({ ok: true, ...result, config: maskUpstreamConfig(result.config) });
     } catch (err) {
       res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -398,6 +472,35 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       session_id: `${entry.session_id.slice(0, 8)}…`,
     };
   }
+  // The in-memory/audit entries can embed raw tool-call arguments (file
+  // contents, shell commands) — including in `summary` for tools/call and
+  // audit-origin tool entries. The admin API only needs a metadata shape, so
+  // compose session-id redaction first, then strip summaries/details for tool
+  // activity before anything leaves the process (JSON, history and SSE).
+  function sanitizeActivityEntry(entry: ActivityEntry): ActivityEntry {
+    const wire = redactActivitySession(entry);
+    const { details, summary, ...rest } = wire;
+    if (wire.kind === "tool" || wire.action === "tools/call" || wire.tool) {
+      const safeDetails: Record<string, unknown> = {};
+      if (details && typeof details === "object") {
+        if (details.http_status !== undefined) safeDetails.http_status = details.http_status;
+        if (details.exit_code !== undefined) safeDetails.exit_code = details.exit_code;
+      }
+      return {
+        ...rest,
+        summary: undefined,
+        ...(Object.keys(safeDetails).length ? { details: { ...safeDetails, redacted: true } } : { details: { redacted: true } }),
+      };
+    }
+    return {
+      ...rest,
+      summary: summary ? String(summary).slice(0, 200) : undefined,
+      ...(details && typeof details === "object" && Object.keys(details).length ? { details } : {}),
+    };
+  }
+
+
+
 
   router.get("/api/activity", (req, res) => {
     const limit = Math.min(parseInt(String(req.query.limit || "100"), 10) || 100, 500);
@@ -408,14 +511,14 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       tool: typeof req.query.tool === "string" ? req.query.tool : undefined,
       q: typeof req.query.q === "string" ? req.query.q : undefined,
     });
-    res.json({ ok: true, entries: entries.map(redactActivitySession), count: entries.length });
+    res.json({ ok: true, entries: entries.map(sanitizeActivityEntry), count: entries.length });
   });
 
   router.get("/api/activity/history", async (req, res) => {
     try {
       const limit = Math.min(parseInt(String(req.query.limit || "80"), 10) || 80, 500);
       const entries = await loadAuditHistory(limit);
-      res.json({ ok: true, entries: entries.map(redactActivitySession), source: "audit_file" });
+      res.json({ ok: true, entries: entries.map(sanitizeActivityEntry), source: "audit_file" });
     } catch (err) {
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }
@@ -426,9 +529,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders?.();
-
     const send = (entry: ActivityEntry) => {
-      res.write(`data: ${JSON.stringify(redactActivitySession(entry))}\n\n`);
+      res.write(`data: ${JSON.stringify(sanitizeActivityEntry(entry))}\n\n`);
     };
 
     for (const entry of getRecentActivity(30).reverse()) send(entry);

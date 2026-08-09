@@ -343,11 +343,15 @@ async function selectInstance(name, initial) {
   $("foot-admin").href = `/admin/ui/?instance=${encodeURIComponent(name)}`;
   $("foot-admin").textContent = `Admin UI của ${name} (qua manager) ↗`;
 
-  // raw env
+  // raw env — server trả masked values (không bao giờ gửi plaintext .env).
+  // Dựng lại dạng KEY=VALUE cho editor; secret hiện là sentinel ******** và
+  // được server khôi phục lại giá trị cũ khi lưu.
   try {
     const r = await api(instUrl(name, "/env"));
     if (state.current !== name) return; // user đã chuyển instance — không đè form
-    $("f-raw").value = r.raw || "";
+    $("f-raw").value = Object.entries(r.values || {})
+      .map(([k, v]) => `${k}=${typeof v === "object" && v !== null ? "********" : v}`)
+      .join("\n");
   } catch (err) {
     if (state.current !== name) return;
     $("f-raw").value = "";

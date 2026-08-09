@@ -287,6 +287,7 @@ OPENAI_TUNNEL_API_KEY=
 |----------|---------|-------------|
 | `WORKSPACE_PATH` | `cwd` | **Your project root** (like `cd` before `claude`). Auto-loads `CLAUDE.md` / `AGENTS.md` into MCP instructions |
 | `EXTRA_WORKSPACE_PATHS` | — | Thêm workspace bổ sung (`;`-separated) — server được phép truy cập tất cả các root này |
+| `WORKSPACE_PATHS` / `ALLOWED_WORKSPACE_PATHS` | — | Aliases của `EXTRA_WORKSPACE_PATHS` (đọc thêm nếu có) |
 | `FULL_DISK_ACCESS` | `false` | **Fail-closed sandbox.** `false` = chỉ truy cập trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`); `true` = mở toàn máy |
 | `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
 | `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
@@ -297,6 +298,7 @@ OPENAI_TUNNEL_API_KEY=
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
 | `CHECKPOINT_ENABLED` / `CHECKPOINT_MAX_FILE_BYTES` | `true` / `5242880` | Checkpoint code trước khi sửa (rewind); file > 5MB bị skip |
 | `PROJECT_MEMORY_MAX_BYTES` / `PROJECT_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn CLAUDE.md/AGENTS.md inject vào instructions. Đặt `0` = không giới hạn |
+| `ACTIVITY_LOG_MAX` | `500` | Số dòng activity giữ trong RAM cho feed admin (`/api/activity`) |
 | `MANAGER_PORT` | `3300` | Cổng manager dashboard (manager/server.mjs) |
 | `ADMIN_PORT` | `3001` | Admin GUI localhost-only (proxy qua manager) |
 
