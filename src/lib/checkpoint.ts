@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { randomUUID, createHash } from "node:crypto";
 import { atomicWriteFile } from "./atomic-write.js";
+import { withFileMutations } from "./file-mutation.js";
 
 export interface CheckpointFileSnapshot {
   path: string;
@@ -372,6 +373,25 @@ async function collectRestorePlan(targetId: string): Promise<{
   return { target, files, skipped };
 }
 
+type RestorePlan = Awaited<ReturnType<typeof collectRestorePlan>>;
+
+class RestorePlanChangedError extends Error {}
+
+function normalizeRestorePath(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function restorePathSet(plan: RestorePlan): string[] {
+  return [...plan.files.keys()].map(normalizeRestorePath).sort();
+}
+
+function sameRestorePathSet(left: RestorePlan, right: RestorePlan): boolean {
+  const a = restorePathSet(left);
+  const b = restorePathSet(right);
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
 export async function previewRestore(targetId: string): Promise<{
   checkpoint: CheckpointSummary;
   changes: Array<{
@@ -432,13 +452,13 @@ export async function previewRestore(targetId: string): Promise<{
   };
 }
 
-async function restoreToCheckpointUnlocked(targetId: string): Promise<{
+async function restoreToCheckpointUnlocked(targetId: string, plan?: RestorePlan): Promise<{
   checkpoint: CheckpointSummary;
   restored: string[];
   deleted: string[];
   skipped: Array<{ path: string; reason?: string }>;
 }> {
-  const { target, files } = await collectRestorePlan(targetId);
+  const { target, files } = plan ?? (await collectRestorePlan(targetId));
   const restored: string[] = [];
   const deleted: string[] = [];
   const skipped: Array<{ path: string; reason?: string }> = [];
@@ -485,7 +505,29 @@ export async function restoreToCheckpoint(targetId: string): Promise<{
   deleted: string[];
   skipped: Array<{ path: string; reason?: string }>;
 }> {
-  return enqueueCheckpointMutation(() => restoreToCheckpointUnlocked(targetId));
+  // File-edit tools acquire source-path locks before entering the checkpoint
+  // mutation queue. Restore must use the same lock order or it can deadlock an
+  // edit that is checkpointing. Build a read-only plan first, release the queue,
+  // acquire all affected path locks, then re-check the plan under the queue.
+  // If another checkpoint added a newly affected path in between, retry before
+  // writing anything so the restore remains complete and race-safe.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const planned = await enqueueCheckpointMutation(() => collectRestorePlan(targetId));
+    const paths = [...planned.files.keys()];
+    try {
+      return await withFileMutations(paths, () =>
+        enqueueCheckpointMutation(async () => {
+          const current = await collectRestorePlan(targetId);
+          if (!sameRestorePathSet(planned, current)) throw new RestorePlanChangedError();
+          return restoreToCheckpointUnlocked(targetId, current);
+        })
+      );
+    } catch (err) {
+      if (err instanceof RestorePlanChangedError) continue;
+      throw err;
+    }
+  }
+  throw new Error("Checkpoint restore plan kept changing; retry after concurrent edits settle");
 }
 
 async function clearCheckpointsUnlocked(): Promise<number> {

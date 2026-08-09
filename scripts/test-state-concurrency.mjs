@@ -21,6 +21,36 @@ try {
     throw new Error(`checkpoint lost update: ids=${ids.filter(Boolean).length} indexed=${indexed.length}`);
   }
 
+  // Rewind and source edits use the same path-lock -> checkpoint-queue order.
+  // This must finish without a lock inversion/deadlock regardless of which one
+  // wins the file lock first.
+  await checkpoints.clearCheckpoints();
+  const rewindFile = path.join(root, "rewind-race.txt");
+  await fs.writeFile(rewindFile, "OLD\n");
+  const rewindTarget = await checkpoints.checkpointBefore("write_file", [rewindFile], { summary: "rewind-target" });
+  if (!rewindTarget) throw new Error("failed to create rewind concurrency target");
+  await fs.writeFile(rewindFile, "MID\n");
+  const { withFileMutation } = await import("../dist/lib/file-mutation.js");
+  const { atomicWriteFile } = await import("../dist/lib/atomic-write.js");
+  const edit = withFileMutation(rewindFile, async () => {
+    await fs.readFile(rewindFile, "utf8");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    await checkpoints.checkpointBefore("edit_file", [rewindFile], { summary: "concurrent-edit" });
+    await atomicWriteFile(rewindFile, "EDIT\n", "utf8");
+  });
+  const restore = checkpoints.restoreToCheckpoint(rewindTarget);
+  const settled = await Promise.race([
+    Promise.allSettled([edit, restore]),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("rewind/edit concurrency deadlocked")), 3000)),
+  ]);
+  if (settled.some((result) => result.status === "rejected")) {
+    throw new Error(`rewind/edit concurrency failed: ${settled.map((result) => result.status === "rejected" ? String(result.reason) : "ok").join("; ")}`);
+  }
+  const rewindFinal = await fs.readFile(rewindFile, "utf8");
+  if (rewindFinal !== "OLD\n" && rewindFinal !== "EDIT\n") {
+    throw new Error(`rewind/edit race left invalid content: ${JSON.stringify(rewindFinal)}`);
+  }
+
   process.env.CODEX_HOME = path.join(root, "codex-home");
   const memory = await import("../dist/lib/auto-memory.js");
   await Promise.all(Array.from({ length: 30 }, (_, i) => memory.appendAutoMemory("C:/concurrent-memory", `unique-note-${String(i).padStart(2, "0")}`)));
@@ -37,7 +67,7 @@ try {
     throw new Error(`shell-state lost update: ${state?.recent_commands?.length ?? 0}/20`);
   }
 
-  console.log("state-concurrency: ok (checkpoint 30/30, memory 30/30, shell recent 20/20)");
+  console.log("state-concurrency: ok (checkpoint 30/30, rewind/edit no-deadlock, memory 30/30, shell recent 20/20)");
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }

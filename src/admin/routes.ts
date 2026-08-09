@@ -218,6 +218,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       sessions: options.sessionList?.() ?? [],
       default_cwd: getDefaultCwd(),
       full_disk_access: getFullDiskAccess(),
+      path_sandbox_enabled: !getFullDiskAccess(),
+      shell_commands_os_sandboxed: false,
       upstream,
       checkpoint: getCheckpointConfig(),
       instructions: options.instructionSummary?.() ?? null,

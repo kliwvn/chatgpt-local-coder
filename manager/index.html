@@ -119,10 +119,10 @@
           <div class="field">
             <label for="f-full-disk">FULL_DISK_ACCESS</label>
             <select id="f-full-disk" class="input">
-              <option value="false">false — sandbox (chỉ trong workspace, mặc định)</option>
-              <option value="true">true — truy cập toàn máy</option>
+              <option value="false">false — path sandbox (workspace roots, mặc định)</option>
+              <option value="true">true — path-aware tools truy cập toàn máy</option>
             </select>
-            <p class="hint">false = chặn mọi path ngoài WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS.</p>
+            <p class="hint">Giới hạn path-aware tools; run_command/start_process vẫn là native shell và không được OS-sandbox.</p>
           </div>
           <div class="field">
             <label for="f-extra-ws">EXTRA_WORKSPACE_PATHS</label>

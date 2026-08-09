@@ -12,6 +12,8 @@ import { enrichAfterEdit } from "../lib/edit-enrichment.js";
 import { toolResult } from "../lib/tool-result.js";
 import { globFiles } from "../lib/glob-search.js";
 import { grepSearch } from "../lib/grep-search.js";
+import { atomicCopyFile, atomicWriteFile } from "../lib/atomic-write.js";
+import { withFileMutation, withFileMutations } from "../lib/file-mutation.js";
 
 
 
@@ -31,6 +33,7 @@ async function searchDirectory(
 
     const fullPath = path.join(dir, entry.name);
     if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+    if (entry.isSymbolicLink()) continue;
 
     if (entry.isDirectory()) {
       await searchDirectory(fullPath, regex, globPattern, results, maxResults);
@@ -65,6 +68,7 @@ async function buildTree(dirPath: string, depth: number, maxDepth: number): Prom
   const children = [];
   for (const entry of entries) {
     if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+    if (entry.isSymbolicLink()) continue;
     const childPath = path.join(dirPath, entry.name);
     if (entry.isDirectory()) children.push(await buildTree(childPath, depth + 1, maxDepth));
     else children.push({ name: entry.name, type: "file" });
@@ -165,15 +169,16 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, content }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const checkpointId = await checkpointBefore("write_file", [validPath]);
-      await fs.mkdir(path.dirname(validPath), { recursive: true });
-      await fs.writeFile(validPath, content, "utf-8");
-      await audit({ tool: "write_file", action: "write", target: validPath, status: "ok", details: { bytes: Buffer.byteLength(content) } });
-      const data = await enrichAfterEdit(
-        { path: validPath, bytes: Buffer.byteLength(content), checkpoint_id: checkpointId },
-        [validPath]
-      );
-      return toolResult("write_file", data);
+      return withFileMutation(validPath, async () => {
+        const checkpointId = await checkpointBefore("write_file", [validPath]);
+        await atomicWriteFile(validPath, content, "utf-8");
+        await audit({ tool: "write_file", action: "write", target: validPath, status: "ok", details: { bytes: Buffer.byteLength(content) } });
+        const data = await enrichAfterEdit(
+          { path: validPath, bytes: Buffer.byteLength(content), checkpoint_id: checkpointId },
+          [validPath]
+        );
+        return toolResult("write_file", data);
+      });
     }
   );
 
@@ -189,12 +194,13 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, content }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const checkpointId = await checkpointBefore("write_file_base64", [validPath]);
       const buffer = Buffer.from(content, "base64");
-      await fs.mkdir(path.dirname(validPath), { recursive: true });
-      await fs.writeFile(validPath, buffer);
-      await audit({ tool: "write_file_base64", action: "write", target: validPath, status: "ok", details: { bytes: buffer.length } });
-      return toolResult("write_file_base64", { path: validPath, bytes: buffer.length, checkpoint_id: checkpointId });
+      return withFileMutation(validPath, async () => {
+        const checkpointId = await checkpointBefore("write_file_base64", [validPath]);
+        await atomicWriteFile(validPath, buffer);
+        await audit({ tool: "write_file_base64", action: "write", target: validPath, status: "ok", details: { bytes: buffer.length } });
+        return toolResult("write_file_base64", { path: validPath, bytes: buffer.length, checkpoint_id: checkpointId });
+      });
     }
   );
 
@@ -216,15 +222,17 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, old_text, new_text, replace_all, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const content = await fs.readFile(validPath, "utf-8");
-      if (!content.includes(old_text)) throw new Error("old_text not found in file. Ensure exact match.");
-      const newContent = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, new_text);
-      const diff = buildSimpleDiff(content, newContent);
-      const checkpointId = await checkpointBefore("edit_file", [validPath], { dry_run });
-      if (!dry_run) await fs.writeFile(validPath, newContent, "utf-8");
-      await audit({ tool: "edit_file", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId }, [validPath], dry_run);
-      return toolResult("edit_file", data, { summary: dry_run ? `dry-run ${validPath}` : `edited ${validPath}` });
+      return withFileMutation(validPath, async () => {
+        const content = await fs.readFile(validPath, "utf-8");
+        if (!content.includes(old_text)) throw new Error("old_text not found in file. Ensure exact match.");
+        const newContent = replace_all ? content.split(old_text).join(new_text) : content.replace(old_text, new_text);
+        const diff = buildSimpleDiff(content, newContent);
+        const checkpointId = await checkpointBefore("edit_file", [validPath], { dry_run });
+        if (!dry_run) await atomicWriteFile(validPath, newContent, "utf-8");
+        await audit({ tool: "edit_file", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok" });
+        const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId }, [validPath], dry_run);
+        return toolResult("edit_file", data, { summary: dry_run ? `dry-run ${validPath}` : `edited ${validPath}` });
+      });
     }
   );
 
@@ -244,22 +252,24 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, edits, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
-      let next = original;
-      for (const edit of edits) {
-        if (!next.includes(edit.old_text)) throw new Error(`old_text not found: ${edit.old_text.slice(0, 120)}`);
-        next = edit.replace_all ? next.split(edit.old_text).join(edit.new_text) : next.replace(edit.old_text, edit.new_text);
-      }
-      const diff = buildSimpleDiff(original, next);
-      const checkpointId = await checkpointBefore("multi_edit", [validPath], { dry_run });
-      if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
-      await audit({ tool: "multi_edit", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok", details: { edits: edits.length } });
-      const data = await enrichAfterEdit(
-        { path: validPath, diff, edits: edits.length, dry_run, checkpoint_id: checkpointId },
-        [validPath],
-        dry_run
-      );
-      return toolResult("multi_edit", data);
+      return withFileMutation(validPath, async () => {
+        const original = await fs.readFile(validPath, "utf-8");
+        let next = original;
+        for (const edit of edits) {
+          if (!next.includes(edit.old_text)) throw new Error(`old_text not found: ${edit.old_text.slice(0, 120)}`);
+          next = edit.replace_all ? next.split(edit.old_text).join(edit.new_text) : next.replace(edit.old_text, edit.new_text);
+        }
+        const diff = buildSimpleDiff(original, next);
+        const checkpointId = await checkpointBefore("multi_edit", [validPath], { dry_run });
+        if (!dry_run) await atomicWriteFile(validPath, next, "utf-8");
+        await audit({ tool: "multi_edit", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok", details: { edits: edits.length } });
+        const data = await enrichAfterEdit(
+          { path: validPath, diff, edits: edits.length, dry_run, checkpoint_id: checkpointId },
+          [validPath],
+          dry_run
+        );
+        return toolResult("multi_edit", data);
+      });
     }
   );
 
@@ -275,15 +285,17 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath, pattern, replacement, flags, dry_run }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
-      const regex = new RegExp(pattern, flags);
-      const next = original.replace(regex, replacement);
-      if (next === original) throw new Error("Regex made no changes.");
-      const diff = buildSimpleDiff(original, next);
-      const checkpointId = await checkpointBefore("replace_regex", [validPath], { dry_run });
-      if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
-      await audit({ tool: "replace_regex", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      return toolResult("replace_regex", { path: validPath, diff, dry_run, checkpoint_id: checkpointId });
+      return withFileMutation(validPath, async () => {
+        const original = await fs.readFile(validPath, "utf-8");
+        const regex = new RegExp(pattern, flags);
+        const next = original.replace(regex, replacement);
+        if (next === original) throw new Error("Regex made no changes.");
+        const diff = buildSimpleDiff(original, next);
+        const checkpointId = await checkpointBefore("replace_regex", [validPath], { dry_run });
+        if (!dry_run) await atomicWriteFile(validPath, next, "utf-8");
+        await audit({ tool: "replace_regex", action: "edit", target: validPath, status: dry_run ? "dry-run" : "ok" });
+        return toolResult("replace_regex", { path: validPath, diff, dry_run, checkpoint_id: checkpointId });
+      });
     }
   );
 
@@ -311,39 +323,44 @@ export function registerFilesystemTools(server: McpServer): void {
           const stat = await fs.stat(validPath);
           baseDir = stat.isDirectory() ? validPath : path.dirname(validPath);
         }
-        const patchPaths = parseMultiFilePatch(patch, baseDir).map((op) => op.path);
-        const checkpointId = await checkpointBefore("apply_patch", patchPaths, { dry_run });
-        const results = await applyMultiFilePatch(patch, { base_dir: baseDir, dry_run });
-        const failed = results.filter((r) => !r.ok);
-        await audit({
-          tool: "apply_patch",
-          action: "patch",
-          target: baseDir || "multi",
-          status: failed.length ? "error" : dry_run ? "dry-run" : "ok",
-          details: { files: results.length, failed: failed.length },
-        });
-        const okPaths = results.filter((r) => r.ok && r.path).map((r) => r.path as string);
-        const payload = await enrichAfterEdit(
-          { files: results, dry_run, multi_file: true, checkpoint_id: checkpointId },
-          okPaths,
-          dry_run
-        );
-        return toolResult("apply_patch", payload, {
-          ok: failed.length === 0,
-          summary: `patched ${results.length} file(s)${failed.length ? `, ${failed.length} failed` : ""}`,
+        const parsedPaths = parseMultiFilePatch(patch, baseDir).map((op) => op.path);
+        const patchPaths = await Promise.all(parsedPaths.map((patchPath) => validatePath(patchPath)));
+        return withFileMutations(patchPaths, async () => {
+          const checkpointId = await checkpointBefore("apply_patch", patchPaths, { dry_run });
+          const results = await applyMultiFilePatch(patch, { base_dir: baseDir, dry_run, resolved_paths: patchPaths });
+          const failed = results.filter((r) => !r.ok);
+          await audit({
+            tool: "apply_patch",
+            action: "patch",
+            target: baseDir || "multi",
+            status: failed.length ? "error" : dry_run ? "dry-run" : "ok",
+            details: { files: results.length, failed: failed.length },
+          });
+          const okPaths = results.filter((r) => r.ok && r.path).map((r) => r.path as string);
+          const payload = await enrichAfterEdit(
+            { files: results, dry_run, multi_file: true, checkpoint_id: checkpointId },
+            okPaths,
+            dry_run
+          );
+          return toolResult("apply_patch", payload, {
+            ok: failed.length === 0,
+            summary: `patched ${results.length} file(s)${failed.length ? `, ${failed.length} failed` : ""}`,
+          });
         });
       }
 
       if (!filePath) throw new Error("path is required for single-file patches");
       const validPath = await validatePath(filePath);
-      const original = await fs.readFile(validPath, "utf-8");
-      const next = applyUnifiedPatchToText(original, patch);
-      const diff = buildSimpleDiff(original, next);
-      const checkpointId = await checkpointBefore("apply_patch", [validPath], { dry_run });
-      if (!dry_run) await fs.writeFile(validPath, next, "utf-8");
-      await audit({ tool: "apply_patch", action: "patch", target: validPath, status: dry_run ? "dry-run" : "ok" });
-      const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId }, [validPath], dry_run);
-      return toolResult("apply_patch", data);
+      return withFileMutation(validPath, async () => {
+        const original = await fs.readFile(validPath, "utf-8");
+        const next = applyUnifiedPatchToText(original, patch);
+        const diff = buildSimpleDiff(original, next);
+        const checkpointId = await checkpointBefore("apply_patch", [validPath], { dry_run });
+        if (!dry_run) await atomicWriteFile(validPath, next, "utf-8");
+        await audit({ tool: "apply_patch", action: "patch", target: validPath, status: dry_run ? "dry-run" : "ok" });
+        const data = await enrichAfterEdit({ path: validPath, diff, dry_run, checkpoint_id: checkpointId }, [validPath], dry_run);
+        return toolResult("apply_patch", data);
+      });
     }
   );
 
@@ -455,12 +472,14 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: filePath }) => {
       requireWriteAllowed();
       const validPath = await validatePath(filePath);
-      const stat = await fs.stat(validPath);
-      if (!stat.isFile()) throw new Error("Path is not a file");
-      const checkpointId = await checkpointBefore("delete_file", [validPath]);
-      await fs.unlink(validPath);
-      await audit({ tool: "delete_file", action: "delete", target: validPath, status: "ok" });
-      return toolResult("delete_file", { path: validPath, checkpoint_id: checkpointId });
+      return withFileMutation(validPath, async () => {
+        const stat = await fs.stat(validPath);
+        if (!stat.isFile()) throw new Error("Path is not a file");
+        const checkpointId = await checkpointBefore("delete_file", [validPath]);
+        await fs.unlink(validPath);
+        await audit({ tool: "delete_file", action: "delete", target: validPath, status: "ok" });
+        return toolResult("delete_file", { path: validPath, checkpoint_id: checkpointId });
+      });
     }
   );
 
@@ -476,9 +495,11 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: dirPath }) => {
       requireWriteAllowed();
       const validPath = await validatePath(dirPath);
-      await fs.mkdir(validPath, { recursive: true });
-      await audit({ tool: "create_directory", action: "mkdir", target: validPath, status: "ok" });
-      return toolResult("create_directory", { path: validPath });
+      return withFileMutation(validPath, async () => {
+        await fs.mkdir(validPath, { recursive: true });
+        await audit({ tool: "create_directory", action: "mkdir", target: validPath, status: "ok" });
+        return toolResult("create_directory", { path: validPath });
+      });
     }
   );
 
@@ -495,15 +516,17 @@ export function registerFilesystemTools(server: McpServer): void {
     async ({ path: dirPath }) => {
       requireWriteAllowed();
       const validPath = await validatePath(dirPath);
-      const stat = await fs.stat(validPath);
-      if (!stat.isDirectory()) throw new Error("Path is not a directory");
-      const checkpointId = await checkpointBefore("delete_directory", [validPath]);
-      await fs.rm(validPath, { recursive: true, force: true });
-      await audit({ tool: "delete_directory", action: "rmdir", target: validPath, status: "ok" });
-      return toolResult("delete_directory", {
-        path: validPath,
-        checkpoint_id: checkpointId,
-        run_command_fallback: `Remove-Item -Recurse -Force "${validPath}"`,
+      return withFileMutation(validPath, async () => {
+        const stat = await fs.stat(validPath);
+        if (!stat.isDirectory()) throw new Error("Path is not a directory");
+        const checkpointId = await checkpointBefore("delete_directory", [validPath]);
+        await fs.rm(validPath, { recursive: true, force: true });
+        await audit({ tool: "delete_directory", action: "rmdir", target: validPath, status: "ok" });
+        return toolResult("delete_directory", {
+          path: validPath,
+          checkpoint_id: checkpointId,
+          run_command_fallback: `Remove-Item -Recurse -Force "${validPath}"`,
+        });
       });
     }
   );
@@ -521,13 +544,14 @@ export function registerFilesystemTools(server: McpServer): void {
       requireWriteAllowed();
       const src = await validatePath(source);
       const dest = await validatePath(destination);
-      const stat = await fs.stat(src);
-      if (!stat.isFile()) throw new Error("Source is not a file");
-      const checkpointId = await checkpointBefore("copy_file", [dest]);
-      await fs.mkdir(path.dirname(dest), { recursive: true });
-      await fs.copyFile(src, dest);
-      await audit({ tool: "copy_file", action: "copy", target: dest, status: "ok", details: { source: src } });
-      return toolResult("copy_file", { source: src, destination: dest, checkpoint_id: checkpointId });
+      return withFileMutations([src, dest], async () => {
+        const stat = await fs.stat(src);
+        if (!stat.isFile()) throw new Error("Source is not a file");
+        const checkpointId = await checkpointBefore("copy_file", [dest]);
+        await atomicCopyFile(src, dest);
+        await audit({ tool: "copy_file", action: "copy", target: dest, status: "ok", details: { source: src } });
+        return toolResult("copy_file", { source: src, destination: dest, checkpoint_id: checkpointId });
+      });
     }
   );
 
@@ -544,11 +568,13 @@ export function registerFilesystemTools(server: McpServer): void {
       requireWriteAllowed();
       const src = await validatePath(source);
       const dest = await validatePath(destination);
-      const checkpointId = await checkpointBefore("move_file", [src, dest]);
-      await fs.mkdir(path.dirname(dest), { recursive: true });
-      await fs.rename(src, dest);
-      await audit({ tool: "move_file", action: "move", target: dest, status: "ok", details: { source: src } });
-      return toolResult("move_file", { source: src, destination: dest, checkpoint_id: checkpointId });
+      return withFileMutations([src, dest], async () => {
+        const checkpointId = await checkpointBefore("move_file", [src, dest]);
+        await fs.mkdir(path.dirname(dest), { recursive: true });
+        await fs.rename(src, dest);
+        await audit({ tool: "move_file", action: "move", target: dest, status: "ok", details: { source: src } });
+        return toolResult("move_file", { source: src, destination: dest, checkpoint_id: checkpointId });
+      });
     }
   );
 
@@ -568,11 +594,13 @@ export function registerFilesystemTools(server: McpServer): void {
   });
 
   server.registerTool("list_allowed_directories", { title: "List Allowed Directories", description: "Show default working directory and machine access scope.", inputSchema: {}, annotations: toolAnnotations("read") }, async () => {
-    const { getDefaultCwd, getMachineRoots } = await import("../lib/path-security.js");
+    const { getDefaultCwd, getFullDiskAccess, getMachineRoots } = await import("../lib/path-security.js");
     const { describePermissionProfile } = await import("../lib/permissions.js");
     const machineRoots = getMachineRoots();
     return toolResult("list_allowed_directories", {
-      full_machine_access: true,
+      full_machine_access: getFullDiskAccess(),
+      path_sandbox_enabled: !getFullDiskAccess(),
+      shell_commands_os_sandboxed: false,
       permission: describePermissionProfile(),
       default_cwd: getDefaultCwd(),
       machine_roots: machineRoots,

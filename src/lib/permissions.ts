@@ -1,4 +1,6 @@
-/** Full open access — no permission profiles or command blocking. */
+import { getFullDiskAccess } from "./path-security.js";
+
+/** Commands are intentionally open; path-aware tools have a separate disk scope. */
 
 export type PermissionProfile = "open";
 
@@ -19,7 +21,7 @@ export function canRunCommands(): boolean {
 }
 
 export function canUseAnyAbsolutePath(): boolean {
-  return true;
+  return getFullDiskAccess();
 }
 
 export function shouldBlockCommand(_command: string): boolean {
@@ -27,7 +29,9 @@ export function shouldBlockCommand(_command: string): boolean {
 }
 
 export function describePermissionProfile(): string {
-  return "open: full machine access — any path, any command, no restrictions";
+  return getFullDiskAccess()
+    ? "open commands; path-aware tools have full-disk access; native shell commands are not OS-sandboxed"
+    : "open commands; path-aware tools are limited to workspace roots; native shell commands are not OS-sandboxed";
 }
 
 export function requireWriteAllowed(): void {}

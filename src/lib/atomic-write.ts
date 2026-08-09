@@ -3,22 +3,14 @@ import path from "path";
 
 let atomicWriteSeq = 0;
 
-/** Atomic same-directory replace with Windows-safe backup/rollback semantics. */
-export async function atomicWriteFile(
-  file: string,
-  data: string | Uint8Array,
-  encoding: BufferEncoding | undefined = typeof data === "string" ? "utf8" : undefined
-): Promise<void> {
-  await fs.mkdir(path.dirname(file), { recursive: true });
+function tempPaths(file: string): { tmp: string; backup: string } {
   const token = `${process.pid}-${Date.now().toString(36)}-${(++atomicWriteSeq).toString(36)}`;
-  const tmp = `${file}.tmp-${token}`;
-  const backup = `${file}.bak-${token}`;
+  return { tmp: `${file}.tmp-${token}`, backup: `${file}.bak-${token}` };
+}
+
+async function commitTempFile(file: string, tmp: string, backup: string): Promise<void> {
   let backupCreated = false;
   let committed = false;
-
-  if (typeof data === "string") await fs.writeFile(tmp, data, encoding ?? "utf8");
-  else await fs.writeFile(tmp, data);
-
   try {
     try {
       await fs.rename(tmp, file);
@@ -49,4 +41,30 @@ export async function atomicWriteFile(
     await fs.rm(tmp, { force: true }).catch(() => undefined);
     if (committed && backupCreated) await fs.rm(backup, { force: true }).catch(() => undefined);
   }
+}
+
+/** Atomic same-directory replace with Windows-safe backup/rollback semantics. */
+export async function atomicWriteFile(
+  file: string,
+  data: string | Uint8Array,
+  encoding: BufferEncoding | undefined = typeof data === "string" ? "utf8" : undefined
+): Promise<void> {
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const { tmp, backup } = tempPaths(file);
+  if (typeof data === "string") await fs.writeFile(tmp, data, encoding ?? "utf8");
+  else await fs.writeFile(tmp, data);
+  await commitTempFile(file, tmp, backup);
+}
+
+/** Copy a potentially large file without exposing a partially-written destination. */
+export async function atomicCopyFile(source: string, destination: string): Promise<void> {
+  await fs.mkdir(path.dirname(destination), { recursive: true });
+  const { tmp, backup } = tempPaths(destination);
+  try {
+    await fs.copyFile(source, tmp);
+  } catch (err) {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    throw err;
+  }
+  await commitTempFile(destination, tmp, backup);
 }

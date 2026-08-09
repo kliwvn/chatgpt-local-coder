@@ -16,7 +16,7 @@
 
 ---
 
-ChatGPT Local Coder is a **self-hosted MCP server** that turns ChatGPT into a coding agent on your machine — read and edit code, run `npm test`, manage git, apply unified diffs, and explore projects with `glob` / `grep`. Sandboxed to your workspace by default (`FULL_DISK_ACCESS=false`).
+ChatGPT Local Coder is a **self-hosted MCP server** that turns ChatGPT into a coding agent on your machine — read and edit code, run `npm test`, manage git, apply unified diffs, and explore projects with `glob` / `grep`. Path-aware tools are scoped to your workspace roots by default (`FULL_DISK_ACCESS=false`).
 
 No desktop app. No vendor lock-in. Run one Node process on your PC, expose it through a tunnel, and code from ChatGPT in the browser.
 
@@ -40,7 +40,7 @@ No desktop app. No vendor lock-in. Run one Node process on your PC, expose it th
 | Run tests / builds | ❌ | ✅ `run_command`, `start_process` |
 | Git workflow | ❌ | ✅ `git_status`, `git_commit`, `git_push`, … |
 | Explore codebase | Limited | ✅ `glob`, `grep`, `list_directory` |
-| Disk access | Sandboxed | ✅ Workspace only (default) — `FULL_DISK_ACCESS=true` để mở toàn máy |
+| Path-aware disk access | — | ✅ Workspace roots only by default — `FULL_DISK_ACCESS=true` mở path-aware tools ra toàn máy |
 | Multi-workspace | — | ✅ Manager dashboard, mỗi workspace 1 server + tunnel + connector |
 | Session recovery | — | ✅ Auto-recover after server restart |
 
@@ -293,7 +293,7 @@ OPENAI_TUNNEL_API_KEY=
 | `WORKSPACE_PATH` | `cwd` | **Your project root** (like `cd` before `claude`). Auto-loads `CLAUDE.md` / `AGENTS.md` into MCP instructions |
 | `EXTRA_WORKSPACE_PATHS` | — | Thêm workspace bổ sung (`;`-separated) — server được phép truy cập tất cả các root này |
 | `WORKSPACE_PATHS` / `ALLOWED_WORKSPACE_PATHS` | — | Aliases của `EXTRA_WORKSPACE_PATHS` (đọc thêm nếu có) |
-| `FULL_DISK_ACCESS` | `false` | **Fail-closed sandbox.** `false` = chỉ truy cập trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`); `true` = mở toàn máy |
+| `FULL_DISK_ACCESS` | `false` | Scope cho **path-aware filesystem/git/config tools**. `false` = chỉ path canonical trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`); `true` = cho phép path toàn máy. Không phải OS sandbox cho native shell |
 | `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
 | `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
 | `MCP_SESSION_TTL_MS` | `120000` | Xóa session **idle** sau 2 phút. Session đang SSE-connected hoặc đang chạy tool không bị evict; stale POST được auto-recover |
@@ -309,7 +309,7 @@ OPENAI_TUNNEL_API_KEY=
 | `MANAGER_PORT` | `3300` | Cổng manager dashboard (manager/server.mjs) |
 | `ADMIN_PORT` | `3001` | Admin GUI localhost-only (proxy qua manager) |
 
-> **Sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → mọi tool bị chặn tại `validatePath` nếu path nằm ngoài workspace roots (đổi ổ đĩa, `..\..` escape). Muốn truy cập toàn máy: đặt `FULL_DISK_ACCESS=true` trong `.env` (instance: `manager/instances/<name>/.env`).
+> **Path sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → các tool có path argument canonicalize path thật (`realpath`/nearest existing ancestor) rồi chặn `..\..`, symlink/junction và multi-file patch escape ra ngoài workspace roots. Recursive `glob`/`grep`/search không follow symlink entries. Project-controlled `CLAUDE.md`/rules imports cũng không được vượt workspace roots. **`run_command` / `start_process` là native shell và không được OS-sandbox bởi setting này**; chỉ working directory của chúng được kiểm tra. Chỉ chạy connector trên máy/code bạn tin cậy.
 
 > **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và không tự reset lịch sử chat. Server giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Các state dùng chung có tính bền vững (checkpoint index, auto-memory, shell history, `.env`/manager config) được serialize/ghi atomic để nhiều transport session chạy song song không ghi đè lẫn nhau. Initialize response vẫn mang MCP server instructions, vì vậy server chỉ gửi **một** bản instruction document (không double-wrap) và dashboard hiển thị retention policy để phát hiện churn bất thường.
 
@@ -346,7 +346,9 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 
 ## 🔒 Security
 
-**Fail-closed sandbox mặc định:** `FULL_DISK_ACCESS=false` → server chỉ thao tác được trong `WORKSPACE_PATH` + `EXTRA_WORKSPACE_PATHS`. Mọi path ngoài ranh giới (đổi ổ, `..\..` escape) bị chặn tại `validatePath` — kể cả khi ChatGPT yêu cầu. Bật `FULL_DISK_ACCESS=true` nghĩa là mở toàn máy — chỉ dùng khi bạn thực sự cần.
+**Path sandbox fail-closed mặc định:** `FULL_DISK_ACCESS=false` giới hạn các path-aware filesystem/git/config operations trong `WORKSPACE_PATH` + `EXTRA_WORKSPACE_PATHS`, với canonical-path checks chống `..`, symlink/junction và patch-path escape. Source mutations trên cùng/overlapping path được serialize và source writes/copies dùng atomic replace để tránh lost-update/partial-write khi nhiều MCP transport chạy song song.
+
+**Native shell caveat:** `run_command` và `start_process` chạy shell/process thật của OS. `FULL_DISK_ACCESS=false` **không** biến chúng thành OS sandbox và không thể ngăn một command được phép tự truy cập path khác. Setting này là path boundary cho các tool mà server tự kiểm soát path, không phải VM/container/process isolation.
 
 - Server chỉ nghe `127.0.0.1` — không phơi ra mạng nội bộ
 - Manager + admin GUI localhost-only; CORS hẹp
@@ -368,7 +370,7 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 | **Tool blocked by OpenAI safety** | Not a server bug. Retry with `run_command` (response may include `run_command_fallback`). Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
 | **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.bat`). |
-| **Access denied — "Path nằm ngoài workspace"** | Sandbox mặc định (`FULL_DISK_ACCESS=false`). Mở rộng `EXTRA_WORKSPACE_PATHS` hoặc bật `FULL_DISK_ACCESS=true` trong `.env` instance, restart server trong manager. |
+| **Access denied — "Path nằm ngoài workspace"** | Path sandbox mặc định (`FULL_DISK_ACCESS=false`). Mở rộng `EXTRA_WORKSPACE_PATHS` hoặc bật `FULL_DISK_ACCESS=true` trong `.env` instance, restart server trong manager. |
 | **Không thấy manager / 3300** | Chạy `manager.bat` (hoặc `node manager/server.mjs`) — dashboard tại http://127.0.0.1:3300. Nếu đã có manager chạy, mở thẳng URL. |
 | **git not found** | Install [Git](https://git-scm.com). |
 
@@ -412,7 +414,7 @@ npm install && npm run build
 
 Mở **http://127.0.0.1:3300**: manager tự cài đặt, cấu hình workspace (folder picker), start server + tunnel, nút mở **Cài Đặt Connector**, **log viewer** (lọc Chỉ MCP), nút **Hướng Dẫn Sử Dụng** — không cần chạy terminal tay.
 
-**Sandbox:** mặc định `FULL_DISK_ACCESS=false` — server chỉ đọc/ghi trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`). Bật `true` mới mở toàn máy.
+**Path sandbox:** mặc định `FULL_DISK_ACCESS=false` — các tool có path argument chỉ đọc/ghi trong canonical `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`) và chặn symlink/junction/patch escape. `run_command` / `start_process` vẫn là native shell, **không** được OS-sandbox bởi setting này. Bật `true` chỉ mở scope của path-aware tools ra toàn máy.
 
 Chạy thủ công (không dùng manager):
 

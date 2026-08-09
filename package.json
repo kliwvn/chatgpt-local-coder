@@ -18,7 +18,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-activity-log.mjs && node scripts/test-redaction.mjs && node scripts/test-audit-path.mjs && node scripts/test-state-concurrency.mjs && node scripts/test-manager-log-utils.mjs && node scripts/test-manager-env-redaction.mjs && node scripts/test-manager-safety.mjs && node scripts/test-session-leak.mjs && node scripts/test-project-memory.mjs && node scripts/test-tool-profile.mjs && node scripts/test-shell-persist.mjs",
+    "test": "npm run build && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-activity-log.mjs && node scripts/test-redaction.mjs && node scripts/test-audit-path.mjs && node scripts/test-state-concurrency.mjs && node scripts/test-filesystem-safety.mjs && node scripts/test-manager-log-utils.mjs && node scripts/test-manager-env-redaction.mjs && node scripts/test-manager-safety.mjs && node scripts/test-session-leak.mjs && node scripts/test-project-memory.mjs && node scripts/test-tool-profile.mjs && node scripts/test-shell-persist.mjs",
     "test:all": "node scripts/run-all-tests.mjs",
     "test:integration": "npm run build && node scripts/test-mcp-bridge-integration.mjs",
     "init-claude-md": "node scripts/init-claude-md.mjs",

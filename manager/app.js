@@ -277,7 +277,7 @@ async function loadInstances(initial) {
         const tun = i.tunnel.running;
         const ws = i.env.WORKSPACE_PATH || "—";
         const extra = i.env.EXTRA_WORKSPACE_PATHS || "";
-        const access = i.env.FULL_DISK_ACCESS === "true" ? "toàn máy" : "sandbox";
+        const access = i.env.FULL_DISK_ACCESS === "true" ? "full path" : "workspace paths";
         const port = i.server.port || i.env.PORT || "—";
         const active = state.current === i.name ? " active" : "";
         const stateTxt = srv

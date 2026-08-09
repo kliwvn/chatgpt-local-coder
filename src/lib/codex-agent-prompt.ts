@@ -6,7 +6,7 @@
 export const CODEX_AGENT_PROMPT = `
 ## Agent workflow (Claude Code-style)
 
-You are a local coding agent with full machine access via MCP tools.
+You are a local coding agent using MCP tools. Path-aware filesystem/git tools obey the configured workspace scope. Native shell commands are not OS-sandboxed by FULL_DISK_ACCESS.
 
 ### Every task — agentic loop
 1. **Gather context** — glob/grep to locate files; read_text_file before editing. Never guess paths.

@@ -1,6 +1,7 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
+import { validatePath } from "./path-security.js";
 
 const ROOT_MEMORY_FILES = [
   "CLAUDE.md",
@@ -67,9 +68,14 @@ async function readTextLimited(
   kind: ProjectMemorySection["kind"]
 ): Promise<ProjectMemorySection | null> {
   try {
-    const buf = await fs.readFile(filePath);
+    // User-level memory is an explicit trusted source outside the project.
+    // Project/rule memory must obey the same path sandbox as path-aware tools;
+    // otherwise a repository-controlled symlink or @import can exfiltrate an
+    // arbitrary local file into MCP instructions during server startup.
+    const resolvedPath = kind === "user" ? path.resolve(filePath) : await validatePath(filePath);
+    const buf = await fs.readFile(resolvedPath);
     let full = stripHtmlComments(buf.toString("utf-8"));
-    full = await expandImportsInContent(full, path.dirname(filePath));
+    full = await expandImportsInContent(full, path.dirname(resolvedPath), kind !== "user");
 
     const lines = Number.isFinite(maxLines) ? full.split(/\r?\n/).slice(0, maxLines) : full.split(/\r?\n/);
     const lineLimited = lines.join("\n");
@@ -84,22 +90,23 @@ async function readTextLimited(
 
     const trimmed = byteLimited.trim();
     if (!trimmed) return null;
-    return { path: filePath, content: trimmed, truncated, kind };
+    return { path: resolvedPath, content: trimmed, truncated, kind };
   } catch {
     return null;
   }
 }
 
-async function expandImportsInContent(content: string, baseDir: string): Promise<string> {
+async function expandImportsInContent(content: string, baseDir: string, restrictToWorkspace: boolean): Promise<string> {
   const visited = new Set<string>();
-  return expandMemoryImportsAsync(content, baseDir, visited, 0);
+  return expandMemoryImportsAsync(content, baseDir, visited, 0, restrictToWorkspace);
 }
 
 async function expandMemoryImportsAsync(
   content: string,
   baseDir: string,
   visited: Set<string>,
-  depth: number
+  depth: number,
+  restrictToWorkspace: boolean
 ): Promise<string> {
   if (depth >= IMPORT_MAX_DEPTH) return content;
 
@@ -131,7 +138,15 @@ async function expandMemoryImportsAsync(
       importPath = path.resolve(baseDir, importPath);
     }
 
-    const resolved = path.resolve(importPath);
+    let resolved = path.resolve(importPath);
+    if (restrictToWorkspace) {
+      try {
+        resolved = await validatePath(resolved);
+      } catch {
+        out.push("<!-- import blocked: outside configured workspace roots -->");
+        continue;
+      }
+    }
     if (visited.has(resolved)) {
       out.push(`<!-- skipped circular import ${resolved} -->`);
       continue;
@@ -145,7 +160,8 @@ async function expandMemoryImportsAsync(
         imported,
         path.dirname(resolved),
         visited,
-        depth + 1
+        depth + 1,
+        restrictToWorkspace
       );
       out.push(`<!-- @import ${resolved} -->`, expanded);
     } catch {
@@ -229,8 +245,14 @@ export async function loadProjectMemory(
 
   const rulesDir = path.join(root, ".claude", "rules");
   if (totalBytes.value < maxBytes && (await fileExists(rulesDir))) {
-    for (const ruleFile of await listUnconditionalRuleFiles(rulesDir)) {
-      await appendSection(sections, totalBytes, maxBytes, maxLines, ruleFile, "rule");
+    try {
+      const safeRulesDir = await validatePath(rulesDir);
+      for (const ruleFile of await listUnconditionalRuleFiles(safeRulesDir)) {
+        await appendSection(sections, totalBytes, maxBytes, maxLines, ruleFile, "rule");
+      }
+    } catch {
+      // A project-controlled rules symlink/junction outside the configured roots
+      // is intentionally ignored when the path sandbox is enabled.
     }
   }
 

@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { atomicWriteFile } from "./atomic-write.js";
 
 /**
  * Apply unified diff / Codex-style patches to text.
@@ -261,49 +262,143 @@ function resolvePatchPath(input: string, baseDir?: string): string {
 
 export async function applyMultiFilePatch(
   patchText: string,
-  options?: { base_dir?: string; dry_run?: boolean }
+  options?: {
+    base_dir?: string;
+    dry_run?: boolean;
+    resolve_path?: (filePath: string) => Promise<string>;
+    resolved_paths?: string[];
+  }
 ): Promise<MultiPatchResult[]> {
   const baseDir = options?.base_dir;
   const dryRun = options?.dry_run ?? false;
   const ops = parseMultiFilePatch(patchText, baseDir);
   if (ops.length === 0) throw new Error("No file operations found in patch");
 
-  const results: MultiPatchResult[] = [];
+  if (options?.resolved_paths) {
+    if (options.resolved_paths.length !== ops.length) {
+      throw new Error("resolved_paths length does not match patch operation count");
+    }
+    for (let i = 0; i < ops.length; i++) ops[i].path = options.resolved_paths[i];
+  } else if (options?.resolve_path) {
+    for (const op of ops) op.path = await options.resolve_path(op.path);
+  }
 
-  for (const op of ops) {
+  const normalizedTargets = ops.map((op) => {
+    const resolved = path.resolve(op.path);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  });
+  if (new Set(normalizedTargets).size !== normalizedTargets.length) {
+    throw new Error("Multi-file patch targets the same path more than once; combine operations for each file into one block.");
+  }
+
+  type PreparedOperation = {
+    op: MultiPatchFileOp;
+    originalExists: boolean;
+    original?: Buffer;
+    next?: string;
+    result: MultiPatchResult;
+  };
+
+  const prepared: PreparedOperation[] = [];
+  let preflightError: { index: number; message: string } | null = null;
+
+  // Preflight every operation before touching disk. This prevents the common
+  // partial-patch failure where file A is changed and file B's hunk then fails.
+  for (let index = 0; index < ops.length; index++) {
+    const op = ops[index];
     try {
       if (op.operation === "delete") {
-        if (!dryRun) await fs.unlink(op.path);
-        results.push({ path: op.path, operation: "delete", ok: true, diff: "[deleted]" });
+        const stat = await fs.stat(op.path);
+        if (!stat.isFile()) throw new Error("Delete target is not a regular file");
+        prepared.push({
+          op,
+          originalExists: true,
+          original: await fs.readFile(op.path),
+          result: { path: op.path, operation: "delete", ok: true, diff: "[deleted]" },
+        });
         continue;
       }
 
       if (op.operation === "create") {
         const content = op.content ?? "";
-        if (!dryRun) {
-          await fs.mkdir(path.dirname(op.path), { recursive: true });
-          await fs.writeFile(op.path, content, "utf-8");
+        let originalExists = false;
+        let original: Buffer | undefined;
+        try {
+          const stat = await fs.stat(op.path);
+          if (!stat.isFile()) throw new Error("Create target exists and is not a regular file");
+          originalExists = true;
+          original = await fs.readFile(op.path);
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
-        results.push({ path: op.path, operation: "create", ok: true, diff: buildSimpleDiff("", content) });
+        prepared.push({
+          op,
+          originalExists,
+          original,
+          next: content,
+          result: { path: op.path, operation: "create", ok: true, diff: buildSimpleDiff("", content) },
+        });
         continue;
       }
 
       const original = await fs.readFile(op.path, "utf-8");
       const next = applyUnifiedPatchToText(original, op.patch || "");
       const diff = buildSimpleDiff(original, next);
-      if (!dryRun) await fs.writeFile(op.path, next, "utf-8");
-      results.push({ path: op.path, operation: "update", ok: true, diff });
-    } catch (err) {
-      results.push({
-        path: op.path,
-        operation: op.operation,
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
+      prepared.push({
+        op,
+        originalExists: true,
+        original: Buffer.from(original, "utf-8"),
+        next,
+        result: { path: op.path, operation: "update", ok: true, diff },
       });
+    } catch (err) {
+      preflightError = { index, message: err instanceof Error ? err.message : String(err) };
+      break;
     }
   }
 
-  return results;
+  if (preflightError) {
+    return ops.map((op, index) => ({
+      path: op.path,
+      operation: op.operation,
+      ok: false,
+      error:
+        index === preflightError!.index
+          ? preflightError!.message
+          : "not applied because another operation failed preflight",
+    }));
+  }
+
+  if (dryRun) return prepared.map((item) => item.result);
+
+  const committed: PreparedOperation[] = [];
+  try {
+    for (const item of prepared) {
+      if (item.op.operation === "delete") await fs.unlink(item.op.path);
+      else await atomicWriteFile(item.op.path, item.next ?? "", "utf-8");
+      committed.push(item);
+    }
+    return prepared.map((item) => item.result);
+  } catch (commitError) {
+    const rollbackErrors: string[] = [];
+    for (const item of [...committed].reverse()) {
+      try {
+        if (item.originalExists && item.original) await atomicWriteFile(item.op.path, item.original);
+        else await fs.rm(item.op.path, { force: true });
+      } catch (rollbackError) {
+        rollbackErrors.push(
+          `${item.op.path}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`
+        );
+      }
+    }
+    if (rollbackErrors.length) {
+      throw new Error(
+        `Multi-file patch commit failed (${commitError instanceof Error ? commitError.message : String(commitError)}) and rollback was incomplete: ${rollbackErrors.join("; ")}`
+      );
+    }
+    const message = `commit failed; all previously-applied operations were rolled back: ${commitError instanceof Error ? commitError.message : String(commitError)}`;
+    return prepared.map((item) => ({ ...item.result, ok: false, error: message }));
+  }
 }
 
 export function buildSimpleDiff(oldContent: string, newContent: string): string {

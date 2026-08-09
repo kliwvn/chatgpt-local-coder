@@ -105,6 +105,27 @@ await run("multi-file patch apply", async () => {
   if (!text.includes("gamma")) throw new Error(text);
 });
 
+await run("multi-file patch preflight prevents partial writes", async () => {
+  const first = path.join(tmpDir, "transaction-a.txt");
+  const second = path.join(tmpDir, "transaction-b.txt");
+  await fs.writeFile(first, "alpha\n");
+  await fs.writeFile(second, "beta\n");
+  const patch = `*** Begin Patch
+*** Update File: transaction-a.txt
+@@
+-alpha
++changed
+*** Update File: transaction-b.txt
+@@
+-missing
++never
+*** End Patch`;
+  const results = await applyMultiFilePatch(patch, { base_dir: tmpDir });
+  if (results.some((result) => result.ok)) throw new Error(`expected all operations rejected: ${JSON.stringify(results)}`);
+  if ((await fs.readFile(first, "utf-8")) !== "alpha\n") throw new Error("first file changed despite later preflight failure");
+  if ((await fs.readFile(second, "utf-8")) !== "beta\n") throw new Error("second file changed despite preflight failure");
+});
+
 await run("delete and move file", async () => {
   const src = path.join(tmpDir, "move-me.txt");
   const dest = path.join(tmpDir, "moved.txt");

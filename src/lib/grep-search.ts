@@ -69,6 +69,9 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
     for (const entry of entries) {
       if (outputMode === "content" && contentLines.length >= headLimit) break;
       if (entry.name.startsWith(".") && entry.name !== ".") continue;
+      // Do not read through a symlink/reparse point discovered during recursive
+      // traversal; explicit file reads are canonicalized by validatePath instead.
+      if (entry.isSymbolicLink()) continue;
 
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {

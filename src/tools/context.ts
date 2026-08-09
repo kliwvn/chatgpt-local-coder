@@ -42,7 +42,10 @@ async function findContextFiles(root: string, maxDepth: number): Promise<string[
 
     for (const name of contextFileNames) {
       const candidate = path.join(dir, name);
-      if (await exists(candidate)) found.push(candidate);
+      if (!(await exists(candidate))) continue;
+      try {
+        found.push(await validatePath(candidate));
+      } catch {}
     }
 
     if (depth === maxDepth) return;
@@ -55,6 +58,7 @@ async function findContextFiles(root: string, maxDepth: number): Promise<string[
     }
 
     for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
       if (!entry.isDirectory()) continue;
       if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "dist" || entry.name === "build") continue;
       await walk(path.join(dir, entry.name), depth + 1);
@@ -81,7 +85,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       annotations: toolAnnotations("read"),
     },
     async ({ path: projectPath, max_depth, max_bytes_per_file }) => {
-      const root = projectPath ? await validatePath(projectPath) : workspaceRoot;
+      const root = await validatePath(projectPath || workspaceRoot);
       const files = await findContextFiles(root, max_depth);
       const fileContents: Array<{ path: string; content: string; truncated: boolean }> = [];
 
@@ -119,6 +123,8 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
         permission_profile: getPermissionProfile(),
         permission_description: describePermissionProfile(),
         full_machine_access: getFullDiskAccess(),
+        path_sandbox_enabled: !getFullDiskAccess(),
+        shell_commands_os_sandboxed: false,
         default_cwd: getDefaultCwd(),
         machine_roots: getMachineRoots(),
         audit_log: getAuditPath(),

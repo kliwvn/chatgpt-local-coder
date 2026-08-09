@@ -1,12 +1,22 @@
 import fs from "fs";
+import fsp from "fs/promises";
 import path from "path";
 import os from "os";
 
-let defaultCwd = process.cwd();
+function canonicalizeExistingSync(inputPath: string): string {
+  const absolute = path.resolve(inputPath);
+  try {
+    return fs.realpathSync.native(absolute);
+  } catch {
+    return absolute;
+  }
+}
+
+let defaultCwd = canonicalizeExistingSync(process.cwd());
 let workspaceRoots: string[] = [defaultCwd];
 
 export function setDefaultCwd(cwd: string): void {
-  defaultCwd = path.resolve(cwd);
+  defaultCwd = canonicalizeExistingSync(cwd);
 }
 
 export function getDefaultCwd(): string {
@@ -15,7 +25,7 @@ export function getDefaultCwd(): string {
 
 /** Đăng ký danh sách thư mục workspace — ranh giới truy cập khi fullDiskAccess tắt. */
 export function setWorkspaceRoots(roots: string[]): void {
-  const resolved = roots.map((r) => path.resolve(r));
+  const resolved = roots.map(canonicalizeExistingSync);
   workspaceRoots = resolved.length > 0 ? resolved : [defaultCwd];
 }
 
@@ -23,9 +33,9 @@ export function getWorkspaceRoots(): string[] {
   return workspaceRoots;
 }
 
-/** Returns default working directory, not an access boundary */
+/** Returns the canonical default search root when sandboxed. */
 export function getAllowedRoots(): string[] {
-  return [defaultCwd];
+  return getFullDiskAccess() ? [defaultCwd] : [workspaceRoots[0] ?? defaultCwd];
 }
 
 /** FULL_DISK_ACCESS=true mở lại toàn quyền máy; mặc định false = chỉ truy cập workspace roots. */
@@ -45,6 +55,26 @@ function isWithinWorkspace(resolved: string): boolean {
   return false;
 }
 
+async function canonicalizeForBoundary(resolved: string): Promise<string> {
+  let cursor = resolved;
+  const missingSegments: string[] = [];
+
+  while (true) {
+    try {
+      const real = await fsp.realpath(cursor);
+      return path.resolve(real, ...missingSegments);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw err;
+      missingSegments.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
 export async function validatePath(inputPath: string): Promise<string> {
   const trimmed = inputPath.trim();
   if (!trimmed) throw new Error("Path is empty");
@@ -53,13 +83,21 @@ export async function validatePath(inputPath: string): Promise<string> {
     ? path.resolve(trimmed)
     : path.resolve(defaultCwd, trimmed);
 
-  if (!getFullDiskAccess() && !isWithinWorkspace(resolved)) {
+  if (getFullDiskAccess()) return resolved;
+
+  // A lexical path can stay under the workspace while a symlink/junction points
+  // outside it. Canonicalize the target (or nearest existing ancestor for create
+  // paths) and return that canonical path so later I/O cannot follow a swapped
+  // link after the boundary check.
+  const canonical = await canonicalizeForBoundary(resolved);
+
+  if (!isWithinWorkspace(canonical)) {
     throw new Error(
-      `Path nằm ngoài workspace (${workspaceRoots.join("; ")}): ${resolved}. ` +
+      `Path nằm ngoài workspace (${workspaceRoots.join("; ")}): ${canonical}. ` +
         "Bật FULL_DISK_ACCESS=true trong .env nếu muốn truy cập toàn máy."
     );
   }
-  return resolved;
+  return canonical;
 }
 
 export function getMachineRoots(): string[] {

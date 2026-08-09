@@ -44,6 +44,9 @@ export async function globFiles(
     for (const entry of entries) {
       if (matches.length >= maxResults) break;
       if (entry.name.startsWith(".") && entry.name !== ".") continue;
+      // Recursive discovery must not follow a symlink/reparse-point target that
+      // was never independently validated against workspace boundaries.
+      if (entry.isSymbolicLink()) continue;
       const fullPath = path.join(dir, entry.name);
       const rel = path.relative(rootDir, fullPath).replace(/\\/g, "/");
 

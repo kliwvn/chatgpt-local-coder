@@ -185,6 +185,8 @@ app.get("/health", (_req, res) => {
     defaultCwd: getDefaultCwd(),
     fullMachineAccess: getFullDiskAccess(),
     fullDiskAccess: getFullDiskAccess(),
+    pathSandboxEnabled: !getFullDiskAccess(),
+    shellCommandsOsSandboxed: false,
     activeSessions: counts.registered,
     connectedSessions: counts.connected,
     sessionPolicy: {
@@ -437,9 +439,8 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`  ${ts} Health:    http://localhost:${PORT}/health`);
   console.log(`  ${ts} Admin UI:  http://127.0.0.1:${ADMIN_PORT}/ui`);
   console.log(`  ${ts} Default cwd: ${workspaceRoot}`);
-  console.log(
-    `  ${ts} Full machine access: ${getFullDiskAccess() ? "ON (no path restrictions)" : "OFF (workspace sandbox)"}`
-  );
+  console.log(`  ${ts} Path-aware access: ${getFullDiskAccess() ? "FULL DISK" : "WORKSPACE ROOTS"}`);
+  console.log(`  ${ts} Shell OS sandbox: OFF (native commands)`);
   console.log(`  ${ts} Session recovery: ${SESSION_RECOVERY ? "ON" : "OFF"}`);
   console.log(`  ${ts} PID:       ${process.pid}`);
   console.log("========================================");

@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { validatePath } from "./path-security.js";
 
 function parseFrontmatter(content: string): { paths?: string[] } {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
@@ -37,6 +38,7 @@ async function listRuleFiles(rulesDir: string): Promise<string[]> {
       return;
     }
     for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) await walk(full, depth + 1);
       else if (entry.name.endsWith(".md")) found.push(full);
@@ -50,17 +52,23 @@ export async function loadPathRulesForFile(
   workspaceRoot: string,
   filePath: string
 ): Promise<Array<{ path: string; content: string }>> {
-  const rulesDir = path.join(workspaceRoot, ".claude", "rules");
   const matched: Array<{ path: string; content: string }> = [];
+  let rulesDir: string;
+  try {
+    rulesDir = await validatePath(path.join(workspaceRoot, ".claude", "rules"));
+  } catch {
+    return matched;
+  }
 
   for (const ruleFile of await listRuleFiles(rulesDir)) {
     try {
-      const raw = await fs.readFile(ruleFile, "utf-8");
+      const safeRuleFile = await validatePath(ruleFile);
+      const raw = await fs.readFile(safeRuleFile, "utf-8");
       const fm = parseFrontmatter(raw);
       if (!fm.paths?.length) continue;
       if (!matchesAny(filePath, fm.paths)) continue;
       const body = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
-      if (body) matched.push({ path: ruleFile, content: body.slice(0, 4000) });
+      if (body) matched.push({ path: safeRuleFile, content: body.slice(0, 4000) });
     } catch {}
   }
 

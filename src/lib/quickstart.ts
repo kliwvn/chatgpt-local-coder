@@ -35,19 +35,23 @@ All tools return JSON: { ok, tool, summary, data }
 *** End Patch
 
 ## Paths
-Full machine access — use ANY absolute path (C:\\, D:\\, etc.). Relative paths resolve from default cwd.
+Path-aware tools follow FULL_DISK_ACCESS + workspace roots. Relative paths resolve from default cwd.
+run_command/start_process execute native shell commands and are not OS-sandboxed by FULL_DISK_ACCESS.
 `.trim();
 
 export function buildServerInstructions(
   workspaceRoot: string,
   workspaceRoots: string[],
-  _fullDiskAccess: boolean,
+  fullDiskAccess: boolean,
   contextBlock?: string
 ): string {
   const header = [
     "# Codex Local Coder MCP",
     `Default project: ${workspaceRoot}`,
-    "Full machine access: ON. Tag this connector in ChatGPT before every task.",
+    fullDiskAccess
+      ? "Path-aware tool access: full disk. Native shell commands are not OS-sandboxed."
+      : "Path-aware tool access: workspace roots only. Native shell commands are not OS-sandboxed by FULL_DISK_ACCESS.",
+    "Tag this connector in ChatGPT before every task.",
   ].join("\n");
 
   const footer = [
