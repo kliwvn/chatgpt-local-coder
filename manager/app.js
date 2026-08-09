@@ -173,7 +173,10 @@ function renderServerTunnel(s) {
 
 
 /* ---------------- log viewer ---------------- */
-const LOG_MCP_RE = /\[(MCP|TOOL|AUDIT)(?: ERROR)?\]/i;
+// Keep the MCP-only view aligned with the server-side activity taxonomy. A
+// command outcome is still tool activity even though it is deliberately not an
+// MCP transport error.
+const LOG_MCP_RE = /\[(?:MCP|TOOL|AUDIT)(?: ERROR| FAILED)?\]|\[COMMAND (?:FAILED|NO MATCH)\]/i;
 const LOG_STATE = { mode: "all", paused: false, sourceLog: "", lastLog: "", lastSize: 0, lastCount: 0, lastMtime: 0, fetchInFlight: false };
 let instancesFetchInFlight = false;
 
@@ -191,7 +194,7 @@ function renderLogLines(logText) {
     if (LOG_STATE.mode === "mcp" && !isMcp) continue;
     const e = esc(line);
     let cls = "";
-    if (/MCP ERROR|TOOL ERROR|\[err|\[error\]|\[fail\]/i.test(line)) cls = "err";
+    if (/MCP ERROR|TOOL ERROR|TOOL FAILED|COMMAND FAILED|\[err|\[error\]|\[fail\]/i.test(line)) cls = "err";
     else if (isMcp && /\[TOOL\]/.test(line)) cls = "tool";
     else if (isMcp) cls = "mcp";
     else if (/\[HTTP\]/.test(line)) cls = "http";
@@ -206,7 +209,7 @@ function renderLogView() {
   const html = renderLogLines(LOG_STATE.lastLog);
   view.innerHTML = html || '<div class="hint">(không có dòng phù hợp)</div>';
   $("log-meta").textContent = LOG_STATE.lastMtime
-    ? `server.log — ${fmtBytes(LOG_STATE.lastSize)} · ${LOG_STATE.lastCount} dòng (tail) · cập nhật ${new Date(LOG_STATE.lastMtime).toLocaleTimeString("vi-VN")}${LOG_STATE.mode === "mcp" ? " · lọc: chỉ MCP/TOOL" : ""}`
+    ? `server.log — ${fmtBytes(LOG_STATE.lastSize)} · ${LOG_STATE.lastCount} dòng (tail) · cập nhật ${new Date(LOG_STATE.lastMtime).toLocaleTimeString("vi-VN")}${LOG_STATE.mode === "mcp" ? " · lọc: MCP/TOOL/COMMAND" : ""}`
     : "";
   if (atBottom) view.scrollTop = view.scrollHeight;
 }

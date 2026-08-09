@@ -4,21 +4,24 @@
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
-import {
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const root = path.resolve(__dirname, "..");
+const stateDir = path.join(root, ".tool-test-tmp", "shell-persist");
+
+// The state-path module resolves MCP_SHELL_STATE_DIR at import time. Set the
+// test sandbox before importing it so this regression can never write the real
+// repo-level .mcp-state directory.
+process.env.MCP_SHELL_STATE_DIR = stateDir;
+const {
   bootstrapShellSession,
   ensureShellBootstrap,
   execInShellSession,
   flushShellPersistence,
   getShellStatus,
   resetShellSession,
-} from "../dist/lib/persistent-shell.js";
-import { loadGlobalShellState, saveGlobalShellState } from "../dist/lib/global-shell-state.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(__dirname, "..");
-const stateDir = path.join(root, ".tool-test-tmp", "shell-persist");
-
-process.env.MCP_SHELL_STATE_DIR = stateDir;
+} = await import("../dist/lib/persistent-shell.js");
+const { loadGlobalShellState, saveGlobalShellState } = await import("../dist/lib/global-shell-state.js");
 
 let passed = 0;
 let failed = 0;

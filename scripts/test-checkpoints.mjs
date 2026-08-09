@@ -1,22 +1,24 @@
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
-import {
-  checkpointBefore,
-  clearCheckpoints,
-  listCheckpoints,
-  previewRestore,
-  restoreToCheckpoint,
-} from "../dist/lib/checkpoint.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 const tmpDir = path.join(root, ".tool-test-tmp", "checkpoints");
 const storeDir = path.join(tmpDir, "store");
 
+// checkpoint.ts resolves its store path while the module is evaluated. Set the
+// sandbox first; a static import here would silently pollute `.mcp-checkpoints`.
 process.env.CHECKPOINT_PATH = storeDir;
 process.env.CHECKPOINT_ENABLED = "true";
 process.env.CHECKPOINT_MAX_COUNT = "50";
+const {
+  checkpointBefore,
+  clearCheckpoints,
+  listCheckpoints,
+  previewRestore,
+  restoreToCheckpoint,
+} = await import("../dist/lib/checkpoint.js");
 
 let passed = 0;
 let failed = 0;

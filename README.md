@@ -105,7 +105,7 @@ npm start
 | **Cài Đặt** | Kiểm tra Node/TS, `npm install` + `npm run build` một nút — đã cài thì báo "Trạng thái: Đã cài đặt OK" |
 | **Cấu hình workspace** | `WORKSPACE_PATH` + folder picker (chọn thư mục bằng dialog Windows), đổi tên, xóa, profile |
 | **Focus Server / Tunnel** | Start/stop server; **Khởi động lại Gateway** thực hiện graceful restart, **đợi PID cũ thoát hoàn toàn** rồi mới start/xác nhận PID mới, trong khi giữ Tunnel đang chạy; lifecycle server/tunnel được serialize theo workspace để tránh overlap/double-spawn/race |
-| **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear. "Tất cả" = toàn bộ server.log (MCP + TOOL + lỗi); chi tiết tool/audit đầy đủ nằm trong audit file `.mcp-audit.log` |
+| **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear. "Chỉ MCP" gồm MCP/TOOL cùng `COMMAND FAILED` / `COMMAND NO MATCH` theo taxonomy mới; command/tool failure được highlight riêng khỏi transport error. Chi tiết tool/audit đầy đủ nằm trong audit file `.mcp-audit.log` |
 | **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel, **WORKSPACE_PATH đầy đủ**, từng `EXTRA_WORKSPACE_PATHS` trên dòng riêng (không rút gọn/ellipsis), `FULL_DISK_ACCESS`, port + PID |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Focus Tunnel |
 | **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
