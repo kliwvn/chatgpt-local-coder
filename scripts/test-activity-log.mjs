@@ -1,23 +1,62 @@
 import assert from "node:assert/strict";
 import { appendActivity, getRecentActivity, logMcpHttpEvent, logMcpRequest, summarizeToolArgs } from "../dist/lib/activity-log.js";
+import { classifyCommandOutcome, isGitGrepCommand } from "../dist/lib/command-outcome.js";
 
 // summarizeToolArgs
 assert.equal(summarizeToolArgs("run_command", { command: "npm test" }), "npm test");
 assert.equal(summarizeToolArgs("read_text_file", { path: "C:\\foo.ts" }), "C:\\foo.ts");
 
-// console taxonomy: tool/business failures are not MCP transport failures
+// command semantics: git grep exit 1 means no-match; other non-zero exits fail
+assert.equal(isGitGrepCommand('git grep -n -I -E "retry|RETRY" -- src | Select-Object -First 20'), true);
+assert.equal(isGitGrepCommand('git -C "C:\\repo" grep foo -- src'), true);
+assert.equal(isGitGrepCommand("pytest -q"), false);
+assert.equal(classifyCommandOutcome("git grep impossible-pattern -- src", 1, ""), "no_match");
+assert.equal(classifyCommandOutcome("git grep impossible-pattern -- src", 128, "fatal"), "failed");
+assert.equal(classifyCommandOutcome("pytest -q", 1, "1 failed"), "failed");
+
+// console taxonomy: command/business failures are not MCP transport failures
 const warnLines = [];
 const originalWarn = console.warn;
 console.warn = (...args) => warnLines.push(args.join(" "));
 try {
-  appendActivity({ kind: "tool", tool: "run_command", status: "error", summary: "exit 1" });
+  appendActivity({
+    kind: "tool",
+    tool: "run_command",
+    target: "C:\\repo",
+    status: "error",
+    summary: "pytest -q",
+    details: { exit_code: 1, command_outcome: "failed" },
+  });
+  appendActivity({ kind: "tool", tool: "mcp_call", status: "error", summary: "upstream rejected" });
   appendActivity({ kind: "mcp", action: "POST /mcp", status: "error", summary: "transport failed" });
 } finally {
   console.warn = originalWarn;
 }
-assert.match(warnLines[0], /\[TOOL ERROR\]/);
+assert.match(warnLines[0], /\[COMMAND FAILED\]/);
+assert.match(warnLines[0], /exit=1/);
+assert.match(warnLines[0], /cwd=C:\\repo/);
 assert.doesNotMatch(warnLines[0], /\[MCP ERROR\]/);
-assert.match(warnLines[1], /\[MCP ERROR\]/);
+assert.match(warnLines[1], /\[TOOL FAILED\]/);
+assert.match(warnLines[2], /\[MCP ERROR\]/);
+
+const noMatchLines = [];
+const originalNoMatchLog = console.log;
+console.log = (...args) => noMatchLines.push(args.join(" "));
+try {
+  appendActivity({
+    kind: "tool",
+    tool: "run_command",
+    target: "C:\\repo",
+    status: "ok",
+    summary: "git grep impossible-pattern -- src",
+    details: { exit_code: 1, command_outcome: "no_match" },
+  });
+} finally {
+  console.log = originalNoMatchLog;
+}
+assert.equal(noMatchLines.length, 1);
+assert.match(noMatchLines[0], /\[COMMAND NO MATCH\]/);
+assert.match(noMatchLines[0], /exit=1/);
 // successful TOOL entry stays in activity but does not duplicate the MCP console line
 const infoLines = [];
 const originalLog = console.log;

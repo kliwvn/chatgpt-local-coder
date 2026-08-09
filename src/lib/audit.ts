@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { appendActivity } from "./activity-log.js";
+import { appendActivity, summarizeToolArgs } from "./activity-log.js";
 import { redactSensitiveValue } from "./redaction.js";
 import { envBoundedInteger } from "./env-utils.js";
 
@@ -55,13 +55,19 @@ export async function audit(event: AuditEvent): Promise<void> {
   await write.catch(() => undefined); // audit must never break the requested tool call
 
   try {
+    const command =
+      safeEvent.tool === "run_command" && typeof safeEvent.details?.command === "string"
+        ? safeEvent.details.command
+        : undefined;
     appendActivity({
       kind: "tool",
       tool: safeEvent.tool,
       action: safeEvent.action,
       target: safeEvent.target,
       status: safeEvent.status ?? "ok",
-      summary: safeEvent.target || (safeEvent.details ? JSON.stringify(safeEvent.details).slice(0, 120) : undefined),
+      summary: command
+        ? summarizeToolArgs("run_command", { command })
+        : safeEvent.target || (safeEvent.details ? JSON.stringify(safeEvent.details).slice(0, 120) : undefined),
       details: safeEvent.details,
     });
   } catch {}

@@ -100,16 +100,37 @@ function writeConsole(entry: ActivityEntry): void {
   const sid = entry.session_id ? ` session=${entry.session_id.slice(0, 8)}` : "";
   const dur = entry.duration_ms != null ? ` ${entry.duration_ms}ms` : "";
   const isError = entry.status === "error" || entry.status === "blocked";
+  const commandOutcome =
+    entry.tool === "run_command" && typeof entry.details?.command_outcome === "string"
+      ? entry.details.command_outcome
+      : undefined;
+  const exitCode =
+    entry.tool === "run_command" && typeof entry.details?.exit_code === "number"
+      ? entry.details.exit_code
+      : undefined;
+
+  if (entry.kind === "tool" && entry.tool === "run_command" && commandOutcome === "no_match") {
+    const detail = entry.summary || "git grep";
+    const cwd = entry.target ? ` cwd=${entry.target}` : "";
+    const exit = exitCode != null ? ` exit=${exitCode}` : "";
+    console.log(`${ts} [COMMAND NO MATCH] run_command${exit}${cwd} — ${detail}${dur}${sid}`);
+    return;
+  }
 
   if (isError) {
     const label =
       entry.tool ? `tools/call ${entry.tool}` : entry.action || entry.kind || "mcp";
     const detail = entry.summary || entry.target || "";
     const http = entry.details?.http_status != null ? ` HTTP ${entry.details.http_status}` : "";
-    // Tool failures (non-zero command, patch miss, test failure) can happen while
-    // the MCP request itself succeeds with HTTP 200. Keep them distinct from
-    // protocol/transport errors so operators do not chase the wrong subsystem.
-    const errorTag = entry.kind === "tool" ? "TOOL ERROR" : "MCP ERROR";
+    if (entry.kind === "tool" && entry.tool === "run_command") {
+      const cwd = entry.target ? ` cwd=${entry.target}` : "";
+      const exit = exitCode != null ? ` exit=${exitCode}` : "";
+      console.warn(`${ts} [COMMAND FAILED] run_command${exit}${cwd}${detail ? ` — ${detail}` : ""}${dur}${sid}`);
+      return;
+    }
+    // Tool/business failures can happen while the MCP request itself succeeds
+    // with HTTP 200. Keep them distinct from protocol/transport failures.
+    const errorTag = entry.kind === "tool" ? "TOOL FAILED" : "MCP ERROR";
     console.warn(
       `${ts} [${errorTag}]${http} ${label}${detail ? ` — ${detail}` : ""}${dur}${sid}`
     );
@@ -166,16 +187,24 @@ export async function loadAuditHistory(limit = 80): Promise<ActivityEntry[]> {
     return slice.map((line) => {
       try {
         const rec = redactSensitiveValue(JSON.parse(line)) as Record<string, unknown>;
+        const tool = String(rec.tool || "unknown");
+        const details = rec.details as Record<string, unknown> | undefined;
+        const replaySummary =
+          tool === "run_command" && typeof details?.command === "string"
+            ? summarizeToolArgs("run_command", { command: details.command })
+            : rec.target
+              ? String(rec.target)
+              : undefined;
         return {
           id: randomUUID(),
           time: String(rec.time || new Date().toISOString()),
           kind: "tool" as const,
-          tool: String(rec.tool || "unknown"),
+          tool,
           action: String(rec.action || ""),
           target: rec.target ? String(rec.target) : undefined,
           status: rec.status ? String(rec.status) : undefined,
-          details: rec.details as Record<string, unknown> | undefined,
-          summary: rec.target ? String(rec.target) : undefined,
+          details,
+          summary: replaySummary,
         };
       } catch {
         return {

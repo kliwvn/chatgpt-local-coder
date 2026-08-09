@@ -344,6 +344,8 @@ OPENAI_TUNNEL_API_KEY=
 
 > **Foreground shell timeout:** stdout/stderr của `run_command` giữ bounded tail. Khi timeout, process tree bị terminate; caller ưu tiên chờ child `close` nhưng có bounded fallback, nên một OS/process edge không phát `close` cũng không thể giữ Promise của `run_command` vô hạn.
 
+> **Command/error taxonomy:** `run_command` non-zero exit là **command-level outcome**, không phải MCP transport failure. Server log dùng `[COMMAND FAILED] ... exit=<code> cwd=<path>` cho test/build/script fail, `[COMMAND NO MATCH]` cho `git grep` exit `1` (Git định nghĩa là không có match), `[TOOL FAILED]` cho failure cấp tool/upstream, và chỉ dùng `[MCP ERROR]` cho protocol/transport/server request failure. Raw `exit_code` vẫn luôn được giữ trong tool result/audit record; no-match chỉ được normalize semantic thành `command_outcome=no_match` để agent không debug một kết quả tìm kiếm hợp lệ như lỗi hệ thống.
+
 > **Background process lifecycle:** `start_process` dùng registry dùng chung giữa các MCP transport session. Registry giới hạn số process đang chạy, số process-history và log tail trong RAM. Khi Gateway graceful shutdown/restart, Local Coder dừng toàn bộ process tree do `start_process` tạo trước khi thoát để tránh orphan process sau restart.
 
 

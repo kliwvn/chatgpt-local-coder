@@ -5,6 +5,7 @@ import { validatePath } from "../lib/path-security.js";
 import { requireCommandAllowed } from "../lib/permissions.js";
 import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
+import { classifyCommandOutcome } from "../lib/command-outcome.js";
 import { toolResult } from "../lib/tool-result.js";
 import { envBoundedInteger } from "../lib/env-utils.js";
 import {
@@ -188,16 +189,26 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       requireCommandAllowed(command);
       const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
       const result = await execInShellSession(command, defaultCwd, timeoutSec * 1000, cwdOverride);
+      const commandOutcome = classifyCommandOutcome(
+        command,
+        result.exit_code,
+        result.stderr,
+        result.timed_out
+      );
+      const response = { ...result, command_outcome: commandOutcome };
       await audit({
         tool: "run_command",
         action: "command",
         target: result.cwd,
-        status: result.exit_code === 0 ? "ok" : "error",
-        details: { command, exit_code: result.exit_code },
+        status: commandOutcome === "failed" ? "error" : "ok",
+        details: { command, exit_code: result.exit_code, command_outcome: commandOutcome },
       });
-      return toolResult("run_command", result, {
-        ok: result.exit_code === 0,
-        summary: `exit ${result.exit_code} in ${result.cwd}`,
+      return toolResult("run_command", response, {
+        ok: commandOutcome !== "failed",
+        summary:
+          commandOutcome === "no_match"
+            ? `no matches (git grep exit ${result.exit_code}) in ${result.cwd}`
+            : `exit ${result.exit_code} in ${result.cwd}`,
       });
     }
   );
