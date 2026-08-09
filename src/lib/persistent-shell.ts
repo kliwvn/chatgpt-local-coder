@@ -14,14 +14,17 @@ export interface ShellExecResult {
   output_max_chars?: number;
 }
 
-import { loadGlobalShellState, saveGlobalShellState } from "./global-shell-state.js";
+import {
+  loadGlobalShellState,
+  saveGlobalShellSnapshot,
+} from "./global-shell-state.js";
 
 let sessionCwd: string | null = null;
 let sessionInitializedAt: string | null = null;
 let persistenceRoot: string | null = null;
 let bootstrapRoot: string | null = null;
 let bootstrapPromise: Promise<void> | null = null;
-let shellExecChain: Promise<void> = Promise.resolve();
+let shellPersistenceTail: Promise<void> = Promise.resolve();
 const history: string[] = [];
 const MAX_HISTORY = 50;
 
@@ -79,26 +82,23 @@ export function getShellCwd(): string {
 export function resetShellSession(cwd: string): void {
   sessionCwd = path.resolve(cwd);
   sessionInitializedAt = new Date().toISOString();
-  if (persistenceRoot) {
-    void saveGlobalShellState(persistenceRoot, sessionCwd, undefined, null);
-  }
+  scheduleShellSnapshot();
 }
 
-export function resetShellSessionQueued(cwd: string): Promise<void> {
-  const run = shellExecChain.then(
-    async () => {
-      sessionCwd = path.resolve(cwd);
-      sessionInitializedAt = new Date().toISOString();
-      if (persistenceRoot) await saveGlobalShellState(persistenceRoot, sessionCwd!, undefined, null);
-    },
-    async () => {
-      sessionCwd = path.resolve(cwd);
-      sessionInitializedAt = new Date().toISOString();
-      if (persistenceRoot) await saveGlobalShellState(persistenceRoot, sessionCwd!, undefined, null);
-    }
-  );
-  shellExecChain = run.then(() => undefined, () => undefined);
-  return run;
+function scheduleShellSnapshot(): void {
+  if (!persistenceRoot || !sessionCwd) return;
+  const root = persistenceRoot;
+  const cwd = sessionCwd;
+  const recent = [...history];
+  const write = saveGlobalShellSnapshot(root, cwd, recent);
+  shellPersistenceTail = write.then(() => undefined, () => undefined);
+  void write.catch((err) => {
+    console.error("[Shell] Failed to persist shell state:", err instanceof Error ? err.message : String(err));
+  });
+}
+
+export async function flushShellPersistence(): Promise<void> {
+  await shellPersistenceTail;
 }
 
 export function getShellStatus() {
@@ -222,7 +222,7 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
  * giữa các lần gọi. Nếu truyền `workingDirectory`, session sẽ chuyển sang
  * thư mục đó TRƯỚC khi chạy (và giữ nguyên cho lần sau, giống Bash persistent).
  */
-async function execInShellSessionUnlocked(
+export async function execInShellSession(
   command: string,
   defaultCwd: string,
   timeoutMs: number,
@@ -230,42 +230,18 @@ async function execInShellSessionUnlocked(
 ): Promise<ShellExecResult> {
   if (!sessionCwd) initShellSession(defaultCwd);
 
-  if (workingDirectory) {
-    sessionCwd = path.resolve(workingDirectory);
-  }
-
-  const { cwd, command: effective } = applyCwdDirectives(sessionCwd!, command);
+  const baseCwd = workingDirectory ? path.resolve(workingDirectory) : sessionCwd!;
+  const { cwd, command: effective } = applyCwdDirectives(baseCwd, command);
+  // Apply the invocation's cwd synchronously before spawning. A later concurrent
+  // invocation therefore deterministically wins the persistent cwd, regardless
+  // of which child process completes first. This avoids serial head-of-line
+  // blocking (and re-entrant MCP deadlocks) while keeping shell state ordered.
   sessionCwd = cwd;
 
   history.push(effective);
   if (history.length > MAX_HISTORY) history.shift();
+  scheduleShellSnapshot();
 
   const result = await runOnce(effective, cwd, timeoutMs);
-  sessionCwd = cwd;
-
-  if (persistenceRoot) {
-    const prev = await loadGlobalShellState(persistenceRoot, defaultCwd);
-    await saveGlobalShellState(persistenceRoot, cwd, effective, prev);
-  }
-
   return result;
-}
-
-/**
- * The foreground shell has one process-wide cwd/history by design. Serialize
- * commands so concurrent MCP transports cannot make final cwd depend on process
- * completion order. Callers that need real parallelism should use start_process.
- */
-export function execInShellSession(
-  command: string,
-  defaultCwd: string,
-  timeoutMs: number,
-  workingDirectory?: string
-): Promise<ShellExecResult> {
-  const run = shellExecChain.then(
-    () => execInShellSessionUnlocked(command, defaultCwd, timeoutMs, workingDirectory),
-    () => execInShellSessionUnlocked(command, defaultCwd, timeoutMs, workingDirectory)
-  );
-  shellExecChain = run.then(() => undefined, () => undefined);
-  return run;
 }

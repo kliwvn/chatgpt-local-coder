@@ -83,6 +83,27 @@ export async function saveGlobalShellState(
   });
 }
 
+/** Persist an authoritative in-memory shell snapshot in one serialized write. */
+export async function saveGlobalShellSnapshot(
+  workspaceRoot: string,
+  cwd: string,
+  recentCommands: string[]
+): Promise<void> {
+  const file = statePath(workspaceRoot);
+  await enqueueShellStateWrite(file, async () => {
+    // Fail closed if an existing state file suddenly becomes unreadable instead
+    // of silently replacing operator-visible/corrupt state with a new snapshot.
+    await readGlobalShellStateStrict(workspaceRoot);
+    const state: GlobalShellState = {
+      workspace_key: workspaceKey(workspaceRoot),
+      cwd: path.resolve(cwd),
+      updated_at: new Date().toISOString(),
+      recent_commands: recentCommands.slice(-MAX_RECENT),
+    };
+    await atomicWriteFile(file, JSON.stringify(state, null, 2), "utf8");
+  });
+}
+
 export async function restoreShellFromDisk(
   workspaceRoot: string,
   defaultCwd: string

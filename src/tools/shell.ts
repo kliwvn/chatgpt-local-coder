@@ -10,7 +10,7 @@ import { envBoundedInteger } from "../lib/env-utils.js";
 import {
   execInShellSession,
   getShellStatus,
-  resetShellSessionQueued,
+  resetShellSession,
 } from "../lib/persistent-shell.js";
 
 interface ManagedProcess {
@@ -228,7 +228,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     },
     async ({ path: dirPath }) => {
       const cwd = dirPath ? await validatePath(dirPath) : defaultCwd;
-      await resetShellSessionQueued(cwd);
+      resetShellSession(cwd);
       return toolResult("shell_reset", { cwd }, { summary: `shell cwd reset to ${cwd}` });
     }
   );

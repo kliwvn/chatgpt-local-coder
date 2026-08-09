@@ -30,7 +30,7 @@ import {
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
 import { envIntegerOrThrow } from "./lib/env-utils.js";
 import { getManagedProcessStats, shutdownManagedProcesses } from "./tools/shell.js";
-import { ensureShellBootstrap } from "./lib/persistent-shell.js";
+import { ensureShellBootstrap, flushShellPersistence } from "./lib/persistent-shell.js";
 
 const PORT = envIntegerOrThrow("PORT", 3000, 1, 65_535);
 const ADMIN_PORT = envIntegerOrThrow("ADMIN_PORT", 3001, 1, 65_535);
@@ -521,6 +521,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
     ]);
     await sessionManager.shutdown();
     await shutdownManagedProcesses();
+    await flushShellPersistence();
     await upstreamManager.shutdown();
     await httpClose;
     clearTimeout(hardExit);
