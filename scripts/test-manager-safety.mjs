@@ -6,6 +6,15 @@ import os from "node:os";
 import path from "node:path";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
 async function freePort() {
   const server = http.createServer();
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
@@ -190,13 +199,20 @@ try {
   assert.equal(managedRestart.ok, true, `managed restart failed: ${JSON.stringify(managedRestart)}`);
   assert.equal(managedRestart.restarted, true);
   assert.equal(managedRestart.previousPid, managedStart.pid);
+  assert.equal(managedRestart.previousProcessExited, true, "restart must confirm the previous Gateway process exited");
+  assert.equal(pidAlive(managedStart.pid), false, "replacement Gateway must not start while the previous PID is still alive");
   assert.ok(Number.isInteger(managedRestart.pid) && managedRestart.pid !== managedStart.pid, "restart must replace the gateway PID");
   managedRestartPid = managedRestart.pid;
+  await sleep(300);
+  const restartLog = await fs.readFile(path.join(restartDemo, "server.log"), "utf8");
+  assert.doesNotMatch(restartLog, /Graceful shutdown timeout/, "isolated restart must not hit the Gateway hard-exit timeout");
   const restartListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
   assert.equal(restartListing.server.running, true);
   assert.equal(restartListing.server.pid, managedRestart.pid);
   const managedStop = (await post("/api/instances/restart-demo/server/stop")).body;
   assert.equal(managedStop.ok, true, `managed server stop failed: ${JSON.stringify(managedStop)}`);
+  assert.equal(managedStop.processExited, true, "stop must confirm the Gateway PID fully exited");
+  assert.equal(pidAlive(managedRestart.pid), false, "stopped Gateway PID must no longer be alive");
   managedRestartPid = null;
 
   const occupiedCreate = (await post("/api/instances", { name: "occupied", port: createConflictPort, workspacePath: process.cwd() })).body;

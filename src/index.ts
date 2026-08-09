@@ -4,6 +4,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import path from "path";
+import type { Server as HttpServer } from "node:http";
 
 import {
   setDefaultCwd,
@@ -466,6 +467,33 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 });
 
 let shutdownStarted = false;
+
+function closeHttpServerBounded(target: HttpServer, forceAfterMs = 2000, settleAfterMs = 4000): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let forceTimer: ReturnType<typeof setTimeout> | undefined;
+    let settleTimer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (forceTimer) clearTimeout(forceTimer);
+      if (settleTimer) clearTimeout(settleTimer);
+      resolve();
+    };
+
+    // close() stops accepting new connections immediately, but its callback can
+    // otherwise wait forever on stale keep-alive/HTTP requests. Drain idle sockets
+    // first, then force-close remaining connections after the MCP/tool cleanup had
+    // time to settle. The final timer prevents a broken callback from hanging exit.
+    target.close(finish);
+    target.closeIdleConnections?.();
+    forceTimer = setTimeout(() => target.closeAllConnections?.(), forceAfterMs);
+    forceTimer.unref?.();
+    settleTimer = setTimeout(finish, settleAfterMs);
+    settleTimer.unref?.();
+  });
+}
+
 async function gracefulShutdown(signal: string): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
@@ -480,13 +508,16 @@ async function gracefulShutdown(signal: string): Promise<void> {
   hardExit.unref?.();
 
   try {
+    // Stop accepting new HTTP requests before draining state. Manager restart
+    // must wait for this PID to exit (not merely for the listener to disappear).
+    const httpClose = Promise.all([
+      closeHttpServerBounded(adminServer),
+      closeHttpServerBounded(server),
+    ]);
     await sessionManager.shutdown();
     await shutdownManagedProcesses();
     await upstreamManager.shutdown();
-    await Promise.all([
-      new Promise<void>((resolve) => adminServer.close(() => resolve())),
-      new Promise<void>((resolve) => server.close(() => resolve())),
-    ]);
+    await httpClose;
     clearTimeout(hardExit);
     process.exit(0);
   } catch (err) {

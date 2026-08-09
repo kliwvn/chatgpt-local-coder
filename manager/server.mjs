@@ -265,6 +265,17 @@ function killPidTree(pid) {
   }
 }
 
+function isPidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but this account cannot signal it.
+    return err?.code === "EPERM";
+  }
+}
+
 async function waitFor(predicate, timeoutMs, intervalMs = 300) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -687,10 +698,19 @@ async function stopServerUnlocked(name) {
     });
     await response.arrayBuffer().catch(() => undefined);
     if (response.ok) {
-      const graceful = await waitFor(async () => !(await isPortOpen(st.port)), 12000, 150);
+      // server.close() stops listening before all old HTTP connections drain, so
+      // "port closed" is not enough: starting the replacement at that point can
+      // overlap two Gateway generations while the old PID is still cleaning up.
+      // The current runtime bounds HTTP drain to 4s; allow 6s for compatibility,
+      // then fall through to the verified hard-stop path for older/wedged builds.
+      const graceful = await waitFor(
+        async () => !isPidAlive(st.pid) && !(await isPortOpen(st.port)),
+        6000,
+        150
+      );
       if (graceful) {
         await writePidFile(inst.serverPid, null);
-        return { ok: true, port: st.port, stopped: true, graceful: true };
+        return { ok: true, port: st.port, stopped: true, graceful: true, processExited: true };
       }
     }
   } catch {
@@ -703,7 +723,11 @@ async function stopServerUnlocked(name) {
   if (!killed && st.pid) killed = killPidTree(st.pid);
   invalidatePortPidCache();
   await writePidFile(inst.serverPid, null);
-  const stopped = await waitFor(async () => !(await isPortOpen(st.port)), 10000);
+  const stopped = await waitFor(
+    async () => !isPidAlive(st.pid) && !(await isPortOpen(st.port)),
+    5000,
+    150
+  );
   if (!stopped) {
     const current = await serverStatus(name);
     return {
@@ -716,7 +740,7 @@ async function stopServerUnlocked(name) {
       forced: killed,
     };
   }
-  return { ok: true, port: st.port, stopped: true, graceful: false, forced: killed };
+  return { ok: true, port: st.port, stopped: true, graceful: false, forced: killed, processExited: true };
 }
 
 async function startServer(name) {
@@ -759,6 +783,7 @@ async function restartServer(name) {
       restarted: true,
       previousPid: before.pid || null,
       gracefulStop: stopped.graceful === true,
+      previousProcessExited: stopped.processExited === true,
     };
   });
 }
