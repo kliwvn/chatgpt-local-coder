@@ -439,8 +439,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     } catch (err) {
       // createMcpServer/connect fail (or shutdown flips mid-build) trước khi
       // transport được publish → release reservation và dọn dẹp: unregister
-      // khỏi upstream manager, đóng server; chỉ đóng transport nếu server
-      // close fail (fallback) hoặc khi server chưa từng được tạo.
+      // khỏi upstream manager rồi đóng server. `mcpServer.close()` tự close
+      // transport đã connect (Protocol.close → this._transport?.close()), nên
+      // lệnh `transport.close()` tường minh chỉ là fallback khi server.close()
+      // reject, hoặc khi server chưa từng được tạo.
       releaseReservation();
       const failedSid = transport?.sessionId;
       if (failedSid) delete lastTransportErrors[failedSid];

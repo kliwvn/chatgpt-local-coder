@@ -22,7 +22,7 @@
 - **Regression test:** `scripts/test-manager-env-redaction.mjs` (both GET routes masked, sentinel round-trip preserves on-disk secrets), wired into `run-all-tests.mjs`.
 
 ### What changed (4a4537f — build-leak + runner parity)
-- **`buildSession` leak fixed:** `mcpServer` hoisted alongside `transport`; catch unregisters from the upstream manager and closes the server, closing the transport only as a fallback when `server.close()` rejects (or when no server was created). Shutdown-branch callback unregisters before close (idempotent `Set.delete`). Redundant pre-throw `close()` calls removed — the catch is the single cleanup point.
+- **`buildSession` leak fixed:** `mcpServer` hoisted alongside `transport`; catch unregisters from the upstream manager and closes the server — `mcpServer.close()` itself closes the connected transport (Protocol.close → `_transport?.close()`), so the explicit `transport.close()` is only a fallback when `server.close()` rejects (or when no server was created). Shutdown-branch callback unregisters before close (idempotent `Set.delete`). Redundant pre-throw `close()` calls removed — the catch is the single cleanup point.
 - **Test seam:** `SessionManagerConfig.createMcpServerOverride`; `McpUpstreamManager.getRegisteredServerCount()`.
 - **`scripts/test-session-leak.mjs`:** drives the real `createNew` path with a failing `connect()`; asserts the rejection propagates, the singleton count returns to baseline, and `close()` ran exactly once.
 - **Runner parity:** both `npm test` and `run-all-tests.mjs` now run all 12 unit scripts (added `test-mcp-upstream`, `test-manager-log-utils`, `test-manager-env-redaction`, `test-session-leak`).
