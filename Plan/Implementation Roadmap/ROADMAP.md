@@ -27,3 +27,4 @@
 - DELETE/POST stay serialized; SDK `close()` runs after any in-flight POST.
 - Admin `connected` / `connected_sessions` live tracking + UI proxy wiring and auto-refresh (`public/ui/app.js`).
 - TX-02 Fix 1: manager env-injection staleness resolved (manager restart + explicit stop/start); per-instance audit isolation live (`agent_status.audit_log` = instance path); fresh PID 55452; session integration 13/13 + unit suite green; records synced.
+- TX-02 round 2 (SHIPPED `8bb68e2`): cap admission counts published + in-flight (hard reject when in-flight fills cap); over-cap → deliberate HTTP 429 (`SessionCapacityError`); recovery leak closed via `disposePendingSession`; manager `startServer` validates session policy before spawn; `.env.example`/README gain `MCP_SESSION_DELETE_GRACE_MS`; deterministic 429 test + parallel-init cap test with `MCP_MAX_SESSIONS=8`; suite 15/15; records synced (`b8f8f18`).
