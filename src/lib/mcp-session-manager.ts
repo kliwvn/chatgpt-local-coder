@@ -78,6 +78,9 @@ export interface SessionManagerConfig {
   workspaceRoots: string[];
   port: number;
   projectMemoryInstructions?: string;
+  /** Test seam: override server construction (defaults to server-factory's
+   *  createMcpServer). Lets tests inject a failing connect or a shutdown race. */
+  createMcpServerOverride?: typeof createMcpServer;
 }
 
 export interface SessionManager {
@@ -351,7 +354,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     let transport!: StreamableHTTPServerTransport;
     let mcpServer: McpServer | undefined;
     try {
-      mcpServer = await createMcpServer(
+      mcpServer = await (config.createMcpServerOverride ?? createMcpServer)(
         config.workspaceRoot,
         config.shellTimeout,
         config.workspaceRoots,

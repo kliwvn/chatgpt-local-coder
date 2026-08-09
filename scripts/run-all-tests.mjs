@@ -62,6 +62,7 @@ const unitScripts = [
   "scripts/test-audit-path.mjs",
   "scripts/test-manager-log-utils.mjs",
   "scripts/test-manager-env-redaction.mjs",
+  "scripts/test-session-leak.mjs",
   "scripts/test-project-memory.mjs",
   "scripts/test-tool-profile.mjs",
   "scripts/test-shell-persist.mjs",

@@ -79,6 +79,11 @@ export class McpUpstreamManager {
     this.servers.delete(server);
   }
 
+  /** Number of servers currently registered for proxying (test/observability). */
+  getRegisteredServerCount(): number {
+    return this.servers.size;
+  }
+
   getConfig(): UpstreamConfigFile {
     return this.config;
   }
