@@ -297,8 +297,9 @@ async function loadInstances(initial) {
         const ws = i.env.WORKSPACE_PATH || "—";
         const extra = i.env.EXTRA_WORKSPACE_PATHS || "";
         const extraRoots = splitExtraWorkspacePaths(extra);
+        const extraInline = extraRoots.join("; ");
         const extraHtml = extraRoots.length
-          ? `<div class="inst-extra" title="${esc(extraRoots.join("\n"))}"><span class="inst-extra-label">EXTRA:</span>${extraRoots.map((root) => `<span class="inst-extra-path mono">${esc(root)}</span>`).join("")}</div>`
+          ? `<div class="inst-extra" title="${esc(extraInline)}"><span class="inst-extra-label">EXTRA:</span><span class="inst-extra-path mono">${esc(extraInline)}</span></div>`
           : "";
         const access = i.env.FULL_DISK_ACCESS === "true" ? "full path" : "workspace paths";
         const port = i.server.port || i.env.PORT || "—";
