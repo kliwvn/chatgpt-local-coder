@@ -2,7 +2,9 @@ import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { globFiles } from "../dist/lib/glob-search.js";
+import { globToRegExp } from "../dist/lib/glob-match.js";
 import { grepSearch } from "../dist/lib/grep-search.js";
+import { regexLineMatches } from "../dist/lib/regex-guard.js";
 import { applyMultiFilePatch, applyUnifiedPatchToText, isMultiFilePatch } from "../dist/lib/patch.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +59,14 @@ await run("globstar matches root, immediate child, nested, and dotfiles", async 
   if (!env.some((m) => m.path.endsWith(".env"))) throw new Error("glob skipped dotfile");
   const github = await globFiles(dir, ".github/**/*.yml", 10);
   if (!github.some((m) => m.path.endsWith("workflow.yml"))) throw new Error("glob skipped dot-directory");
+});
+
+await run("glob compiler treats regex metacharacters literally", async () => {
+  const literal = globToRegExp("[draft](1)+.txt");
+  if (!literal.test("[draft](1)+.txt")) throw new Error("literal regex metacharacters did not match themselves");
+  if (literal.test("d1.txt")) throw new Error("regex metacharacters leaked into glob semantics");
+  const wildcard = globToRegExp("*.log");
+  if (!wildcard.test("server.log") || wildcard.test("server.log.tmp")) throw new Error("glob wildcard semantics regressed");
 });
 
 await run("grep content mode", async () => {
@@ -126,6 +136,34 @@ await run("grep path glob and multiline count", async () => {
     headLimit: 20,
   });
   if (!hidden.includes(".hidden.tsx")) throw new Error("grep skipped dotfile");
+});
+
+await run("regex timeout is isolated and queued work recovers", async () => {
+  const pathological = regexLineMatches("(a+)+$", "", `${"a".repeat(30000)}!`, 1);
+  const queuedNormal = regexLineMatches("needle", "", "alpha\nneedle\nomega", 2);
+  let timedOut = false;
+  try {
+    await pathological;
+  } catch (err) {
+    timedOut = /timed out/i.test(String(err));
+  }
+  if (!timedOut) throw new Error("pathological regex did not hit the worker timeout");
+  const normal = await queuedNormal;
+  if (normal.count !== 1 || normal.indexes[0] !== 1) {
+    throw new Error(`queued regex did not recover after timeout: ${JSON.stringify(normal)}`);
+  }
+});
+
+await run("grep propagates regex timeout instead of returning false no-match", async () => {
+  const file = path.join(tmpDir, "regex-timeout.txt");
+  await fs.writeFile(file, `${"a".repeat(30000)}!\n`);
+  let timedOut = false;
+  try {
+    await grepSearch({ pattern: "(a+)+$", path: file, glob: "*", headLimit: 10 });
+  } catch (err) {
+    timedOut = /timed out/i.test(String(err));
+  }
+  if (!timedOut) throw new Error("grep swallowed a regex timeout as No matches found");
 });
 
 await run("apply_patch codex style", async () => {

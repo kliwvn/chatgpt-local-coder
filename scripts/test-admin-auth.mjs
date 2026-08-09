@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import fs from "node:fs/promises";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 
 async function freePort() {
@@ -30,6 +32,9 @@ const mcpPort = await freePort();
 const adminPort = await freePort();
 const token = "admin-auth-test-token";
 const root = path.resolve(process.cwd());
+const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-admin-auth-"));
+const oversizedEnvPath = path.join(temp, ".env");
+await fs.writeFile(oversizedEnvPath, "X".repeat(2 * 1024 * 1024 + 1), "utf8");
 const child = spawn(process.execPath, [path.join(root, "dist", "index.js")], {
   cwd: root,
   env: {
@@ -39,6 +44,7 @@ const child = spawn(process.execPath, [path.join(root, "dist", "index.js")], {
     ADMIN_TOKEN: token,
     WORKSPACE_PATH: root,
     CHATGPT_TOOL_PROFILE: "slim",
+    MCP_ENV_FILE: oversizedEnvPath,
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -64,6 +70,12 @@ try {
   const health = await allowed.json();
   assert.equal(health.mcp_port, mcpPort);
 
+  const oversizedEnv = await fetch(`http://127.0.0.1:${adminPort}/api/config/env`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(oversizedEnv.status, 413, "oversized Admin .env should fail bounded instead of being read into memory");
+  assert.match(await oversizedEnv.text(), /Admin \.env exceeds 2097152 bytes/);
+
   const uiJs = await (await fetch(`http://127.0.0.1:${adminPort}/ui/app.js`)).text();
   assert.match(uiJs, /sessionStorage\.setItem\(ADMIN_TOKEN_SESSION_KEY/);
   assert.match(uiJs, /ADMIN_TOKEN_SESSION_KEY_BASE.*API_INSTANCE/s, "proxied multi-instance UI must scope session token by instance");
@@ -85,4 +97,5 @@ try {
     new Promise((resolve) => setTimeout(resolve, 6000)),
   ]);
   if (child.exitCode == null) child.kill();
+  await fs.rm(temp, { recursive: true, force: true });
 }

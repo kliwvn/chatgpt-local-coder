@@ -49,6 +49,16 @@ function decodeUtf8Prefix(buffer: Buffer): string {
   return buffer.toString("utf8");
 }
 
+function decodeUtf8Suffix(buffer: Buffer): string {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  for (let trim = 0; trim <= 3 && trim <= buffer.length; trim++) {
+    try {
+      return decoder.decode(trim === 0 ? buffer : buffer.subarray(trim));
+    } catch {}
+  }
+  return buffer.toString("utf8");
+}
+
 /** Read only the leading bytes needed by metadata/context loaders. */
 export async function readUtf8FilePrefix(
   filePath: string,
@@ -67,6 +77,30 @@ export async function readUtf8FilePrefix(
     return {
       text: decodeUtf8Prefix(prefix),
       truncated: stat.size > maxBytes || bytesRead > maxBytes,
+      sizeBytes: stat.size,
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Read only the trailing bytes needed by recent-history/log consumers. */
+export async function readUtf8FileTail(
+  filePath: string,
+  maxBytes: number
+): Promise<{ text: string; truncated: boolean; sizeBytes: number }> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new Error("maxBytes must be a positive safe integer");
+  const stat = await fs.stat(filePath);
+  if (!stat.isFile()) throw new Error("Path is not a regular file");
+  const length = Math.min(stat.size, maxBytes);
+  const start = Math.max(0, stat.size - length);
+  const handle = await fs.open(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, start);
+    return {
+      text: decodeUtf8Suffix(buffer.subarray(0, bytesRead)),
+      truncated: start > 0,
       sizeBytes: stat.size,
     };
   } finally {

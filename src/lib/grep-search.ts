@@ -3,6 +3,7 @@ import path from "path";
 import { READ_TEXT_MAX_BYTES } from "./output-budget.js";
 import { readUtf8FileBounded } from "./bounded-file.js";
 import { globToRegExp, matchesCompiledGlob } from "./glob-match.js";
+import { regexLineMatches, regexMultilineCount } from "./regex-guard.js";
 
 export type GrepOutputMode = "content" | "files_with_matches" | "count";
 
@@ -23,9 +24,41 @@ function shouldSkipDir(name: string): boolean {
   return name === "node_modules" || name === ".git";
 }
 
-function buildRegex(pattern: string, caseInsensitive: boolean, multiline: boolean): RegExp {
-  const flags = `${caseInsensitive ? "i" : ""}${multiline ? "gm" : ""}`;
-  return new RegExp(pattern, flags || undefined);
+function plainRegexLiteral(pattern: string): string | null {
+  if (!pattern || /[\\^$.*+?()[\]{}|]/.test(pattern)) return null;
+  return pattern;
+}
+
+function literalLineMatches(
+  literal: string,
+  text: string,
+  caseInsensitive: boolean,
+  maxIndexes: number
+): { count: number; indexes: number[] } {
+  const needle = caseInsensitive ? literal.toLowerCase() : literal;
+  const indexes: number[] = [];
+  let count = 0;
+  const lines = text.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const haystack = caseInsensitive ? lines[i].toLowerCase() : lines[i];
+    if (!haystack.includes(needle)) continue;
+    count++;
+    if (indexes.length < maxIndexes) indexes.push(i);
+  }
+  return { count, indexes };
+}
+
+function countLiteralMatches(literal: string, text: string, caseInsensitive: boolean): number {
+  const needle = caseInsensitive ? literal.toLowerCase() : literal;
+  const haystack = caseInsensitive ? text.toLowerCase() : text;
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const index = haystack.indexOf(needle, offset);
+    if (index < 0) return count;
+    count++;
+    offset = index + needle.length;
+  }
 }
 
 export async function grepSearch(options: GrepOptions): Promise<string> {
@@ -44,7 +77,8 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
 
   const before = contextAround || contextBefore;
   const after = contextAround || contextAfter;
-  const regex = buildRegex(pattern, caseInsensitive, multiline);
+  const regexFlags = `${caseInsensitive ? "i" : ""}${multiline ? "gm" : ""}`;
+  const literalPattern = plainRegexLiteral(pattern);
   const fileMatches = new Map<string, number>();
   const contentLines: string[] = [];
   let totalMatches = 0;
@@ -63,9 +97,9 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
     }
 
     if (multiline) {
-      // multiline regex carries `g`, so count reflects every match in a file.
-      const matches = text.match(regex);
-      const count = matches?.length || 0;
+      const count = literalPattern !== null
+        ? countLiteralMatches(literalPattern, text, caseInsensitive)
+        : await regexMultilineCount(pattern, regexFlags, text);
       if (count > 0) {
         totalMatches += count;
         fileMatches.set(fullPath, (fileMatches.get(fullPath) || 0) + count);
@@ -76,14 +110,17 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
       return;
     }
 
-    const lines = text.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      if (!regex.test(lines[i])) continue;
+    const maxIndexes = outputMode === "content" ? headLimit : 0;
+    const { count, indexes } = literalPattern !== null
+      ? literalLineMatches(literalPattern, text, caseInsensitive, maxIndexes)
+      : await regexLineMatches(pattern, regexFlags, text, maxIndexes);
+    if (count === 0) return;
+    totalMatches += count;
+    fileMatches.set(fullPath, (fileMatches.get(fullPath) || 0) + count);
 
-      totalMatches++;
-      fileMatches.set(fullPath, (fileMatches.get(fullPath) || 0) + 1);
-
-      if (outputMode === "content") {
+    if (outputMode === "content") {
+      const lines = text.split("\n");
+      for (const i of indexes) {
         if (contentLines.length >= headLimit) break;
         if (before > 0 || after > 0) {
           const start = Math.max(0, i - before);
@@ -138,16 +175,17 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
     }
   }
 
+  let rootStat;
   try {
-    const rootStat = await fs.stat(searchRoot);
-    if (rootStat.isFile()) {
-      const basename = path.basename(searchRoot);
-      await processFile(searchRoot, basename, basename);
-    } else if (rootStat.isDirectory()) {
-      await walk(searchRoot);
-    }
+    rootStat = await fs.stat(searchRoot);
   } catch {
     return "No matches found";
+  }
+  if (rootStat.isFile()) {
+    const basename = path.basename(searchRoot);
+    await processFile(searchRoot, basename, basename);
+  } else if (rootStat.isDirectory()) {
+    await walk(searchRoot);
   }
 
   if (outputMode === "files_with_matches") {

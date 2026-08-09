@@ -4,6 +4,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { atomicWriteFile } from "./atomic-write.js";
 import { withFileMutations } from "./file-mutation.js";
 import { envBoundedInteger } from "./env-utils.js";
+import { readUtf8FileBounded } from "./bounded-file.js";
 
 export interface CheckpointFileSnapshot {
   path: string;
@@ -46,6 +47,8 @@ const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 const DEFAULT_MAX_NODES = 10_000;
 const MAX_DIRECTORY_DEPTH = 32;
+const CHECKPOINT_INDEX_MAX_BYTES = 32 * 1024 * 1024;
+const CHECKPOINT_MANIFEST_MAX_BYTES = 64 * 1024 * 1024;
 
 let checkpointMutationChain: Promise<void> = Promise.resolve();
 
@@ -111,7 +114,7 @@ function isUtf8(buffer: Buffer): boolean {
 
 async function readIndex(): Promise<CheckpointIndex> {
   try {
-    const raw = await fs.readFile(indexPath(), "utf-8");
+    const raw = await readUtf8FileBounded(indexPath(), CHECKPOINT_INDEX_MAX_BYTES, "checkpoint index");
     const parsed = JSON.parse(raw) as CheckpointIndex;
     if (parsed.version === INDEX_VERSION && Array.isArray(parsed.checkpoints)) {
       return parsed;
@@ -125,12 +128,17 @@ async function readIndex(): Promise<CheckpointIndex> {
 async function writeIndex(index: CheckpointIndex): Promise<void> {
   const root = getStoreRoot();
   await fs.mkdir(root, { recursive: true });
-  await atomicWriteFile(indexPath(), JSON.stringify(index, null, 2), "utf8");
+  const serialized = JSON.stringify(index, null, 2);
+  const bytes = Buffer.byteLength(serialized, "utf8");
+  if (bytes > CHECKPOINT_INDEX_MAX_BYTES) {
+    throw new Error(`checkpoint index exceeds ${CHECKPOINT_INDEX_MAX_BYTES} bytes (${bytes})`);
+  }
+  await atomicWriteFile(indexPath(), serialized, "utf8");
 }
 
 async function readManifest(id: string): Promise<CheckpointManifest | null> {
   try {
-    const raw = await fs.readFile(manifestPath(id), "utf-8");
+    const raw = await readUtf8FileBounded(manifestPath(id), CHECKPOINT_MANIFEST_MAX_BYTES, "checkpoint manifest");
     return JSON.parse(raw) as CheckpointManifest;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -349,6 +357,8 @@ export function getCheckpointConfig(): Record<string, unknown> {
     max_file_bytes: getMaxFileBytes(),
     max_total_bytes: getMaxTotalBytes(),
     max_nodes: getMaxNodes(),
+    index_max_bytes: CHECKPOINT_INDEX_MAX_BYTES,
+    manifest_max_bytes: CHECKPOINT_MANIFEST_MAX_BYTES,
     note: "Only file-editing MCP tools are tracked. Shell/bash file changes are not captured.",
   };
 }
@@ -391,12 +401,23 @@ async function checkpointBeforeUnlocked(
 
   const dir = checkpointDir(id);
   await fs.mkdir(dir, { recursive: true });
-  await atomicWriteFile(manifestPath(id), JSON.stringify(manifest, null, 2), "utf8");
+  const serializedManifest = JSON.stringify(manifest, null, 2);
+  const manifestBytes = Buffer.byteLength(serializedManifest, "utf8");
+  if (manifestBytes > CHECKPOINT_MANIFEST_MAX_BYTES) {
+    await removeCheckpointData(id).catch(() => undefined);
+    throw new Error(`checkpoint manifest exceeds ${CHECKPOINT_MANIFEST_MAX_BYTES} bytes (${manifestBytes})`);
+  }
+  await atomicWriteFile(manifestPath(id), serializedManifest, "utf8");
 
-  const index = await readIndex();
-  index.checkpoints.push(buildSummary(manifest));
-  const pruned = await pruneCheckpoints(index);
-  await writeIndex(pruned);
+  try {
+    const index = await readIndex();
+    index.checkpoints.push(buildSummary(manifest));
+    const pruned = await pruneCheckpoints(index);
+    await writeIndex(pruned);
+  } catch (err) {
+    await removeCheckpointData(id).catch(() => undefined);
+    throw err;
+  }
 
   return id;
 }

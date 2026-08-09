@@ -248,6 +248,27 @@ await run("parse and import cursor mcp config", async () => {
   }
 });
 
+await run("jsonc comments do not corrupt comment-like text inside strings", async () => {
+  const fixturePath = path.join(tmpDir, "cursor-jsonc-string-fixture.json");
+  const literal = "literal // keep /* block-like text */";
+  const jsonc = `{
+    // real line comment
+    "mcpServers": {
+      "jsonc-string-safe": {
+        "url": "http://127.0.0.1:3100/mcp/*literal-path*/",
+        "headers": { "X-Literal": "${literal}" }
+      }
+    }
+    /* real block comment */
+  }`;
+  await fs.writeFile(fixturePath, jsonc, "utf8");
+  const result = await importCursorMcpConfig(fixturePath, { merge: true });
+  const server = result.config.servers.find((entry) => entry.id === "jsonc-string-safe");
+  assert.ok(server, "JSONC fixture server was not imported");
+  assert.equal(server.url, "http://127.0.0.1:3100/mcp/*literal-path*/");
+  assert.equal(server.headers?.["X-Literal"], literal);
+});
+
 const httpPort = 3901 + Math.floor(Math.random() * 200);
 const mockHttp = spawnMockHttp(httpPort);
 try {

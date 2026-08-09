@@ -12,6 +12,7 @@ import {
   getShellStatus,
   resetShellSession,
 } from "../dist/lib/persistent-shell.js";
+import { loadGlobalShellState, saveGlobalShellState } from "../dist/lib/global-shell-state.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -104,6 +105,16 @@ try {
   }
   await flushShellPersistence();
   ok("shell reset remains authoritative over earlier in-flight command");
+
+  await saveGlobalShellState(root, root, "x".repeat(100_000));
+  const boundedState = await loadGlobalShellState(root, root);
+  const persistedCommand = boundedState?.recent_commands.at(-1) ?? "";
+  if (persistedCommand.length > 4096 || !persistedCommand.startsWith("…")) {
+    throw new Error(`persistent shell history was not bounded: ${persistedCommand.length}`);
+  }
+  const persistedStat = await fs.stat(stateFile);
+  if (persistedStat.size > 256 * 1024) throw new Error(`shell state file exceeded hard cap: ${persistedStat.size}`);
+  ok("persistent shell state bounds long commands and disk state");
 } catch (e) {
   fail("shell persist", e.message || e);
 }

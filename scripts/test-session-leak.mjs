@@ -87,6 +87,52 @@ async function main() {
   if (!timedOut || elapsed > 2000) fail("recovery loopback is bounded", `timedOut=${timedOut} elapsed=${elapsed}ms`);
   else ok("recovery loopback is bounded");
 
+  // A local wrong process can return headers and then stream forever. Recovery
+  // does not need the response body, so it must stop draining after a small cap
+  // instead of waiting for the global request timeout or allocating indefinitely.
+  const streamingSockets = new Set();
+  const streamingServer = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "fixture-session" });
+    res.write(Buffer.alloc(96 * 1024, 0x61));
+    // Deliberately do not end the response.
+  });
+  streamingServer.on("connection", (socket) => {
+    streamingSockets.add(socket);
+    socket.on("close", () => streamingSockets.delete(socket));
+  });
+  await new Promise((resolve, reject) => {
+    streamingServer.once("error", reject);
+    streamingServer.listen(0, "127.0.0.1", resolve);
+  });
+  const streamingPort = streamingServer.address().port;
+  const streamingStarted = Date.now();
+  let streamingResult = null;
+  let streamingError = null;
+  try {
+    streamingResult = await loopbackMcpPost(
+      streamingPort,
+      "/mcp",
+      { jsonrpc: "2.0", id: 2, method: "initialize", params: {} },
+      undefined,
+      undefined,
+      1500
+    );
+  } catch (err) {
+    streamingError = err;
+  } finally {
+    for (const socket of streamingSockets) socket.destroy();
+    await new Promise((resolve) => streamingServer.close(resolve));
+  }
+  const streamingElapsed = Date.now() - streamingStarted;
+  if (streamingError || !streamingResult?.ok || streamingElapsed >= 1200) {
+    fail(
+      "recovery loopback stops draining oversized streaming bodies",
+      `error=${String(streamingError || "")} status=${streamingResult?.status ?? "none"} elapsed=${streamingElapsed}ms`
+    );
+  } else {
+    ok("recovery loopback stops draining oversized streaming bodies");
+  }
+
   const baseline = getUpstreamManager().getRegisteredServerCount();
   const fake = fakeMcpServer(true);
   const upstreamManager = getUpstreamManager();

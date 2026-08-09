@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import fs from "fs/promises";
 import { getAuditPath } from "./audit.js";
 import { redactSensitiveText, redactSensitiveValue } from "./redaction.js";
 import { envBoundedInteger } from "./env-utils.js";
+import { readUtf8FileTail } from "./bounded-file.js";
 
 export function formatLogTime(d: Date | string = new Date()): string {
   const dt = typeof d === "string" ? new Date(d) : d;
@@ -33,6 +33,7 @@ export interface ActivityEntry {
 // (e.g. -1) or disabled trimming via NaN. Keep the in-memory feed bounded even
 // when .env was edited outside the Manager validation path.
 const MAX_ENTRIES = envBoundedInteger("ACTIVITY_LOG_MAX", 500, 1, 100_000);
+const AUDIT_HISTORY_READ_MAX_BYTES = 2 * 1024 * 1024;
 const entries: ActivityEntry[] = [];
 const listeners = new Set<(entry: ActivityEntry) => void>();
 
@@ -156,8 +157,11 @@ function writeConsole(entry: ActivityEntry): void {
 export async function loadAuditHistory(limit = 80): Promise<ActivityEntry[]> {
   const auditPath = getAuditPath();
   try {
-    const raw = await fs.readFile(auditPath, "utf-8");
-    const lines = raw.trim().split("\n").filter(Boolean);
+    const tail = await readUtf8FileTail(auditPath, AUDIT_HISTORY_READ_MAX_BYTES);
+    let lines = tail.text.trim().split("\n").filter(Boolean);
+    // A tail read can begin in the middle of a JSONL record. Drop that partial
+    // record instead of surfacing a misleading synthetic parse-error entry.
+    if (tail.truncated && lines.length > 0) lines = lines.slice(1);
     const slice = lines.slice(-limit);
     return slice.map((line) => {
       try {

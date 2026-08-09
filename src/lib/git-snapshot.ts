@@ -1,27 +1,84 @@
 import { spawn } from "child_process";
 import os from "os";
+import { appendBoundedHead, appendBoundedTail } from "./output-budget.js";
+
+const GIT_SNAPSHOT_TIMEOUT_MS = 5_000;
+const GIT_SNAPSHOT_STDOUT_MAX_CHARS = 32_768;
+const GIT_SNAPSHOT_STDERR_MAX_CHARS = 16_384;
 
 interface GitRunResult {
   stdout: string;
   stderr: string;
   exit_code: number;
+  timed_out: boolean;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
 }
 
 function runGit(args: string[], cwd: string): Promise<GitRunResult> {
   const { promise, resolve } = Promise.withResolvers<GitRunResult>();
-  const child = spawn("git", args, { cwd, windowsHide: true });
+  const child = spawn("git", args, {
+    cwd,
+    windowsHide: true,
+    detached: process.platform !== "win32",
+  });
   let stdout = "";
   let stderr = "";
+  let stdoutTruncated = false;
+  let stderrTruncated = false;
   let settled = false;
+  let timedOut = false;
+  let forceSettleTimer: NodeJS.Timeout | null = null;
   const settle = (fn: () => void) => {
     if (settled) return;
     settled = true;
+    clearTimeout(timer);
+    if (forceSettleTimer) clearTimeout(forceSettleTimer);
     fn();
   };
-  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-  child.on("close", (code) => settle(() => resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 })));
-  child.on("error", () => settle(() => resolve({ stdout: "", stderr: "git not found", exit_code: 127 })));
+  const result = (code: number): GitRunResult => ({
+    stdout: stdout.trim(),
+    stderr: stderr.trim(),
+    exit_code: code,
+    timed_out: timedOut,
+    stdout_truncated: stdoutTruncated,
+    stderr_truncated: stderrTruncated,
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    if (process.platform === "win32" && child.pid) {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+      killer.unref();
+    } else if (child.pid) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    } else {
+      child.kill("SIGKILL");
+    }
+    forceSettleTimer = setTimeout(() => settle(() => resolve(result(124))), 1_000);
+    forceSettleTimer.unref?.();
+  }, GIT_SNAPSHOT_TIMEOUT_MS);
+  timer.unref?.();
+
+  child.stdout.on("data", (d: Buffer) => {
+    const next = appendBoundedHead(stdout, d.toString(), GIT_SNAPSHOT_STDOUT_MAX_CHARS, stdoutTruncated);
+    stdout = next.text;
+    stdoutTruncated = next.truncated;
+  });
+  child.stderr.on("data", (d: Buffer) => {
+    const next = appendBoundedTail(stderr, d.toString(), GIT_SNAPSHOT_STDERR_MAX_CHARS, stderrTruncated);
+    stderr = next.text;
+    stderrTruncated = next.truncated;
+  });
+  child.on("close", (code) => settle(() => resolve(result(timedOut ? 124 : (code ?? 1)))));
+  child.on("error", () => settle(() => resolve({
+    ...result(127),
+    stdout: "",
+    stderr: "git not found",
+  })));
   return promise;
 }
 
@@ -36,7 +93,12 @@ export interface GitSnapshot {
 export async function collectGitSnapshot(cwd: string): Promise<GitSnapshot> {
   const root = await runGit(["rev-parse", "--show-toplevel"], cwd);
   if (root.exit_code !== 0) {
-    return { is_repo: false, error: root.stderr || "not a git repository" };
+    return {
+      is_repo: false,
+      error: root.timed_out
+        ? `git repository probe timed out after ${GIT_SNAPSHOT_TIMEOUT_MS}ms`
+        : root.stderr || "not a git repository",
+    };
   }
 
   const [branch, status, log] = await Promise.all([
@@ -47,9 +109,13 @@ export async function collectGitSnapshot(cwd: string): Promise<GitSnapshot> {
 
   return {
     is_repo: true,
-    branch: branch.stdout || "(detached)",
-    status_short: status.stdout.slice(0, 1200),
-    recent_commits: log.stdout ? log.stdout.split("\n").filter(Boolean) : [],
+    branch: branch.timed_out ? "(git branch probe timed out)" : branch.stdout || "(detached)",
+    status_short: status.timed_out
+      ? `[git status timed out after ${GIT_SNAPSHOT_TIMEOUT_MS}ms]${status.stdout ? `\n${status.stdout.slice(0, 1100)}` : ""}`
+      : `${status.stdout.slice(0, 1200)}${status.stdout_truncated ? "\n… [git status output truncated]" : ""}`,
+    recent_commits: log.timed_out
+      ? [`[git log timed out after ${GIT_SNAPSHOT_TIMEOUT_MS}ms]`]
+      : log.stdout ? log.stdout.split("\n").filter(Boolean) : [],
   };
 }
 

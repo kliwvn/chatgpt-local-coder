@@ -30,7 +30,12 @@ import {
   atomicWriteFile,
   enqueueKeyedMutation,
   pruneExpiredCache,
+  readUtf8FileBounded,
+  readResponseTextBounded,
   retryTransientFsMutation,
+  appendBoundedTail,
+  extractSingleZipEntryBoundedWindows,
+  streamResponseToFileBounded,
 } from "./fs-utils.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -51,6 +56,14 @@ const INSTANCES_DIR = path.resolve(
   process.env.MANAGER_INSTANCES_DIR || path.join(__dirname, "instances")
 );
 const INSTANCE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+const MANAGER_ENV_MAX_BYTES = 2 * 1024 * 1024;
+const MANAGER_JSON_MAX_BYTES = 2 * 1024 * 1024;
+const MANAGER_PID_MAX_BYTES = 128;
+const INSTALL_OUTPUT_MAX_CHARS = 6000;
+const INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
+const DOWNLOAD_MAX_BYTES = 128 * 1024 * 1024;
+const HELPER_OUTPUT_MAX_CHARS = 16 * 1024;
+const MAX_MANAGED_INSTANCES = 256;
 const IS_WIN = process.platform === "win32";
 const REPO_ROOT = ROOT; // thư mục repo (manager.bat nằm ở đây)
 const MANAGER_BAT = path.join(ROOT, "manager.bat");
@@ -143,7 +156,12 @@ function listeningPortPids() {
   if (Date.now() - portPidCache.at < PORT_PID_CACHE_TTL_MS) return portPidCache.pids;
   const pids = new Map();
   try {
-    const out = spawnSync("netstat", ["-ano", "-p", "tcp"], { encoding: "utf8", windowsHide: true }).stdout || "";
+    const out = spawnSync("netstat", ["-ano", "-p", "tcp"], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 3000,
+      maxBuffer: 2 * 1024 * 1024,
+    }).stdout || "";
     for (const line of out.split(/\r?\n/)) {
       const m = /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i.exec(line);
       if (!m) continue;
@@ -163,8 +181,9 @@ function pidOnPort(port) {
  * MANAGER_PORT và migrate sang instance "default" lần đầu. */
 async function readEnvRaw() {
   try {
-    return await fsp.readFile(ENV_PATH, "utf-8");
-  } catch {
+    return await readUtf8FileBounded(ENV_PATH, MANAGER_ENV_MAX_BYTES, "manager .env");
+  } catch (err) {
+    if (err?.code !== "ENOENT") throw err;
     return "";
   }
 }
@@ -185,14 +204,21 @@ async function ensureStateDirs() {
 
 async function readJson(p, fallback) {
   try {
-    return JSON.parse(await fsp.readFile(p, "utf-8"));
-  } catch {
+    return JSON.parse(await readUtf8FileBounded(p, MANAGER_JSON_MAX_BYTES, "manager state JSON"));
+  } catch (err) {
+    if (err?.code === "ENOENT") return fallback;
+    if (/manager state JSON exceeds/i.test(String(err?.message || err))) throw err;
     return fallback;
   }
 }
 
 async function writeJson(p, data) {
-  await atomicWriteFile(p, JSON.stringify(data, null, 2), "utf8");
+  const serialized = JSON.stringify(data, null, 2);
+  const bytes = Buffer.byteLength(serialized, "utf8");
+  if (bytes > MANAGER_JSON_MAX_BYTES) {
+    throw new Error(`manager state JSON exceeds ${MANAGER_JSON_MAX_BYTES} bytes (${bytes} bytes): ${p}`);
+  }
+  await atomicWriteFile(p, serialized, "utf8");
 }
 
 const fileMutationChains = new Map();
@@ -214,7 +240,7 @@ async function readConfig() {
 
 async function readPidFile(p) {
   try {
-    const pid = Number((await fsp.readFile(p, "utf-8")).trim());
+    const pid = Number((await readUtf8FileBounded(p, MANAGER_PID_MAX_BYTES, "manager PID file")).trim());
     return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
@@ -256,7 +282,12 @@ function killPidTree(pid) {
   if (!pid || pid === process.pid) return false;
   try {
     const args = IS_WIN ? ["/PID", String(pid), "/T", "/F"] : ["-9", String(pid)];
-    const res = spawnSync(IS_WIN ? "taskkill" : "kill", args, { encoding: "utf8", windowsHide: true });
+    const res = spawnSync(IS_WIN ? "taskkill" : "kill", args, {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5000,
+      maxBuffer: 256 * 1024,
+    });
     return res.status === 0;
   } catch {
     return false;
@@ -348,22 +379,29 @@ function instPaths(name) {
 
 async function listInstances() {
   try {
-    const names = (await fsp.readdir(INSTANCES_DIR, { withFileTypes: true }))
-      .filter((e) => e.isDirectory())
-      .map((e) => e.name)
-      .filter((n) => INSTANCE_NAME_RE.test(n))
-      .sort();
+    const names = [];
+    const dir = await fsp.opendir(INSTANCES_DIR);
+    for await (const entry of dir) {
+      if (!entry.isDirectory() || !INSTANCE_NAME_RE.test(entry.name)) continue;
+      names.push(entry.name);
+      if (names.length > MAX_MANAGED_INSTANCES) {
+        throw new Error(`Managed instances exceed hard cap ${MAX_MANAGED_INSTANCES}`);
+      }
+    }
+    names.sort();
     return names;
-  } catch {
+  } catch (err) {
+    if (err?.code !== "ENOENT") throw err;
     return [];
   }
 }
 
 async function readInstanceEnvRaw(name) {
   try {
-    return await fsp.readFile(instPaths(name).env, "utf-8");
-  } catch {
-    return "";
+    return await readUtf8FileBounded(instPaths(name).env, MANAGER_ENV_MAX_BYTES, "instance .env");
+  } catch (err) {
+    if (err?.code === "ENOENT") return "";
+    throw err;
   }
 }
 
@@ -481,7 +519,12 @@ function pidsWithCmdLine(imageName, substring) {
       "-Command",
       `Get-CimInstance Win32_Process -Filter "Name='${imageName}'" | Where-Object { $_.CommandLine -like '*${needle}*' } | Select-Object -ExpandProperty ProcessId`,
     ];
-    const out = spawnSync("powershell.exe", ps, { encoding: "utf8", windowsHide: true, timeout: 15000 }).stdout || "";
+    const out = spawnSync("powershell.exe", ps, {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 15000,
+      maxBuffer: 512 * 1024,
+    }).stdout || "";
     pids = out
       .split(/\r?\n/)
       .map((l) => Number(l.trim()))
@@ -497,7 +540,7 @@ async function serverHealth(port) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2500) });
     if (!res.ok) return null;
-    return await res.json();
+    return JSON.parse(await readResponseTextBounded(res, 512 * 1024, "server health response"));
   } catch {
     return null;
   }
@@ -525,7 +568,9 @@ async function tunnelClientHealth(port) {
     if (!res.ok) return false;
     const type = String(res.headers.get("content-type") || "").toLowerCase();
     if (!type.includes("text/html")) return false;
-    return /<title>\s*tunnel-client\s*<\/title>/i.test(await res.text());
+    return /<title>\s*tunnel-client\s*<\/title>/i.test(
+      await readResponseTextBounded(res, 64 * 1024, "tunnel health response")
+    );
   } catch { return false; }
 }
 
@@ -541,11 +586,25 @@ async function runInstall() {
       const child = IS_WIN
         ? spawn("cmd.exe", ["/c", "npm.cmd", ...args], { cwd: ROOT, windowsHide: true })
         : spawn(NPM_CMD, args, { cwd: ROOT, windowsHide: true });
-      child.on("error", (err) => resolve({ code: -1, out: "spawn lỗi: " + err.message }));
+      let settled = false;
       let out = "";
-      child.stdout.on("data", (d) => (out += d));
-      child.stderr.on("data", (d) => (out += d));
-      child.on("close", (code) => resolve({ code, out: out.slice(-6000) }));
+      let timer = null;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(value);
+      };
+      child.stdout.on("data", (d) => (out = appendBoundedTail(out, d, INSTALL_OUTPUT_MAX_CHARS)));
+      child.stderr.on("data", (d) => (out = appendBoundedTail(out, d, INSTALL_OUTPUT_MAX_CHARS)));
+      child.on("error", (err) => finish({ code: -1, out: appendBoundedTail(out, `\nspawn lỗi: ${err.message}`, INSTALL_OUTPUT_MAX_CHARS) }));
+      child.on("close", (code) => finish({ code, out }));
+      timer = setTimeout(() => {
+        out = appendBoundedTail(out, `\n[timeout after ${INSTALL_TIMEOUT_MS}ms]`, INSTALL_OUTPUT_MAX_CHARS);
+        if (child.pid) killPidTree(child.pid);
+        finish({ code: 124, out });
+      }, INSTALL_TIMEOUT_MS);
+      timer.unref?.();
     });
     log.push({ step: `npm ${args.join(" ")}`, code: res.code, output: res.out });
     if (res.code !== 0) break;
@@ -595,6 +654,7 @@ async function warmUpMcp(port) {
     });
     if (!res.ok) return false;
     const sid = res.headers.get("mcp-session-id");
+    await res.body?.cancel().catch(() => undefined);
     if (sid) {
       await fetch(url, {
         method: "POST",
@@ -605,12 +665,12 @@ async function warmUpMcp(port) {
         },
         body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
         signal: AbortSignal.timeout(10000),
-      }).then((r) => r.arrayBuffer()).catch(() => {});
+      }).then((r) => r.body?.cancel()).catch(() => {});
       await fetch(url, {
         method: "DELETE",
         headers: { "Mcp-Session-Id": sid },
         signal: AbortSignal.timeout(10000),
-      }).then((r) => r.arrayBuffer()).catch(() => {});
+      }).then((r) => r.body?.cancel()).catch(() => {});
     }
     return true;
   } catch {
@@ -696,7 +756,7 @@ async function stopServerUnlocked(name) {
       headers,
       signal: AbortSignal.timeout(2500),
     });
-    await response.arrayBuffer().catch(() => undefined);
+    await response.body?.cancel().catch(() => undefined);
     if (response.ok) {
       // server.close() stops listening before all old HTTP connections drain, so
       // "port closed" is not enough: starting the replacement at that point can
@@ -820,33 +880,19 @@ async function ensureTunnelClient() {
   const tmpZip = path.join(binDir, "tunnel-client.zip");
   try {
     await fsp.mkdir(binDir, { recursive: true });
+    await fsp.rm(tmpZip, { force: true }).catch(() => undefined);
     const res = await fetch(OPENAI_TUNNEL_ZIP_URL, { signal: AbortSignal.timeout(240000), redirect: "follow" });
     if (!res.ok) return { ok: false, error: `Tải tunnel-client thất bại: HTTP ${res.status}` };
-    await fsp.writeFile(tmpZip, Buffer.from(await res.arrayBuffer()));
-    const viaTar = spawnSync("tar", ["-xf", tmpZip, "-C", binDir], { windowsHide: true });
-    if (viaTar.status !== 0) {
-      const viaPs = spawnSync(
-        "powershell.exe",
-        ["-NoProfile", "-Command", `Expand-Archive -Path '${tmpZip}' -DestinationPath '${binDir}' -Force`],
-        { windowsHide: true }
-      );
-      if (viaPs.status !== 0) return { ok: false, error: "Giải nén tunnel-client thất bại." };
-    }
-    const found = (function walk(dir) {
-      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-        const p = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          const r = walk(p);
-          if (r) return r;
-        } else if (entry.name.toLowerCase() === "tunnel-client.exe") {
-          return p;
-        }
-      }
-      return null;
-    })(binDir);
-    if (!found) return { ok: false, error: "Không tìm thấy tunnel-client.exe trong gói tải về." };
-    if (path.resolve(found) !== path.resolve(exe)) {
-      await fsp.rename(found, exe);
+    await streamResponseToFileBounded(res, tmpZip, DOWNLOAD_MAX_BYTES, "tunnel-client download");
+    extractSingleZipEntryBoundedWindows(
+      tmpZip,
+      exe,
+      "tunnel-client.exe",
+      DOWNLOAD_MAX_BYTES,
+      { timeoutMs: 120000, maxBuffer: HELPER_OUTPUT_MAX_CHARS }
+    );
+    if (!fs.existsSync(exe)) {
+      return { ok: false, error: "Giải nén tunnel-client thất bại: không tạo được tunnel-client.exe." };
     }
     return { ok: true, path: exe };
   } catch (err) {
@@ -1012,9 +1058,8 @@ async function downloadCloudflared() {
   if (fs.existsSync(CLOUDFLARED)) return { ok: true, alreadyExists: true };
   const res = await fetch(CLOUDFLARED_DOWNLOAD_URL, { signal: AbortSignal.timeout(120000) });
   if (!res.ok) return { ok: false, error: `Tải thất bại: HTTP ${res.status}` };
-  const buf = Buffer.from(await res.arrayBuffer());
-  await atomicWriteFile(CLOUDFLARED, buf);
-  return { ok: true, bytes: buf.length };
+  const bytes = await streamResponseToFileBounded(res, CLOUDFLARED, DOWNLOAD_MAX_BYTES, "cloudflared download");
+  return { ok: true, bytes };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1033,6 +1078,8 @@ async function ensureFolderPicker() {
     const res = spawnSync(CSC_PATH, ["/nologo", "/target:exe", `/out:${FOLDER_PICKER_EXE}`, FOLDER_PICKER_CS], {
       encoding: "utf8",
       windowsHide: true,
+      timeout: 30000,
+      maxBuffer: HELPER_OUTPUT_MAX_CHARS,
     });
     if (res.status !== 0 || !fs.existsSync(FOLDER_PICKER_EXE)) {
       return { ok: false, error: "Compile folder-picker thất bại: " + (res.stderr || res.stdout || "").trim().slice(-200) };
@@ -1061,21 +1108,25 @@ async function pickFolder(initialDir = "") {
       });
       let stdout = "";
       let stderr = "";
-      child.stdout.on("data", (d) => (stdout += d));
-      child.stderr.on("data", (d) => (stderr += d));
+      let settled = false;
+      child.stdout.on("data", (d) => (stdout = appendBoundedTail(stdout, d, HELPER_OUTPUT_MAX_CHARS)));
+      child.stderr.on("data", (d) => (stderr = appendBoundedTail(stderr, d, HELPER_OUTPUT_MAX_CHARS)));
+      const finish = (value, rejectError = null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (rejectError) reject(rejectError);
+        else resolve(value);
+      };
       const timer = setTimeout(() => {
-        try {
-          child.kill();
-        } catch {}
-        resolve({ status: -1, stdout, stderr });
+        if (child.pid) killPidTree(child.pid);
+        finish({ status: -1, stdout, stderr: appendBoundedTail(stderr, "\n[folder-picker timeout]", HELPER_OUTPUT_MAX_CHARS) });
       }, 180000);
       child.on("error", (e) => {
-        clearTimeout(timer);
-        reject(e);
+        finish(null, e);
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
-        resolve({ status: code, stdout, stderr });
+        finish({ status: code, stdout, stderr });
       });
     });
     const picked = (res.stdout || "").trim();
@@ -1145,8 +1196,9 @@ async function ensureSessionPolicyDefaults(name) {
       const next = serializeDotEnv({ ...env, ...updates }, raw);
       await atomicWriteFile(file, next, "utf8");
       return { changed: true, updates };
-    } catch {
-      return { changed: false };
+    } catch (err) {
+      if (err?.code === "ENOENT") return { changed: false };
+      throw err;
     }
   });
 }
@@ -1370,8 +1422,12 @@ async function createInstance(body) {
   if (!INSTANCE_NAME_RE.test(name)) {
     return { ok: false, error: "Tên instance: 2–32 ký tự, chỉ chữ thường/số/gạch ngang, bắt đầu bằng chữ hoặc số." };
   }
-  if ((await listInstances()).includes(name)) {
+  const existingInstances = await listInstances();
+  if (existingInstances.includes(name)) {
     return { ok: false, error: `Instance '${name}' đã tồn tại.` };
+  }
+  if (existingInstances.length >= MAX_MANAGED_INSTANCES) {
+    return { ok: false, error: `Đã đạt giới hạn ${MAX_MANAGED_INSTANCES} managed instances.` };
   }
   const used = await allUsedPorts();
   used.add(managerPortNum);
@@ -1990,7 +2046,12 @@ async function handleApi(req, res, url, body) {
           ].join("\n");
           const vbsPath = path.join(STATE_DIR, "make-startup-lnk.vbs");
           await fsp.writeFile(vbsPath, vbs, "utf8");
-          const r = spawnSync("cscript", ["//nologo", "//B", vbsPath], { encoding: "utf8", windowsHide: true });
+          const r = spawnSync("cscript", ["//nologo", "//B", vbsPath], {
+            encoding: "utf8",
+            windowsHide: true,
+            timeout: 30000,
+            maxBuffer: HELPER_OUTPUT_MAX_CHARS,
+          });
           if (r.status !== 0) {
             return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: " + (r.stderr || r.stdout || "").trim().slice(-200) });
           }

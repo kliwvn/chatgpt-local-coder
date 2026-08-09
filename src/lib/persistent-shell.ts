@@ -170,11 +170,13 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
   let stderrTruncated = false;
   let timedOut = false;
   let settled = false;
+  let forceSettleTimer: ReturnType<typeof setTimeout> | undefined;
 
   const settle = (fn: () => void) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
+    if (forceSettleTimer) clearTimeout(forceSettleTimer);
     fn();
   };
 
@@ -182,11 +184,22 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     timedOut = true;
     // Giết cả process tree — child process con (npm test, node script) không bị bỏ lại
     if (process.platform === "win32" && child.pid) {
-      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true });
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      killer.unref();
     } else {
       child.kill("SIGKILL");
     }
+    // Usually the child emits close promptly after tree-kill. Bound the rare OS
+    // edge where it never does so a timed-out run_command cannot hang forever.
+    forceSettleTimer = setTimeout(() => {
+      settle(() => reject(new Error(`Command timed out after ${timeoutMs / 1000}s`)));
+    }, 1500);
+    forceSettleTimer.unref?.();
   }, timeoutMs);
+  timer.unref?.();
 
   child.stdout.on("data", (d: string) => {
     const next = appendBoundedTail(stdout, d, SHELL_OUTPUT_MAX_CHARS, stdoutTruncated);

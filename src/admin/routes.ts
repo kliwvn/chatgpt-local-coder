@@ -1,4 +1,3 @@
-import fs from "fs/promises";
 import path from "path";
 import { Router, type Request, type Response } from "express";
 import type { McpUpstreamManager } from "../lib/mcp-upstream-manager.js";
@@ -15,7 +14,7 @@ import {
 import { getDefaultCwd, getFullDiskAccess } from "../lib/path-security.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
 import { atomicWriteFile } from "../lib/atomic-write.js";
-import { readUtf8FileIfExists } from "../lib/optional-file.js";
+import { readUtf8FileBounded } from "../lib/bounded-file.js";
 import {
   getRecentActivity,
   loadAuditHistory,
@@ -26,6 +25,7 @@ import {
 const SECRET_KEY_PATTERN =
   /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
 const REDACTED_MASK = "********";
+const ADMIN_ENV_MAX_BYTES = 2 * 1024 * 1024;
 
 const NUMERIC_ENV_LIMITS: Record<string, [number, number]> = {
   PORT: [1, 65_535],
@@ -292,7 +292,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 
   router.get("/api/config/env", async (_req, res) => {
     try {
-      const text = await fs.readFile(envPath, "utf-8");
+      const text = await readUtf8FileBounded(envPath, ADMIN_ENV_MAX_BYTES, "Admin .env");
       const values = parseDotEnv(text);
       const masked: Record<string, string> = {};
       for (const [key, value] of Object.entries(values)) {
@@ -304,7 +304,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         res.json({ ok: true, path: envPath, values: {} });
         return;
       }
-      res.status(500).json({ ok: false, error: String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(/Admin \.env exceeds/i.test(message) ? 413 : 500).json({ ok: false, error: message });
     }
   });
 
@@ -327,7 +328,12 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         for (const [key, value] of Object.entries(values)) {
           if (value !== REDACTED_MASK) filtered[key] = value;
         }
-        const original = (await readUtf8FileIfExists(envPath)) ?? "";
+        let original = "";
+        try {
+          original = await readUtf8FileBounded(envPath, ADMIN_ENV_MAX_BYTES, "Admin .env");
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
         const next = serializeDotEnv(filtered, original);
         const validationError = validateAdminEnv(next);
         if (validationError) return { ok: false as const, error: validationError };
@@ -343,7 +349,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       // require one clean restart instead of mixing old/new process state.
       res.json({ ok: true, path: envPath, restart_required: true });
     } catch (err) {
-      res.status(500).json({ ok: false, error: String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      res.status(/Admin \.env exceeds/i.test(message) ? 413 : 500).json({ ok: false, error: message });
     }
   });
 
@@ -568,18 +575,42 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.flushHeaders?.();
+
+    let blocked = false;
+    let pendingEntry: ActivityEntry | null = null;
     const send = (entry: ActivityEntry) => {
-      res.write(`data: ${JSON.stringify(sanitizeActivityEntry(entry))}\n\n`);
+      if (res.writableEnded || res.destroyed) return;
+      if (blocked) {
+        // Bound slow-client memory: coalesce to the newest activity event while
+        // Node's response buffer is full instead of accumulating every event.
+        pendingEntry = entry;
+        return;
+      }
+      blocked = !res.write(`data: ${JSON.stringify(sanitizeActivityEntry(entry))}\n\n`);
     };
+
+    const onDrain = () => {
+      blocked = false;
+      const pending = pendingEntry;
+      pendingEntry = null;
+      if (pending) send(pending);
+    };
+    res.on("drain", onDrain);
 
     for (const entry of getRecentActivity(30).reverse()) send(entry);
 
     const unsub = subscribeActivity(send);
-    const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+    const ping = setInterval(() => {
+      if (!blocked && !res.writableEnded && !res.destroyed) {
+        blocked = !res.write(": ping\n\n");
+      }
+    }, 25000);
 
     req.on("close", () => {
       unsub();
       clearInterval(ping);
+      pendingEntry = null;
+      res.off("drain", onDrain);
     });
   });
 

@@ -13,7 +13,7 @@ process.env.EDIT_TEXT_MAX_BYTES = "65536";
 const { toolResult } = await import("../dist/lib/tool-result.js");
 const { execInShellSession, initShellSession } = await import("../dist/lib/persistent-shell.js");
 const { registerFilesystemTools } = await import("../dist/tools/filesystem.js");
-const { readUtf8FilePrefix } = await import("../dist/lib/bounded-file.js");
+const { readUtf8FilePrefix, readUtf8FileTail } = await import("../dist/lib/bounded-file.js");
 
 const mediumText = "m".repeat(64 * 1024);
 const medium = toolResult("medium", { output: mediumText });
@@ -36,6 +36,14 @@ assert.equal(shell.stdout_truncated, true);
 assert.equal(shell.stderr_truncated, true);
 assert.ok(shell.stdout.length <= 4096);
 assert.ok(shell.stderr.length <= 4096);
+
+const timeoutStarted = Date.now();
+await assert.rejects(
+  () => execInShellSession(process.platform === "win32" ? "Start-Sleep -Seconds 5" : "sleep 5", process.cwd(), 100),
+  /Command timed out after/,
+  "persistent shell timeout did not reject"
+);
+assert.ok(Date.now() - timeoutStarted < 2500, "persistent shell timeout waited indefinitely for child close");
 
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-output-budget-"));
 try {
@@ -103,6 +111,11 @@ try {
   assert.equal(utf8Prefix.truncated, true);
   assert.equal(utf8Prefix.text.includes("\uFFFD"), false, "UTF-8 prefix ended on an invalid code-point boundary");
   assert.equal(utf8Prefix.text, "abc", `unexpected UTF-8-safe prefix: ${JSON.stringify(utf8Prefix.text)}`);
+
+  const utf8Tail = await readUtf8FileTail(utf8File, 5);
+  assert.equal(utf8Tail.truncated, true);
+  assert.equal(utf8Tail.text.includes("\uFFFD"), false, "UTF-8 tail began on an invalid code-point boundary");
+  assert.equal(utf8Tail.text, "def", `unexpected UTF-8-safe tail: ${JSON.stringify(utf8Tail.text)}`);
 } finally {
   await fs.rm(temp, { recursive: true, force: true });
 }

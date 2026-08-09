@@ -212,7 +212,60 @@ const HTTP_TYPES = new Set(["http", "streamable-http", "sse", "remote"]);
 const STDIO_TYPES = new Set(["stdio", "local"]);
 
 function stripJsonComments(text: string): string {
-  return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|\s)\/\/.*$/gm, "$1");
+  let output = "";
+  let inString = false;
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (lineComment) {
+      if (ch === "\n") {
+        lineComment = false;
+        output += ch;
+      } else {
+        output += " ";
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (ch === "*" && next === "/") {
+        output += "  ";
+        i++;
+        blockComment = false;
+      } else {
+        output += ch === "\n" || ch === "\r" ? ch : " ";
+      }
+      continue;
+    }
+    if (inString) {
+      output += ch;
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      output += ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      output += "  ";
+      i++;
+      lineComment = true;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      output += "  ";
+      i++;
+      blockComment = true;
+      continue;
+    }
+    output += ch;
+  }
+  return output;
 }
 
 function parseJsonc(text: string): unknown {

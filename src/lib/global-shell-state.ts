@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import path from "path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { enqueueKeyedMutation } from "./keyed-mutation.js";
-import { readUtf8FileIfExists } from "./optional-file.js";
+import { readUtf8FileBounded } from "./bounded-file.js";
 
 export interface GlobalShellState {
   workspace_key: string;
@@ -18,6 +18,8 @@ function stateDir(): string {
 }
 
 const MAX_RECENT = 20;
+const MAX_RECENT_COMMAND_CHARS = 4_096;
+const SHELL_STATE_MAX_BYTES = 256 * 1024;
 
 const shellStateWriteChains = new Map<string, Promise<void>>();
 
@@ -34,11 +36,38 @@ function statePath(workspaceRoot: string): string {
 }
 
 async function readGlobalShellStateStrict(workspaceRoot: string): Promise<GlobalShellState | null> {
-  const raw = await readUtf8FileIfExists(statePath(workspaceRoot));
-  if (raw === null) return null;
+  const file = statePath(workspaceRoot);
+  let raw: string;
+  try {
+    raw = await readUtf8FileBounded(file, SHELL_STATE_MAX_BYTES, "shell state");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
   const parsed = JSON.parse(raw) as GlobalShellState;
-  if (!parsed.cwd) return null;
-  return parsed;
+  if (!parsed || typeof parsed !== "object" || typeof parsed.cwd !== "string") return null;
+  const recent = Array.isArray(parsed.recent_commands)
+    ? parsed.recent_commands
+        .filter((entry): entry is string => typeof entry === "string")
+        .slice(-MAX_RECENT)
+        .map((entry) => entry.slice(-MAX_RECENT_COMMAND_CHARS))
+    : [];
+  return { ...parsed, recent_commands: recent };
+}
+
+function boundedRecentCommand(command: string): string {
+  return command.length <= MAX_RECENT_COMMAND_CHARS
+    ? command
+    : `…${command.slice(-(MAX_RECENT_COMMAND_CHARS - 1))}`;
+}
+
+function serializeShellState(state: GlobalShellState): string {
+  const serialized = JSON.stringify(state, null, 2);
+  const bytes = Buffer.byteLength(serialized, "utf8");
+  if (bytes > SHELL_STATE_MAX_BYTES) {
+    throw new Error(`shell state exceeds ${SHELL_STATE_MAX_BYTES} bytes (${bytes})`);
+  }
+  return serialized;
 }
 
 export async function loadGlobalShellState(
@@ -68,7 +97,7 @@ export async function saveGlobalShellState(
     const base = latest ?? previous ?? null;
     const recent = [...(base?.recent_commands ?? [])];
     if (command) {
-      recent.push(command);
+      recent.push(boundedRecentCommand(command));
       while (recent.length > MAX_RECENT) recent.shift();
     }
 
@@ -79,7 +108,7 @@ export async function saveGlobalShellState(
       recent_commands: recent,
     };
 
-    await atomicWriteFile(file, JSON.stringify(state, null, 2), "utf8");
+    await atomicWriteFile(file, serializeShellState(state), "utf8");
   });
 }
 
@@ -98,9 +127,9 @@ export async function saveGlobalShellSnapshot(
       workspace_key: workspaceKey(workspaceRoot),
       cwd: path.resolve(cwd),
       updated_at: new Date().toISOString(),
-      recent_commands: recentCommands.slice(-MAX_RECENT),
+      recent_commands: recentCommands.slice(-MAX_RECENT).map(boundedRecentCommand),
     };
-    await atomicWriteFile(file, JSON.stringify(state, null, 2), "utf8");
+    await atomicWriteFile(file, serializeShellState(state), "utf8");
   });
 }
 

@@ -18,6 +18,7 @@ import { withFileMutation, withFileMutations } from "../lib/file-mutation.js";
 import { EDIT_TEXT_MAX_BYTES, READ_BASE64_MAX_BYTES, READ_TEXT_MAX_BYTES } from "../lib/output-budget.js";
 import { readUtf8FileBounded } from "../lib/bounded-file.js";
 import { globToRegExp, matchesCompiledGlob } from "../lib/glob-match.js";
+import { regexLineMatches, regexReplace } from "../lib/regex-guard.js";
 
 const MAX_PARTIAL_TEXT_LINES = 100_000;
 const TAIL_READ_CHUNK_BYTES = 64 * 1024;
@@ -163,7 +164,7 @@ async function readTextTail(filePath: string, lineCount: number): Promise<string
 async function searchDirectory(
   rootDir: string,
   dir: string,
-  regex: RegExp,
+  pattern: string,
   globMatcher: RegExp,
   results: string[],
   maxResults: number
@@ -178,23 +179,36 @@ async function searchDirectory(
       if (entry.isSymbolicLink()) continue;
 
       if (entry.isDirectory()) {
-        await searchDirectory(rootDir, fullPath, regex, globMatcher, results, maxResults);
+        await searchDirectory(rootDir, fullPath, pattern, globMatcher, results, maxResults);
         continue;
       }
 
       const rel = path.relative(rootDir, fullPath).replace(/\\/g, "/");
       if (!matchesCompiledGlob(globMatcher, rel, entry.name)) continue;
+      let content: string;
       try {
         const stat = await fs.stat(fullPath);
         if (!stat.isFile() || stat.size > READ_TEXT_MAX_BYTES) continue;
-        const content = await readUtf8FileBounded(fullPath, READ_TEXT_MAX_BYTES, "search file");
-        const lines = content.split("\n");
-        lines.forEach((line, idx) => {
-          if (results.length < maxResults && regex.test(line)) {
-            results.push(`${fullPath}:${idx + 1}: ${line.trim()}`);
-          }
-        });
-      } catch {}
+        content = await readUtf8FileBounded(fullPath, READ_TEXT_MAX_BYTES, "search file");
+      } catch {
+        continue;
+      }
+      const remaining = maxResults - results.length;
+      const plainLiteral = pattern && !/[\\^$.*+?()[\]{}|]/.test(pattern) ? pattern.toLowerCase() : null;
+      let indexes: number[];
+      const lines = content.split("\n");
+      if (plainLiteral !== null) {
+        indexes = [];
+        for (let idx = 0; idx < lines.length && indexes.length < remaining; idx++) {
+          if (lines[idx].toLowerCase().includes(plainLiteral)) indexes.push(idx);
+        }
+      } else {
+        ({ indexes } = await regexLineMatches(pattern, "i", content, remaining));
+      }
+      for (const idx of indexes) {
+        if (results.length >= maxResults) break;
+        results.push(`${fullPath}:${idx + 1}: ${lines[idx].trim()}`);
+      }
     }
   } finally {
     await handle.close().catch((err: NodeJS.ErrnoException) => {
@@ -480,8 +494,7 @@ export function registerFilesystemTools(server: McpServer): void {
       const validPath = await validatePath(filePath);
       return withFileMutation(validPath, async () => {
         const original = await readUtf8FileBounded(validPath, EDIT_TEXT_MAX_BYTES, "editable text file (EDIT_TEXT_MAX_BYTES)");
-        const regex = new RegExp(pattern, flags);
-        const next = original.replace(regex, replacement);
+        const next = await regexReplace(pattern, flags, original, replacement, EDIT_TEXT_MAX_BYTES);
         if (next === original) throw new Error("Regex made no changes.");
         assertEditableResultSize(next, "Regex edit");
         const diff = buildSimpleDiff(original, next);
@@ -573,9 +586,7 @@ export function registerFilesystemTools(server: McpServer): void {
     },
     async ({ path: dirPath, ignore }) => {
       const validPath = await validatePath(dirPath);
-      const ignoreMatchers = (ignore || []).map(
-        (p) => new RegExp("^" + p.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i")
-      );
+      const ignoreMatchers = (ignore || []).map((p) => globToRegExp(p));
       const items: Array<{ name: string; type: "directory" | "file" }> = [];
       let truncated = false;
       const dir = await fs.opendir(validPath);
@@ -846,7 +857,7 @@ export function registerFilesystemTools(server: McpServer): void {
   server.registerTool("search_files", { title: "Search Files", description: "Search file contents for a text pattern.", inputSchema: { path: z.string(), pattern: z.string(), glob: z.string().optional().default("*"), max_results: z.number().int().positive().max(500).optional().default(50) }, annotations: toolAnnotations("read") }, async ({ path: searchPath, pattern, glob: globPattern, max_results }) => {
     const validPath = await validatePath(searchPath);
     const results: string[] = [];
-    await searchDirectory(validPath, validPath, new RegExp(pattern, "i"), globToRegExp(globPattern), results, max_results);
+    await searchDirectory(validPath, validPath, pattern, globToRegExp(globPattern), results, max_results);
     await audit({ tool: "search_files", action: "search", target: validPath, status: "ok", details: { pattern, results: results.length } });
     return toolResult("search_files", { path: validPath, pattern, matches: results, count: results.length });
   });

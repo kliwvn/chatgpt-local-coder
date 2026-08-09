@@ -40,6 +40,7 @@ if (SESSION_CLEANUP_INTERVAL_MS > SESSION_TTL_MS) {
 // shutdown deadline so one wedged SDK transport cannot stall all sessions.
 const SESSION_RESOURCE_CLOSE_TIMEOUT_MS = 2000;
 const RECOVERY_LOOPBACK_TIMEOUT_MS = 5000;
+const RECOVERY_LOOPBACK_RESPONSE_MAX_BYTES = 64 * 1024;
 
 const lastTransportErrors: Record<string, string> = {};
 const sessionOpChains = new Map<string, Promise<void>>();
@@ -158,9 +159,18 @@ export async function loopbackMcpPost(
       status: response.status,
       sessionId: response.headers.get("mcp-session-id") ?? undefined,
     };
-    // Drain the local response before returning so undici can release/reuse the
-    // socket instead of leaving recovery warm-up bodies pending in the pool.
-    await response.arrayBuffer();
+    // Drain only a bounded amount. A wrong local process or an unexpectedly
+    // streaming MCP response must not make recovery allocate/wait without bound.
+    if (response.body) {
+      let received = 0;
+      for await (const chunk of response.body) {
+        received += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk);
+        if (received > RECOVERY_LOOPBACK_RESPONSE_MAX_BYTES) {
+          await response.body.cancel().catch(() => undefined);
+          break;
+        }
+      }
+    }
     return result;
   } catch (err) {
     if (controller.signal.aborted) {
