@@ -210,15 +210,16 @@ app.get("/health", (_req, res) => {
   });
 });
 
-// This local MCP endpoint intentionally has no OAuth/DCR metadata. tunnel-client's
-// built-in sample_mcp_remote_no_auth treats 404 on all protected-resource metadata
-// candidates as the supported no-auth path. Keep the 404 body empty: advertising a
-// syntactically valid PRMD document here would incorrectly opt the server into OAuth.
+// This local MCP endpoint intentionally has no OAuth/DCR metadata. tunnel-client
+// v0.0.10 requires a non-empty 404 body to reach its fallback-to-next-candidate
+// branch; an empty 404 returns early and makes /readyz fail. Keep the body JSON but
+// deliberately invalid as PRMD so both 404 candidates are attempted and the client
+// classifies the result as its supported optional/no-auth discovery failure.
 app.get("/.well-known/oauth-protected-resource", (_req, res) => {
-  res.status(404).end();
+  res.status(404).json({ error: "not_found" });
 });
 app.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => {
-  res.status(404).end();
+  res.status(404).json({ error: "not_found" });
 });
 
 async function handleMcpPost(req: express.Request, res: express.Response): Promise<void> {
