@@ -1,5 +1,28 @@
 # CONTEXT_LOG — chatgpt-local-coder
 
+
+
+## TX-2026-08-09-03-R3 — round 3 audit: secret masking, activity redaction, session build leaks, runner parity (SHIPPED `5521ceb` + `4a4537f`)
+
+### Why
+Round 3 asked: audit thoroughly, fix every logic/perf/optimization gap, eliminate drift, ship. Three reviewer reports (core-server, manager/UI, scripts/harness) were collected and triaged against the actual code before any change.
+
+### Key decisions
+- **Manager env leak = generic sentinel round-trip, not tunnel-key special-casing.** `SECRET_KEY_RE` masks every secret key on the wire (covers `ADMIN_TOKEN`); `saveInstanceEnv` restores every `KEY=********` line from the original parsed `.env` on both raw and values paths. Raw editor stays power-user but is populated from masked values.
+- **Upstream masking covers EVERY response path** (GET/PUT/POST/DELETE/imports) with one helper + sentinel-merge on write — `updateConfig`/`upsertServer` REPLACE (no internal merge), so an echoed sentinel would otherwise persist as the real secret.
+- **Activity redaction at the API boundary** (JSON/history/SSE uniformly), not only at write time; audit FILE stays raw by design (local disk).
+- **Hoist with definite-assignment assertion** (`let transport!: …`, `let mcpServer: McpServer | undefined`) over `| undefined` (7 TS closure errors) and over reverting (catch needs `transport?.sessionId`). Shutdown-branch callback unregisters before close (idempotent `Set.delete`).
+- **Test seam for the leak:** `SessionManagerConfig.createMcpServerOverride` + `McpUpstreamManager.getRegisteredServerCount()` — the regression drives the REAL `createNew` path (real upstream singleton) with a failing `connect()`, asserting unregister + close. Not a mocked-unit fake.
+- **Runner parity:** `npm test` and `run-all-tests.mjs` both run all 12 unit scripts (was drifted: `test:all` lacked `test-mcp-upstream`/`test-manager-log-utils`; `npm test` lacked `test-manager-env-redaction`).
+- **False-green exit: NOT modified** (advisory-corrected) — `run-all-tests.mjs` has only `finally`, no `catch`; a failing unit already propagates nonzero exit.
+
+### Evidence
+- `npm run build` → tsc clean; `node --check` clean on all changed JS.
+- `set -o pipefail; node scripts/run-all-tests.mjs` → **ALL TESTS PASSED**, `SUITE_EXIT=0` (12 unit + 15 integration).
+- Leak test standalone: `3 passed, 0 failed`.
+- Live post-restart: instance **2640** (:3000/:3001, health ok), manager **31400** (:3300). Env endpoint masks tunnel key `{set,last4}` + `ADMIN_TOKEN` sentinel, 0 plaintext `sk-`; activity JSON metadata-only.
+- Commits `5521ceb` + `4a4537f` on `main`, pushed `a20a865..4a4537f` to `origin/main`.
+
 ## TX-2026-08-09-03 — cap-race fix, 429 mapping, manager start validation (SHIPPED `8bb68e2`)
 
 ### Why

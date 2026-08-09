@@ -1,5 +1,39 @@
 # PROGRESS — chatgpt-local-coder
 
+
+
+## TX-2026-08-09-03-R3 — round 3 audit: secret masking, activity redaction, session build leaks, test-runner drift
+
+### Status: SHIPPED — committed `5521ceb` + `4a4537f` on `main`, pushed to `origin/main`
+
+### Findings triaged (reviewer reports)
+- **REAL (fixed):** manager env endpoints returned plaintext `.env` to the browser (`OPENAI_TUNNEL_API_KEY`, `ADMIN_TOKEN`); upstream-config API echoed header/env secrets; activity feed shipped raw `details` (tool arguments/commands) at the API boundary; `buildSession` leaked `McpServer` + upstream registration when `connect()` failed; shutdown-branch callback closed without unregistering; test runners omitted real scripts (`test:all` lacked `test-mcp-upstream`/`test-manager-log-utils`; `npm test` lacked `test-manager-env-redaction`).
+- **SKIP (by design/localhost trust, documented):** per-poll `spawnSync`, audit-file raw command lines, tunnel.log rotation, adminAuth non-constant-time + `0.0.0.0`/`::` acceptance, manager zero-auth, DELETE-grace log volume, audit fs-write batching.
+- **FALSE POSITIVES (advisory-corrected):** "false-green exit" — `run-all-tests.mjs` has only `finally`, no `catch`; failures already exit nonzero. Do not modify.
+
+### What changed (5521ceb)
+- **Manager env leak closed:** GET `/api/instances/:name/env` + legacy `/api/env` return masked values only (`SECRET_KEY_RE` + sentinel `********`; tunnel key keeps `{set,last4}`). `saveInstanceEnv` restores every sentinel from the original `.env` on both raw and values paths. Raw editor (`manager/app.js`) is populated from masked values, never plaintext.
+- **Admin routes:** `SENSITIVE_HEADER_NAMES`/`isSensitiveHeader`/`maskUpstreamConfig`/`restoreUpstreamSecrets` inside `createAdminRouter`; every `/api/upstream` response (GET/PUT/POST/DELETE/imports) masked; write paths restore sentinels before `updateConfig`/`upsertServer` (both REPLACE).
+- **Activity-feed redaction at API boundary:** `/api/activity`, `/api/activity/history`, `/api/activity/stream` — metadata-only `details` (`{redacted:true}`/`{exit_code}`) + sanitized `summary` for tool entries; audit FILE stays raw by design.
+- **DELETE-grace re-init (index.ts):** an initialize during DELETE grace disposes the closing session first instead of routing to the closed SDK transport (was HTTP 400 for the whole grace window).
+- **clientInfo sanitization:** control chars stripped, name truncated to 120 / version 60, fallback `unknown` (log-injection defense).
+- **`isSessionConnected` restored** to the `SessionManager` interface; `lastTransportErrors` cleanup in `buildSession` catch.
+- **Docs drift:** `.env.example`/README add `WORKSPACE_PATHS`/`ALLOWED_WORKSPACE_PATHS`/`ACTIVITY_LOG_MAX`.
+- **Regression test:** `scripts/test-manager-env-redaction.mjs` (both GET routes masked, sentinel round-trip preserves on-disk secrets), wired into `run-all-tests.mjs`.
+
+### What changed (4a4537f — build-leak + runner parity)
+- **`buildSession` leak fixed:** `mcpServer` hoisted alongside `transport`; catch closes server+transport AND unregisters from the upstream manager. Shutdown-branch callback unregisters before close (idempotent `Set.delete`).
+- **Test seam:** `SessionManagerConfig.createMcpServerOverride`; `McpUpstreamManager.getRegisteredServerCount()`.
+- **`scripts/test-session-leak.mjs`:** drives the real `createNew` path with a failing `connect()`; asserts the rejection propagates, the singleton count returns to baseline, and `close()` ran exactly once.
+- **Runner parity:** both `npm test` and `run-all-tests.mjs` now run all 12 unit scripts (added `test-mcp-upstream`, `test-manager-log-utils`, `test-manager-env-redaction`, `test-session-leak`).
+
+### Evidence
+- `npm run build` → tsc clean.
+- `set -o pipefail; node scripts/run-all-tests.mjs` → **ALL TESTS PASSED**, `SUITE_EXIT=0` (12 unit scripts + 15 integration).
+- Leak test standalone: `3 passed, 0 failed`.
+- `node --check manager/server.mjs` / `manager/app.js` / `scripts/test-session-leak.mjs` → clean.
+- Live (post-restart): instance PID **2640** on :3000/:3001 (health `ok`), manager PID **31400** on :3300. Env endpoint: tunnel key `{set:true,last4:"JesA"}`, `ADMIN_TOKEN` sentinel, 0 plaintext `sk-`; activity JSON metadata-only.
+
 ## TX-2026-08-09-02 — session churn / performance / context-quality audit
 
 ### Status: SHIPPED — committed `8bb68e2` on `main`, pushed to `origin/main`
