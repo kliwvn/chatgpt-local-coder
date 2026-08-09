@@ -1032,6 +1032,12 @@ async function startTunnelUnlocked(name) {
       OPENAI_TUNNEL_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_TUNNEL_ID: env.OPENAI_TUNNEL_ID,
+      // The managed MCP target is already explicit in mcp.server_urls. Do not
+      // auto-register arbitrary loopback/private hosts discovered in metadata.
+      // This also avoids Harpoon warnings for the intentional local http:// URL
+      // without weakening transport policy via HARPOON_ALLOW_PLAINTEXT_HTTP.
+      HARPOON_HOSTS_INCLUDE_LOOPBACK: "false",
+      HARPOON_HOSTS_INCLUDE_PRIVATE: "false",
     });
     invalidateProcessScanCache();
     const up = await waitFor(() => tunnelClientHealth(healthPort), 45000);

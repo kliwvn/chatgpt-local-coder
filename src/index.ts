@@ -210,6 +210,23 @@ app.get("/health", (_req, res) => {
   });
 });
 
+// RFC 9728 protected-resource metadata for tunnel-client discovery. This local
+// MCP endpoint does not require OAuth, so the authorization-server list is
+// intentionally empty. Managed tunnel startup disables Harpoon auto-registration
+// for loopback/private hosts; only the explicit mcp.server_urls target is used.
+app.get("/.well-known/oauth-protected-resource", (_req, res) => {
+  res.json({
+    resource: `http://127.0.0.1:${PORT}/mcp`,
+    authorization_servers: [],
+  });
+});
+app.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => {
+  res.json({
+    resource: `http://127.0.0.1:${PORT}/mcp`,
+    authorization_servers: [],
+  });
+});
+
 async function handleMcpPost(req: express.Request, res: express.Response): Promise<void> {
   try {
     // SEP-2575: server/discover (stateless discovery) — trả JSON-RPC error 200
