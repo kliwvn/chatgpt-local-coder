@@ -28,11 +28,17 @@ export function startAdminServer(options: AdminServerOptions): Server {
   const app = express();
   app.use(express.json({ limit: "5mb" }));
   app.use(localhostOnly);
-  app.use(adminAuth);
 
   const uiDir = path.resolve(__dirname, "../../public/ui");
+  // The static localhost-only shell must remain loadable when ADMIN_TOKEN is
+  // enabled; otherwise a normal browser cannot attach the token header and the
+  // Admin UI locks itself out with 401 before its JavaScript can run.
   app.use("/ui", express.static(uiDir));
   app.get("/", (_req, res) => res.redirect("/ui/"));
+
+  // Protect the operational API, not the static shell. The UI keeps the token
+  // in sessionStorage and sends it as Authorization on API requests.
+  app.use(adminAuth);
 
   app.use(createAdminRouter(options.manager, {
     mcpPort: options.mcpPort,

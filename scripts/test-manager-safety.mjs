@@ -127,12 +127,19 @@ const put = (route, body = {}) => api(route, { method: "PUT", headers: { "conten
 
 try {
   let listing;
+  let item;
   for (let i = 0; i < 150; i++) {
-    try { listing = (await api("/api/instances")).body; break; } catch {}
+    try {
+      listing = (await api("/api/instances")).body;
+      item = listing.instances.find((x) => x.name === "demo");
+      // The first probe can race the fake listener accepting its first socket on
+      // busy Windows CI. Require the full identity-conflict state before leaving
+      // readiness, rather than treating the first HTTP response as readiness.
+      if (item?.server?.portOccupied && item?.tunnel?.portOccupied) break;
+    } catch {}
     await sleep(30);
   }
   if (!listing) throw new Error(`manager did not start: ${managerOutput}`);
-  const item = listing.instances.find((x) => x.name === "demo");
   assert.ok(item);
   assert.equal(item.server.running, false);
   assert.equal(item.server.portOccupied, true, "fake MCP-like health must not be trusted as this workspace");
@@ -213,6 +220,19 @@ try {
   assert.equal(managedStop.ok, true, `managed server stop failed: ${JSON.stringify(managedStop)}`);
   assert.equal(managedStop.processExited, true, "stop must confirm the Gateway PID fully exited");
   assert.equal(pidAlive(managedRestart.pid), false, "stopped Gateway PID must no longer be alive");
+  managedRestartPid = null;
+
+  // Deleting a live instance must first stop its owned Gateway and only then
+  // remove the instance metadata. This guards against orphaning a process when
+  // instance deletion and lifecycle management drift apart.
+  const deleteStart = (await post("/api/instances/restart-demo/server/start")).body;
+  assert.equal(deleteStart.ok, true, `delete-demo start failed: ${JSON.stringify(deleteStart)}`);
+  assert.ok(Number.isInteger(deleteStart.pid));
+  managedRestartPid = deleteStart.pid;
+  const deleteResult = (await api("/api/instances/restart-demo", { method: "DELETE" })).body;
+  assert.equal(deleteResult.ok, true, `live instance delete failed: ${JSON.stringify(deleteResult)}`);
+  assert.equal(pidAlive(deleteStart.pid), false, "instance delete left its Gateway process alive");
+  assert.equal(await fs.stat(restartDemo).then(() => true, () => false), false, "instance directory survived successful delete");
   managedRestartPid = null;
 
   const occupiedCreate = (await post("/api/instances", { name: "occupied", port: createConflictPort, workspacePath: process.cwd() })).body;

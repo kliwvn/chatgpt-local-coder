@@ -54,8 +54,9 @@ export interface McpSession {
 export interface McpSessionSummary {
   index: number;
   shortId: string;
-  /** registered = session tồn tại trong map (có thể đang có/như không có SSE mở);
-   *  closing = client đã DELETE, đang trong grace 45s để tool call chạy xong. */
+  /** registered = session tồn tại trong map (có thể có hoặc không có SSE mở);
+   *  closing = transport close đang ở fallback grace; explicit DELETE normally
+   *  drains its serialized op and disposes immediately. */
   status: "registered" | "closing";
   /** connected = có ít nhất 1 SSE GET stream đang mở trên session này (thực tế đang kết nối). */
   connected: boolean;
@@ -213,11 +214,11 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
 
   function scheduleDeleteGrace(sessionId: string): void {
     cancelDeleteGrace(sessionId);
-    console.log(
-      `${formatLogTime()} [MCP] Session DELETE — giữ ${SESSION_DELETE_GRACE_MS / 1000}s để tool call đang chạy: ${sessionLogId(sessionId)}`
-    );
     deleteGraceTimers[sessionId] = setTimeout(() => {
       delete deleteGraceTimers[sessionId];
+      console.log(
+        `${formatLogTime()} [MCP] Session close fallback grace expired after ${SESSION_DELETE_GRACE_MS / 1000}s: ${sessionLogId(sessionId)}`
+      );
       disposeSession(sessionId, "client DELETE (grace expired)");
     }, SESSION_DELETE_GRACE_MS);
     deleteGraceTimers[sessionId].unref?.();
@@ -683,6 +684,16 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         await enqueueSessionOp(sid, run);
       } else {
         await run();
+      }
+
+      // POST and DELETE share the same per-session op chain. Once an explicit
+      // DELETE returns from enqueueSessionOp, every earlier POST/tool call has
+      // already settled, so the old fixed 45s grace no longer protects in-flight
+      // work. Dispose promptly to keep short-lived client sessions from occupying
+      // the retained-session cap. onsessionclosed still keeps the configured grace
+      // as a defensive fallback for transport closes outside this explicit path.
+      if (sid && req.method === "DELETE" && deleteGraceTimers[sid]) {
+        disposeSession(sid, "client DELETE (serialized op drained)");
       }
     },
     async tryRecoverStale(

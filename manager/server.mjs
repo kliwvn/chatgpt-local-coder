@@ -26,7 +26,12 @@ import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { rotateLogFile, tailFile } from "./log-utils.mjs";
-import { atomicWriteFile } from "./fs-utils.mjs";
+import {
+  atomicWriteFile,
+  enqueueKeyedMutation,
+  pruneExpiredCache,
+  retryTransientFsMutation,
+} from "./fs-utils.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -192,10 +197,7 @@ async function writeJson(p, data) {
 
 const fileMutationChains = new Map();
 function enqueueFileMutation(file, operation) {
-  const previous = fileMutationChains.get(file) || Promise.resolve();
-  const run = previous.then(operation, operation);
-  fileMutationChains.set(file, run.then(() => undefined, () => undefined));
-  return run;
+  return enqueueKeyedMutation(fileMutationChains, file, operation);
 }
 async function mutateJson(file, fallback, mutator) {
   return enqueueFileMutation(file, async () => {
@@ -221,17 +223,13 @@ async function readPidFile(p) {
 
 async function writePidFile(p, pid) {
   await fsp.mkdir(path.dirname(p), { recursive: true });
-  // Windows đôi khi trả EBUSY/EPERM khi process khác đang đọc file — retry ngắn
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
+  // Windows đôi khi trả EBUSY/EPERM khi process khác đang đọc file — retry ngắn.
+  // Retry exhaustion must propagate: reporting lifecycle success with stale/missing
+  // PID metadata makes later identity-safe stop/restart decisions unreliable.
+  await retryTransientFsMutation(async () => {
       if (pid) await fsp.writeFile(p, String(pid), "utf-8");
       else await fsp.rm(p, { force: true });
-      return;
-    } catch (err) {
-      if (err && err.code !== "EBUSY" && err.code !== "EPERM" && err.code !== "EACCES") throw err;
-      await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
-    }
-  }
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -470,9 +468,11 @@ const PID_SCAN_TTL_MS = 2000;
 function invalidateProcessScanCache() { pidScanCache.clear(); }
 /** PIDs của process imageName mà command line chứa substring (phân biệt instance). */
 function pidsWithCmdLine(imageName, substring) {
+  const now = Date.now();
+  pruneExpiredCache(pidScanCache, PID_SCAN_TTL_MS, now);
   const key = `${imageName}\u0000${substring}`;
   const hit = pidScanCache.get(key);
-  if (hit && Date.now() - hit.at < PID_SCAN_TTL_MS) return hit.pids;
+  if (hit) return hit.pids;
   let pids = [];
   try {
     const needle = String(substring).replace(/'/g, "''");
@@ -489,7 +489,7 @@ function pidsWithCmdLine(imageName, substring) {
   } catch {
     pids = [];
   }
-  pidScanCache.set(key, { at: Date.now(), pids });
+  pidScanCache.set(key, { at: now, pids });
   return pids;
 }
 
@@ -1427,12 +1427,38 @@ async function deleteInstance(name) {
   if (!INSTANCE_NAME_RE.test(name)) return { ok: false, error: "Tên không hợp lệ." };
   if (name === "default") return { ok: false, error: "Instance 'default' là mặc định, không xóa được." };
   const inst = instPaths(name);
+
+  // Fail closed: never delete the only metadata/profile/PID files for a process
+  // we failed to stop. Otherwise a transient lifecycle failure can turn a managed
+  // server/tunnel into an orphan that the Manager can no longer identify safely.
+  let tunnelStop;
   try {
-    await stopServer(name);
-  } catch {}
+    tunnelStop = await stopTunnel(name);
+  } catch (err) {
+    return { ok: false, error: `Không thể dừng Tunnel trước khi xóa '${name}': ${String(err?.message || err)}` };
+  }
+  if (!tunnelStop?.ok) {
+    return { ok: false, error: `Không thể dừng Tunnel trước khi xóa '${name}': ${tunnelStop?.error || "unknown error"}` };
+  }
+
+  let serverStop;
   try {
-    await stopTunnel(name);
-} catch {}
+    serverStop = await stopServer(name);
+  } catch (err) {
+    return { ok: false, error: `Không thể dừng Server trước khi xóa '${name}': ${String(err?.message || err)}` };
+  }
+  if (!serverStop?.ok) {
+    return { ok: false, error: `Không thể dừng Server trước khi xóa '${name}': ${serverStop?.error || "unknown error"}` };
+  }
+
+  const [serverAfter, tunnelAfter] = await Promise.all([serverStatus(name), tunnelStatus(name)]);
+  if (serverAfter.running || tunnelAfter.running) {
+    return {
+      ok: false,
+      error: `Từ chối xóa '${name}': process vẫn đang chạy sau stop (server=${serverAfter.running}, tunnel=${tunnelAfter.running}).`,
+    };
+  }
+
   // Windows có thể giữ file vài trăm ms sau taskkill — retry ngắn trước khi báo lỗi
   for (let i = 0; i < 5; i++) {
     try {

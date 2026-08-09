@@ -4,6 +4,7 @@ import os from "os";
 import path from "path";
 import { atomicWriteFile } from "./atomic-write.js";
 import { envBoundedInteger } from "./env-utils.js";
+import { enqueueKeyedMutation } from "./keyed-mutation.js";
 
 const MAX_BYTES = envBoundedInteger("AUTO_MEMORY_MAX_BYTES", 25_000, 1024, 10_000_000);
 const MAX_LINES = envBoundedInteger("AUTO_MEMORY_MAX_LINES", 200, 1, 10_000);
@@ -13,10 +14,7 @@ const NOTE_BYTE_BUDGET = Math.max(1, MAX_BYTES - Buffer.byteLength(MEMORY_HEADER
 const memoryWriteChains = new Map<string, Promise<void>>();
 
 function enqueueMemoryWrite<T>(file: string, operation: () => Promise<T>): Promise<T> {
-  const previous = memoryWriteChains.get(file) ?? Promise.resolve();
-  const run = previous.then(operation, operation);
-  memoryWriteChains.set(file, run.then(() => undefined, () => undefined));
-  return run;
+  return enqueueKeyedMutation(memoryWriteChains, file, operation);
 }
 
 function projectDir(workspaceRoot: string): string {

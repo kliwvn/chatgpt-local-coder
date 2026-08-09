@@ -15,6 +15,7 @@ import {
 import { getDefaultCwd, getFullDiskAccess } from "../lib/path-security.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
 import { atomicWriteFile } from "../lib/atomic-write.js";
+import { readUtf8FileIfExists } from "../lib/optional-file.js";
 import {
   getRecentActivity,
   loadAuditHistory,
@@ -313,11 +314,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         for (const [key, value] of Object.entries(values)) {
           if (value !== REDACTED_MASK) filtered[key] = value;
         }
-        let original = "";
-        try {
-          original = await fs.readFile(envPath, "utf-8");
-        } catch {}
-        const next = serializeDotEnv(filtered, original || "");
+        const original = (await readUtf8FileIfExists(envPath)) ?? "";
+        const next = serializeDotEnv(filtered, original);
         const validationError = validateAdminEnv(next);
         if (validationError) return { ok: false as const, error: validationError };
         await atomicWriteFile(envPath, next, "utf8");

@@ -41,6 +41,7 @@ let activitySeenIds = new Set();
 let activityPaused = false;
 let dashboardRefreshInFlight = false;
 let dashboardPollTimer = null;
+const ADMIN_TOKEN_SESSION_KEY_BASE = "chatgpt-local-coder-admin-token";
 
 // Khi admin UI được nhúng qua manager (http://127.0.0.1:<MANAGER_PORT>/admin/ui/),
 // mọi request API tương đối phải đi qua /admin để manager proxy chuyển tiếp tới
@@ -51,6 +52,9 @@ const API_BASE = IS_PROXIED ? "/admin" : "";
 // Trong chế độ proxy, giữ instance hiện tại trên mọi URL API (manager proxy
 // chọn instance theo query ?instance=... khi không có header x-instance-name).
 const API_INSTANCE = new URLSearchParams(location.search).get("instance") || "";
+const ADMIN_TOKEN_SESSION_KEY = API_INSTANCE
+  ? `${ADMIN_TOKEN_SESSION_KEY_BASE}:${API_INSTANCE}`
+  : ADMIN_TOKEN_SESSION_KEY_BASE;
 const apiUrl = (path) => {
   let url = API_BASE + path;
   if (IS_PROXIED && API_INSTANCE) {
@@ -67,11 +71,36 @@ function toast(msg, isError = false) {
   clearTimeout(toast._t);
   toast._t = setTimeout(() => (el.hidden = true), 3200);
 }
-async function api(path, options = {}) {
-  const res = await fetch(apiUrl(path), {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
+function getAdminToken() {
+  try {
+    return sessionStorage.getItem(ADMIN_TOKEN_SESSION_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function setAdminToken(token) {
+  try {
+    if (token) sessionStorage.setItem(ADMIN_TOKEN_SESSION_KEY, token);
+    else sessionStorage.removeItem(ADMIN_TOKEN_SESSION_KEY);
+  } catch {}
+}
+
+async function api(path, options = {}, allowTokenPrompt = true) {
+  const token = getAdminToken();
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (token && !headers.Authorization && !headers["x-admin-token"]) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const res = await fetch(apiUrl(path), { ...options, headers });
+  if (res.status === 401 && allowTokenPrompt) {
+    const provided = window.prompt("ADMIN_TOKEN cho Local Coder Admin API:", token);
+    if (provided != null && provided.trim()) {
+      setAdminToken(provided.trim());
+      return api(path, options, false);
+    }
+    if (token) setAdminToken("");
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
@@ -387,6 +416,15 @@ function startActivityStream() {
   stopActivityStream();
   const live = document.getElementById("activity-live").checked;
   if (!live || activityPaused) return;
+
+  // Native EventSource cannot attach Authorization headers. With ADMIN_TOKEN,
+  // use the existing authenticated polling fallback instead of weakening auth
+  // by placing secrets in a query string.
+  if (getAdminToken()) {
+    activityPollTimer = setInterval(pollActivityQuietly, 2000);
+    void pollActivityQuietly();
+    return;
+  }
 
   activityEventSource = new EventSource(apiUrl("/api/activity/stream"));
   activityEventSource.onmessage = (ev) => {

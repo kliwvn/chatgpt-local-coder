@@ -4,6 +4,38 @@ import path from "node:path";
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-state-concurrency-"));
 try {
+  const { enqueueKeyedMutation } = await import("../dist/lib/keyed-mutation.js");
+  const { readUtf8FileIfExists } = await import("../dist/lib/optional-file.js");
+  if ((await readUtf8FileIfExists(path.join(root, "missing-optional.txt"))) !== null) {
+    throw new Error("optional file reader did not map ENOENT to null");
+  }
+  let nonEnoentRejected = false;
+  try {
+    await readUtf8FileIfExists(root); // directory read is EISDIR on Windows/Linux
+  } catch {
+    nonEnoentRejected = true;
+  }
+  if (!nonEnoentRejected) throw new Error("optional file reader swallowed a non-ENOENT read failure");
+
+  const mutationChains = new Map();
+  const mutationOrder = [];
+  await Promise.all([
+    enqueueKeyedMutation(mutationChains, "project-a", async () => {
+      mutationOrder.push("first-start");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      mutationOrder.push("first-end");
+    }),
+    enqueueKeyedMutation(mutationChains, "project-a", async () => {
+      mutationOrder.push("second-start");
+      mutationOrder.push("second-end");
+    }),
+  ]);
+  await Promise.resolve();
+  if (mutationOrder.join(",") !== "first-start,first-end,second-start,second-end") {
+    throw new Error(`keyed mutation order broken: ${mutationOrder.join(",")}`);
+  }
+  if (mutationChains.size !== 0) throw new Error(`keyed mutation retained settled keys: ${mutationChains.size}`);
+
   process.env.CHECKPOINT_PATH = path.join(root, "checkpoints");
   process.env.CHECKPOINT_ENABLED = "true";
   process.env.CHECKPOINT_MAX_COUNT = "200";
@@ -86,7 +118,23 @@ try {
     throw new Error(`shell-state lost update: ${state?.recent_commands?.length ?? 0}/20`);
   }
 
-  console.log("state-concurrency: ok (checkpoint 30/30, rewind/edit no-deadlock, memory concurrent+bounded-recent, shell recent 20/20)");
+  // A corrupted/unreadable existing state must fail closed on save rather than
+  // being mistaken for an absent file and overwritten with a truncated history.
+  const shellFiles = await fs.readdir(path.join(root, "shell-state"));
+  const shellFile = path.join(root, "shell-state", shellFiles[0]);
+  await fs.writeFile(shellFile, "{broken-json", "utf8");
+  let corruptRejected = false;
+  try {
+    await shell.saveGlobalShellState("C:/concurrent-shell", "C:/concurrent-shell", "must-not-overwrite", null);
+  } catch {
+    corruptRejected = true;
+  }
+  if (!corruptRejected) throw new Error("shell-state save overwrote unreadable/corrupt existing state");
+  if ((await fs.readFile(shellFile, "utf8")) !== "{broken-json") {
+    throw new Error("shell-state save modified corrupt state after strict read failure");
+  }
+
+  console.log("state-concurrency: ok (keyed queues release, checkpoint 30/30, rewind/edit no-deadlock, memory concurrent+bounded-recent, shell recent 20/20)");
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }

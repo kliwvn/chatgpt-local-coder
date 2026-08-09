@@ -86,6 +86,17 @@ async function adminSessions() {
   return res.json();
 }
 
+async function waitForSessionGone(rawSessionId, timeoutMs = 1500) {
+  const prefix = rawSessionId.slice(0, 8);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const data = await adminSessions();
+    if (!data.sessions.some((x) => x.shortId.startsWith(prefix))) return true;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return false;
+}
+
 
 let sessionId;
 await run("initialize session on /mcp", async () => {
@@ -274,15 +285,13 @@ await run("run_command after re-init", async () => {
     throw new Error(`unexpected result: ${text.slice(0, 300)}`);
   }
 });
-await run("admin /api/sessions marks closing after DELETE", async () => {
+await run("explicit DELETE disposes session promptly after op drain", async () => {
   const out = await initialize("/mcp");
   const { status } = await mcpPost("/mcp", undefined, out.sessionId, {}, "DELETE");
   if (status !== 200) throw new Error(`DELETE HTTP ${status}`);
-  const data = await adminSessions();
-  const s = data.sessions.find((x) => x.shortId.startsWith(out.sessionId.slice(0, 8)));
-  if (!s) throw new Error("session removed too early");
-  if (s.status !== "closing") throw new Error(`expected closing, got ${s.status}`);
-  if (s.connected) throw new Error(`closing session must not be connected, got ${JSON.stringify(s)}`);
+  if (!(await waitForSessionGone(out.sessionId))) {
+    throw new Error("explicit DELETE retained session instead of disposing after serialized op drain");
+  }
 });
 await run("POST tools/list succeeds while SSE open (GET not in op queue)", async () => {
   // GET (SSE) chạy ngoài hàng đợi op của session → POST ngắn không phải chờ stream.
@@ -370,7 +379,8 @@ await run("DELETE returns 200 and closes open SSE (not queued behind stream)", a
   if (!closed) throw new Error("SSE stream did not close after DELETE");
   const data = await adminSessions();
   const s = data.sessions.find((x) => x.shortId.startsWith(out.sessionId.slice(0, 8)));
-  if (!s || s.connected) throw new Error(`expected disconnected/closing after DELETE, got ${JSON.stringify(s)}`);
+  if (s?.connected) throw new Error(`expected disconnected/removed after DELETE, got ${JSON.stringify(s)}`);
+  if (!(await waitForSessionGone(out.sessionId))) throw new Error("DELETE closed SSE but retained session");
   ac.abort();
 });
 
@@ -468,6 +478,9 @@ await run("DELETE waits for in-flight POST then closes (op chain serialized)", a
     new Promise((res) => setTimeout(() => res(false), 5000)),
   ]);
   if (!closed) throw new Error("SSE stream did not close after DELETE (in-flight POST case)");
+  if (!(await waitForSessionGone(out.sessionId))) {
+    throw new Error("DELETE waited for slow POST but retained session after the op chain drained");
+  }
   ac.abort();
 });
 await run("parallel initializes respect hard cap (bounded, no hang)", async () => {

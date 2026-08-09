@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import fs from "fs/promises";
 import path from "path";
 import { atomicWriteFile } from "./atomic-write.js";
+import { enqueueKeyedMutation } from "./keyed-mutation.js";
+import { readUtf8FileIfExists } from "./optional-file.js";
 
 export interface GlobalShellState {
   workspace_key: string;
@@ -21,10 +22,7 @@ const MAX_RECENT = 20;
 const shellStateWriteChains = new Map<string, Promise<void>>();
 
 function enqueueShellStateWrite<T>(file: string, operation: () => Promise<T>): Promise<T> {
-  const previous = shellStateWriteChains.get(file) ?? Promise.resolve();
-  const run = previous.then(operation, operation);
-  shellStateWriteChains.set(file, run.then(() => undefined, () => undefined));
-  return run;
+  return enqueueKeyedMutation(shellStateWriteChains, file, operation);
 }
 
 function workspaceKey(workspaceRoot: string): string {
@@ -35,16 +33,23 @@ function statePath(workspaceRoot: string): string {
   return path.join(stateDir(), `shell-${workspaceKey(workspaceRoot)}.json`);
 }
 
+async function readGlobalShellStateStrict(workspaceRoot: string): Promise<GlobalShellState | null> {
+  const raw = await readUtf8FileIfExists(statePath(workspaceRoot));
+  if (raw === null) return null;
+  const parsed = JSON.parse(raw) as GlobalShellState;
+  if (!parsed.cwd) return null;
+  return parsed;
+}
+
 export async function loadGlobalShellState(
   workspaceRoot: string,
-  defaultCwd: string
+  _defaultCwd: string
 ): Promise<GlobalShellState | null> {
   try {
-    const raw = await fs.readFile(statePath(workspaceRoot), "utf-8");
-    const parsed = JSON.parse(raw) as GlobalShellState;
-    if (!parsed.cwd) return null;
-    return parsed;
+    return await readGlobalShellStateStrict(workspaceRoot);
   } catch {
+    // Startup/status reads are best-effort; saveGlobalShellState uses the strict
+    // path below so transient read/corruption cannot silently overwrite history.
     return null;
   }
 }
@@ -59,7 +64,7 @@ export async function saveGlobalShellState(
   await enqueueShellStateWrite(file, async () => {
     // Re-read inside the serialized mutation so concurrent tool completions merge
     // into the latest persisted history instead of overwriting each other.
-    const latest = await loadGlobalShellState(workspaceRoot, cwd);
+    const latest = await readGlobalShellStateStrict(workspaceRoot);
     const base = latest ?? previous ?? null;
     const recent = [...(base?.recent_commands ?? [])];
     if (command) {
