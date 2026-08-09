@@ -6,32 +6,75 @@ import { audit } from "../lib/audit.js";
 import { requireWriteAllowed } from "../lib/permissions.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
+import { appendBoundedHead, appendBoundedTail, GIT_OUTPUT_MAX_CHARS } from "../lib/output-budget.js";
 
 interface GitRunResult {
   stdout: string;
   stderr: string;
   exit_code: number;
+  stdout_truncated?: boolean;
+  stderr_truncated?: boolean;
+}
+
+function markTruncated(text: string, truncated: boolean, where: "head" | "tail"): string {
+  if (!truncated) return text.trim();
+  const marker = `...[git output truncated at ${GIT_OUTPUT_MAX_CHARS} chars]`;
+  if (where === "head") {
+    const room = Math.max(0, GIT_OUTPUT_MAX_CHARS - marker.length - 1);
+    return `${text.slice(0, room).trimEnd()}\n${marker}`;
+  }
+  const room = Math.max(0, GIT_OUTPUT_MAX_CHARS - marker.length - 1);
+  return `${marker}\n${text.slice(-room).trimStart()}`;
 }
 
 function runGit(args: string[], cwd: string, timeoutMs = 30_000): Promise<GitRunResult> {
   const { promise, resolve, reject } = Promise.withResolvers<GitRunResult>();
   const child = spawn("git", args, { cwd, windowsHide: true });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
   let stdout = "";
   let stderr = "";
+  let stdoutTruncated = false;
+  let stderrTruncated = false;
   let settled = false;
   const timer = setTimeout(() => {
     if (settled) return;
     settled = true;
     child.kill("SIGKILL");
-    resolve({ stdout: stdout.trim(), stderr: (stderr || `git timed out after ${timeoutMs}ms`).trim(), exit_code: 124 });
+    resolve({
+      stdout: markTruncated(stdout, stdoutTruncated, "head"),
+      stderr: stderr
+        ? markTruncated(stderr, stderrTruncated, "tail")
+        : `git timed out after ${timeoutMs}ms`,
+      exit_code: 124,
+      stdout_truncated: stdoutTruncated,
+      stderr_truncated: stderrTruncated,
+    });
   }, timeoutMs);
-  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  child.stdout.on("data", (d: string) => {
+    // For diff/status/log, the beginning contains the most useful structural
+    // context. Stop retaining bytes after the configured cap.
+    const next = appendBoundedHead(stdout, d, GIT_OUTPUT_MAX_CHARS, stdoutTruncated);
+    stdout = next.text;
+    stdoutTruncated = next.truncated;
+  });
+  child.stderr.on("data", (d: string) => {
+    // Errors are usually most useful at the tail.
+    const next = appendBoundedTail(stderr, d, GIT_OUTPUT_MAX_CHARS, stderrTruncated);
+    stderr = next.text;
+    stderrTruncated = next.truncated;
+  });
   child.on("close", (code) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 });
+    resolve({
+      stdout: markTruncated(stdout, stdoutTruncated, "head"),
+      stderr: markTruncated(stderr, stderrTruncated, "tail"),
+      exit_code: code ?? 1,
+      stdout_truncated: stdoutTruncated,
+      stderr_truncated: stderrTruncated,
+    });
   });
   child.on("error", () => {
     if (settled) return;
@@ -81,7 +124,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
 
   server.registerTool("git_log", {
     title: "Git Log", description: "Show recent commit history.",
-    inputSchema: { path: z.string().optional(), count: z.number().optional().default(10) },
+    inputSchema: { path: z.string().optional(), count: z.number().int().positive().max(1000).optional().default(10) },
 
     annotations: toolAnnotations("read"),
   }, async ({ path: repoPath, count }) => {

@@ -1108,6 +1108,12 @@ const RUNTIME_LIMIT_SPECS = [
   ["PROCESS_MAX_RUNNING", 16, 1, 128],
   ["PROCESS_HISTORY_MAX", 32, 1, 1000],
   ["PROCESS_LOG_MAX_CHARS", 200000, 4096, 2000000],
+  ["SHELL_OUTPUT_MAX_CHARS", 250000, 4096, 1000000],
+  ["GIT_OUTPUT_MAX_CHARS", 500000, 4096, 2000000],
+  ["READ_TEXT_MAX_BYTES", 2097152, 65536, 6291456],
+  ["READ_BASE64_MAX_BYTES", 2097152, 65536, 2097152],
+  ["MCP_TOOL_RESULT_MAX_BYTES", 7340032, 262144, 8388608],
+  ["MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES", 131072, 16384, 524288],
 ];
 
 /**
@@ -1177,6 +1183,15 @@ function validateRuntimeLimits(env) {
     if (!Number.isInteger(value) || value < min || value > max) {
       errors.push(`${key} phải là số nguyên ${min}–${max} (hiện tại: ${raw || `(mặc định ${fallback})`})`);
     }
+  }
+  const wireMax = values.MCP_TOOL_RESULT_MAX_BYTES;
+  const duplicateMax = values.MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES;
+  if (
+    Number.isInteger(wireMax) &&
+    Number.isInteger(duplicateMax) &&
+    duplicateMax > wireMax
+  ) {
+    errors.push("MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES must not exceed MCP_TOOL_RESULT_MAX_BYTES");
   }
   return { ok: errors.length === 0, errors, values };
 }

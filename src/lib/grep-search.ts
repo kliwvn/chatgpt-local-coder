@@ -1,5 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
+import { READ_TEXT_MAX_BYTES } from "./output-budget.js";
 
 export type GrepOutputMode = "content" | "files_with_matches" | "count";
 
@@ -57,7 +58,10 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
   let totalMatches = 0;
 
   async function walk(dir: string): Promise<void> {
-    if (outputMode === "content" && contentLines.length >= headLimit) return;
+    if (
+      (outputMode === "content" && contentLines.length >= headLimit) ||
+      (outputMode !== "content" && fileMatches.size >= headLimit)
+    ) return;
 
     let entries;
     try {
@@ -67,7 +71,10 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
     }
 
     for (const entry of entries) {
-      if (outputMode === "content" && contentLines.length >= headLimit) break;
+      if (
+        (outputMode === "content" && contentLines.length >= headLimit) ||
+        (outputMode !== "content" && fileMatches.size >= headLimit)
+      ) break;
       if (entry.name.startsWith(".") && entry.name !== ".") continue;
       // Do not read through a symlink/reparse point discovered during recursive
       // traversal; explicit file reads are canonicalized by validatePath instead.
@@ -83,6 +90,8 @@ export async function grepSearch(options: GrepOptions): Promise<string> {
 
       let text: string;
       try {
+        const stat = await fs.stat(fullPath);
+        if (!stat.isFile() || stat.size > READ_TEXT_MAX_BYTES) continue;
         text = await fs.readFile(fullPath, "utf-8");
       } catch {
         continue;

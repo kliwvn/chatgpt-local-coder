@@ -1,3 +1,9 @@
+import {
+  MCP_TOOL_RESULT_MAX_BYTES,
+  MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES,
+  utf8Prefix,
+} from "./output-budget.js";
+
 /**
  * Chuẩn output JSON cho mọi tool — ChatGPT dễ parse.
  *
@@ -27,9 +33,46 @@ export function toolResult<T extends object>(
     data: data as Record<string, unknown>,
   };
 
+  const payloadJson = JSON.stringify(payload);
+  const payloadBytes = Buffer.byteLength(payloadJson, "utf8");
+  const text =
+    payloadBytes <= MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES
+      ? payloadJson
+      : JSON.stringify({
+          ok: payload.ok,
+          tool: payload.tool,
+          summary: payload.summary,
+          data: { structured_content: true, payload_bytes: payloadBytes },
+        });
+  const result = {
+    content: [{ type: "text" as const, text }],
+    structuredContent: payload as Record<string, unknown>,
+  };
+
+  if (Buffer.byteLength(JSON.stringify(result), "utf8") <= MCP_TOOL_RESULT_MAX_BYTES) {
+    return result;
+  }
+
+  // Last-resort wire guard for huge diffs, directory trees or upstream MCP
+  // payloads that bypass source-specific caps. Return a useful preview instead
+  // of letting the Secure MCP Tunnel fail the entire tool call with HTTP 413.
+  const previewBytes = Math.min(64 * 1024, Math.max(8 * 1024, Math.floor(MCP_TOOL_RESULT_MAX_BYTES / 8)));
+  const compactPayload: ToolResultPayload = {
+    ok: payload.ok,
+    tool: payload.tool,
+    summary: `${payload.summary} (result truncated to MCP wire budget)`,
+    data: {
+      truncated: true,
+      original_payload_bytes: payloadBytes,
+      wire_budget_bytes: MCP_TOOL_RESULT_MAX_BYTES,
+      preview: utf8Prefix(payloadJson, previewBytes),
+      hint: "Refine the request or use offset/limit/head/tail for large outputs.",
+    },
+  };
+  const compactJson = JSON.stringify(compactPayload);
   return {
-    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-    structuredContent: payload,
+    content: [{ type: "text" as const, text: compactJson }],
+    structuredContent: compactPayload as Record<string, unknown>,
   };
 }
 

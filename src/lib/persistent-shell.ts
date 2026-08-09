@@ -1,5 +1,6 @@
 import { spawn } from "child_process";
 import path from "path";
+import { appendBoundedTail, SHELL_OUTPUT_MAX_CHARS } from "./output-budget.js";
 
 export interface ShellExecResult {
   command: string;
@@ -8,6 +9,9 @@ export interface ShellExecResult {
   stderr: string;
   exit_code: number | null;
   timed_out: boolean;
+  stdout_truncated?: boolean;
+  stderr_truncated?: boolean;
+  output_max_chars?: number;
 }
 
 import { loadGlobalShellState, saveGlobalShellState } from "./global-shell-state.js";
@@ -15,6 +19,9 @@ import { loadGlobalShellState, saveGlobalShellState } from "./global-shell-state
 let sessionCwd: string | null = null;
 let sessionInitializedAt: string | null = null;
 let persistenceRoot: string | null = null;
+let bootstrapRoot: string | null = null;
+let bootstrapPromise: Promise<void> | null = null;
+let shellExecChain: Promise<void> = Promise.resolve();
 const history: string[] = [];
 const MAX_HISTORY = 50;
 
@@ -44,6 +51,26 @@ export async function bootstrapShellSession(defaultCwd: string): Promise<void> {
   initShellSession(defaultCwd);
 }
 
+/**
+ * Bootstrap persistent shell state once per process/workspace. ChatGPT may create
+ * a new MCP transport for nearly every tool call; re-reading disk state on every
+ * transport can race with a live command and overwrite the singleton cwd/history
+ * with an older snapshot.
+ */
+export function ensureShellBootstrap(defaultCwd: string): Promise<void> {
+  const resolved = path.resolve(defaultCwd);
+  if (bootstrapPromise && bootstrapRoot === resolved) return bootstrapPromise;
+  bootstrapRoot = resolved;
+  bootstrapPromise = bootstrapShellSession(resolved).catch((err) => {
+    if (bootstrapRoot === resolved) {
+      bootstrapRoot = null;
+      bootstrapPromise = null;
+    }
+    throw err;
+  });
+  return bootstrapPromise;
+}
+
 export function getShellCwd(): string {
   if (!sessionCwd) throw new Error("Shell session not initialized");
   return sessionCwd;
@@ -55,6 +82,23 @@ export function resetShellSession(cwd: string): void {
   if (persistenceRoot) {
     void saveGlobalShellState(persistenceRoot, sessionCwd, undefined, null);
   }
+}
+
+export function resetShellSessionQueued(cwd: string): Promise<void> {
+  const run = shellExecChain.then(
+    async () => {
+      sessionCwd = path.resolve(cwd);
+      sessionInitializedAt = new Date().toISOString();
+      if (persistenceRoot) await saveGlobalShellState(persistenceRoot, sessionCwd!, undefined, null);
+    },
+    async () => {
+      sessionCwd = path.resolve(cwd);
+      sessionInitializedAt = new Date().toISOString();
+      if (persistenceRoot) await saveGlobalShellState(persistenceRoot, sessionCwd!, undefined, null);
+    }
+  );
+  shellExecChain = run.then(() => undefined, () => undefined);
+  return run;
 }
 
 export function getShellStatus() {
@@ -114,8 +158,12 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
   const shell = process.platform === "win32" ? "powershell.exe" : "bash";
   const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
   const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
   let stdout = "";
   let stderr = "";
+  let stdoutTruncated = false;
+  let stderrTruncated = false;
   let timedOut = false;
   let settled = false;
 
@@ -136,8 +184,16 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     }
   }, timeoutMs);
 
-  child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-  child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+  child.stdout.on("data", (d: string) => {
+    const next = appendBoundedTail(stdout, d, SHELL_OUTPUT_MAX_CHARS, stdoutTruncated);
+    stdout = next.text;
+    stdoutTruncated = next.truncated;
+  });
+  child.stderr.on("data", (d: string) => {
+    const next = appendBoundedTail(stderr, d, SHELL_OUTPUT_MAX_CHARS, stderrTruncated);
+    stderr = next.text;
+    stderrTruncated = next.truncated;
+  });
   child.on("close", (code) => {
     settle(() => {
       if (timedOut) {
@@ -151,6 +207,9 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
         stderr: stderr.trim(),
         exit_code: code,
         timed_out: false,
+        stdout_truncated: stdoutTruncated,
+        stderr_truncated: stderrTruncated,
+        output_max_chars: SHELL_OUTPUT_MAX_CHARS,
       });
     });
   });
@@ -163,7 +222,7 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
  * giữa các lần gọi. Nếu truyền `workingDirectory`, session sẽ chuyển sang
  * thư mục đó TRƯỚC khi chạy (và giữ nguyên cho lần sau, giống Bash persistent).
  */
-export async function execInShellSession(
+async function execInShellSessionUnlocked(
   command: string,
   defaultCwd: string,
   timeoutMs: number,
@@ -190,4 +249,23 @@ export async function execInShellSession(
   }
 
   return result;
+}
+
+/**
+ * The foreground shell has one process-wide cwd/history by design. Serialize
+ * commands so concurrent MCP transports cannot make final cwd depend on process
+ * completion order. Callers that need real parallelism should use start_process.
+ */
+export function execInShellSession(
+  command: string,
+  defaultCwd: string,
+  timeoutMs: number,
+  workingDirectory?: string
+): Promise<ShellExecResult> {
+  const run = shellExecChain.then(
+    () => execInShellSessionUnlocked(command, defaultCwd, timeoutMs, workingDirectory),
+    () => execInShellSessionUnlocked(command, defaultCwd, timeoutMs, workingDirectory)
+  );
+  shellExecChain = run.then(() => undefined, () => undefined);
+  return run;
 }

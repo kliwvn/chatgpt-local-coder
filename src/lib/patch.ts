@@ -401,19 +401,56 @@ export async function applyMultiFilePatch(
   }
 }
 
-export function buildSimpleDiff(oldContent: string, newContent: string): string {
-  const oldLines = normalizeEol(oldContent).split("\n");
-  const newLines = normalizeEol(newContent).split("\n");
-  const diff: string[] = [];
+const SIMPLE_DIFF_MAX_CHARS = 500_000;
 
-  for (let i = 0; i < Math.max(oldLines.length, newLines.length); i++) {
-    const oldLine = oldLines[i];
-    const newLine = newLines[i];
-    if (oldLine !== newLine) {
-      if (oldLine !== undefined) diff.push(`- ${oldLine}`);
-      if (newLine !== undefined) diff.push(`+ ${newLine}`);
+function nextNormalizedLine(text: string, offset: number): { line: string; next: number } | null {
+  if (offset > text.length) return null;
+  const newline = text.indexOf("\n", offset);
+  const end = newline === -1 ? text.length : newline;
+  let line = text.slice(offset, end);
+  if (line.endsWith("\r")) line = line.slice(0, -1);
+  return { line, next: newline === -1 ? text.length + 1 : newline + 1 };
+}
+
+/**
+ * Human-readable preview only — mutation correctness never depends on this diff.
+ * Iterate lines without materializing two full split() arrays, and stop once the
+ * preview reaches a bounded size so a large edit cannot multiply heap/wire usage.
+ */
+export function buildSimpleDiff(oldContent: string, newContent: string): string {
+  const diff: string[] = [];
+  let diffChars = 0;
+  let oldOffset = 0;
+  let newOffset = 0;
+  let truncated = false;
+
+  const push = (prefix: "- " | "+ ", line: string): boolean => {
+    const entry = `${prefix}${line}`;
+    const added = entry.length + (diff.length ? 1 : 0);
+    if (diffChars + added > SIMPLE_DIFF_MAX_CHARS) {
+      truncated = true;
+      return false;
     }
+    diff.push(entry);
+    diffChars += added;
+    return true;
+  };
+
+  while (oldOffset <= oldContent.length || newOffset <= newContent.length) {
+    const oldEntry = nextNormalizedLine(oldContent, oldOffset);
+    const newEntry = nextNormalizedLine(newContent, newOffset);
+    if (!oldEntry && !newEntry) break;
+
+    const oldLine = oldEntry?.line;
+    const newLine = newEntry?.line;
+    if (oldLine !== newLine) {
+      if (oldLine !== undefined && !push("- ", oldLine)) break;
+      if (newLine !== undefined && !push("+ ", newLine)) break;
+    }
+    oldOffset = oldEntry?.next ?? oldContent.length + 1;
+    newOffset = newEntry?.next ?? newContent.length + 1;
   }
 
+  if (truncated) diff.push(`...[diff preview truncated at ${SIMPLE_DIFF_MAX_CHARS} chars]`);
   return diff.join("\n") || "(no visible diff)";
 }

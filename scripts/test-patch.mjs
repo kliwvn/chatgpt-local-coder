@@ -1,4 +1,4 @@
-import { applyUnifiedPatchToText } from "../dist/lib/patch.js";
+import { applyUnifiedPatchToText, buildSimpleDiff } from "../dist/lib/patch.js";
 
 let passed = 0;
 let failed = 0;
@@ -35,6 +35,19 @@ test("crlf preserved", () => {
   const patch = "@@\n-b\r\n+c2\r\n";
   const result = applyUnifiedPatchToText(original, patch);
   if (!result.includes("c2\r\n")) throw new Error("crlf patch failed");
+});
+
+test("simple diff keeps normalized line semantics", () => {
+  const diff = buildSimpleDiff("a\r\nb\r\n", "a\r\nc\r\n");
+  if (diff !== "- b\n+ c") throw new Error(`unexpected simple diff: ${JSON.stringify(diff)}`);
+});
+
+test("simple diff preview is bounded for huge edits", () => {
+  const oldText = `${"a".repeat(300)}\n`.repeat(2500);
+  const newText = `${"b".repeat(300)}\n`.repeat(2500);
+  const diff = buildSimpleDiff(oldText, newText);
+  if (!diff.includes("diff preview truncated")) throw new Error("huge diff was not marked truncated");
+  if (diff.length > 501_000) throw new Error(`huge diff preview exceeded bound: ${diff.length}`);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

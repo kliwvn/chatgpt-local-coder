@@ -15,9 +15,12 @@ import { globFiles } from "../lib/glob-search.js";
 import { grepSearch } from "../lib/grep-search.js";
 import { atomicCopyFile, atomicWriteFile } from "../lib/atomic-write.js";
 import { withFileMutation, withFileMutations } from "../lib/file-mutation.js";
+import { READ_BASE64_MAX_BYTES, READ_TEXT_MAX_BYTES } from "../lib/output-budget.js";
 
 const MAX_PARTIAL_TEXT_LINES = 100_000;
 const TAIL_READ_CHUNK_BYTES = 64 * 1024;
+const DIRECTORY_TREE_MAX_NODES = 5_000;
+const DIRECTORY_LIST_MAX_ENTRIES = 5_000;
 
 async function readTextLinesFrom(
   filePath: string,
@@ -28,16 +31,33 @@ async function readTextLinesFrom(
   const output: string[] = [];
   let lineNumber = 0;
   let carry = "";
+  let outputBytes = 0;
   const acceptLine = (rawLine: string): boolean => {
     lineNumber++;
     const line = lineNumber === 1 ? rawLine.replace(/^\uFEFF/, "") : rawLine;
     if (lineNumber < startLine) return false;
+    const lineBytes = Buffer.byteLength(line, "utf8") + (output.length ? 1 : 0);
+    if (outputBytes + lineBytes > READ_TEXT_MAX_BYTES) {
+      throw new Error(
+        `Requested text slice exceeds READ_TEXT_MAX_BYTES=${READ_TEXT_MAX_BYTES}. ` +
+        "Use a smaller line range or read_file_base64 with byte offset/length."
+      );
+    }
     output.push(line);
+    outputBytes += lineBytes;
     return limit !== undefined && output.length >= limit;
   };
   try {
     for await (const chunk of input) {
       carry += chunk;
+      // A single line without a newline can otherwise grow until the entire file
+      // is resident in memory before the result-level wire guard ever sees it.
+      if (Buffer.byteLength(carry, "utf8") > READ_TEXT_MAX_BYTES) {
+        throw new Error(
+          `A text line exceeds READ_TEXT_MAX_BYTES=${READ_TEXT_MAX_BYTES}. ` +
+          "Use read_file_base64 with byte offset/length for oversized single-line data."
+        );
+      }
       let newline: number;
       while ((newline = carry.indexOf("\n")) >= 0) {
         const line = carry.slice(0, newline);
@@ -61,13 +81,21 @@ async function readTextTail(filePath: string, lineCount: number): Promise<string
   const chunks: Buffer[] = [];
   let position = stat.size;
   let newlineCount = 0;
+  let bytesBuffered = 0;
   try {
     while (position > 0 && newlineCount < lineCount) {
       const size = Math.min(TAIL_READ_CHUNK_BYTES, position);
+      if (bytesBuffered + size > READ_TEXT_MAX_BYTES) {
+        throw new Error(
+          `Requested tail exceeds READ_TEXT_MAX_BYTES=${READ_TEXT_MAX_BYTES}. ` +
+          "Use a smaller tail or read_file_base64 with byte offset/length."
+        );
+      }
       position -= size;
       const buffer = Buffer.allocUnsafe(size);
       const { bytesRead } = await handle.read(buffer, 0, size, position);
       const chunk = buffer.subarray(0, bytesRead);
+      bytesBuffered += bytesRead;
       for (let i = 0; i < chunk.length; i++) if (chunk[i] === 0x0a) newlineCount++;
       chunks.unshift(chunk);
     }
@@ -102,6 +130,8 @@ async function searchDirectory(
       await searchDirectory(fullPath, regex, globPattern, results, maxResults);
     } else if (matchesGlob(entry.name, globPattern)) {
       try {
+        const stat = await fs.stat(fullPath);
+        if (!stat.isFile() || stat.size > READ_TEXT_MAX_BYTES) continue;
         const content = await fs.readFile(fullPath, "utf-8");
         const lines = content.split("\n");
         lines.forEach((line, idx) => {
@@ -122,8 +152,19 @@ function matchesGlob(filename: string, pattern: string): boolean {
   return regex.test(filename);
 }
 
-async function buildTree(dirPath: string, depth: number, maxDepth: number): Promise<object> {
+interface TreeBuildState {
+  nodes: number;
+  truncated: boolean;
+}
+
+async function buildTree(
+  dirPath: string,
+  depth: number,
+  maxDepth: number,
+  state: TreeBuildState
+): Promise<object> {
   const name = path.basename(dirPath);
+  state.nodes++;
   const entries = await fs.readdir(dirPath, { withFileTypes: true });
 
   if (depth >= maxDepth) return { name, type: "directory", truncated: true };
@@ -132,9 +173,17 @@ async function buildTree(dirPath: string, depth: number, maxDepth: number): Prom
   for (const entry of entries) {
     if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
     if (entry.isSymbolicLink()) continue;
+    if (state.nodes >= DIRECTORY_TREE_MAX_NODES) {
+      state.truncated = true;
+      children.push({ name: "…", type: "truncated", reason: `node limit ${DIRECTORY_TREE_MAX_NODES}` });
+      break;
+    }
     const childPath = path.join(dirPath, entry.name);
-    if (entry.isDirectory()) children.push(await buildTree(childPath, depth + 1, maxDepth));
-    else children.push({ name: entry.name, type: "file" });
+    if (entry.isDirectory()) children.push(await buildTree(childPath, depth + 1, maxDepth, state));
+    else {
+      state.nodes++;
+      children.push({ name: entry.name, type: "file" });
+    }
   }
 
   return { name, type: "directory", children };
@@ -169,7 +218,32 @@ export function registerFilesystemTools(server: McpServer): void {
       let result: string;
       if (head !== undefined) result = (await readTextLinesFrom(validPath, 1, head)).join("\n");
       else if (tail !== undefined) result = await readTextTail(validPath, tail);
-      else result = await fs.readFile(validPath, "utf-8");
+      else {
+        const stat = await fs.stat(validPath);
+        if (!stat.isFile()) throw new Error("Path is not a regular file");
+        if (stat.size > READ_TEXT_MAX_BYTES) {
+          await audit({
+            tool: "read_text_file",
+            action: "read",
+            target: validPath,
+            status: "ok",
+            details: { truncated: true, size: stat.size, maxBytes: READ_TEXT_MAX_BYTES },
+          });
+          return toolResult(
+            "read_text_file",
+            {
+              path: validPath,
+              content: "",
+              size_bytes: stat.size,
+              truncated: true,
+              max_bytes: READ_TEXT_MAX_BYTES,
+              hint: "File is too large for a full MCP response. Retry with offset+limit, head, or tail.",
+            },
+            { summary: `large file: use partial read (${stat.size} bytes)` }
+          );
+        }
+        result = await fs.readFile(validPath, "utf-8");
+      }
       await audit({ tool: "read_text_file", action: "read", target: validPath, status: "ok", details: { head, tail } });
       return toolResult("read_text_file", { path: validPath, content: result, head, tail });
     }
@@ -179,11 +253,11 @@ export function registerFilesystemTools(server: McpServer): void {
     "read_file_base64",
     {
       title: "Read File Base64",
-      description: "Read any local file as base64. Use offset/length for large files. Max chunk 8 MiB.",
+      description: `Read any local file as base64. Use offset/length for large files. Max chunk ${Math.round(READ_BASE64_MAX_BYTES / 1024)} KiB.`,
       inputSchema: {
         path: z.string(),
         offset: z.number().int().nonnegative().optional().default(0),
-        length: z.number().int().positive().max(8 * 1024 * 1024).optional().default(1024 * 1024),
+        length: z.number().int().positive().max(READ_BASE64_MAX_BYTES).optional().default(Math.min(1024 * 1024, READ_BASE64_MAX_BYTES)),
       },
 
       annotations: toolAnnotations("read"),
@@ -193,7 +267,7 @@ export function registerFilesystemTools(server: McpServer): void {
       const stat = await fs.stat(validPath);
       if (!stat.isFile()) throw new Error("Path is not a regular file");
       const start = Math.min(offset, stat.size);
-      const chunkLength = Math.min(length, 8 * 1024 * 1024, stat.size - start);
+      const chunkLength = Math.min(length, READ_BASE64_MAX_BYTES, stat.size - start);
       const handle = await fs.open(validPath, "r");
       try {
         const buffer = Buffer.alloc(chunkLength);
@@ -438,14 +512,37 @@ export function registerFilesystemTools(server: McpServer): void {
     },
     async ({ path: dirPath, ignore }) => {
       const validPath = await validatePath(dirPath);
-      const entries = await fs.readdir(validPath, { withFileTypes: true });
       const ignoreMatchers = (ignore || []).map(
         (p) => new RegExp("^" + p.replace(/\./g, "\\.").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i")
       );
-      const filtered = entries.filter((e) => !ignoreMatchers.some((m) => m.test(e.name)));
-      const items = filtered.map((e) => ({ name: e.name, type: e.isDirectory() ? "directory" : "file" }));
-      await audit({ tool: "list_directory", action: "list", target: validPath, status: "ok" });
-      return toolResult("list_directory", { path: validPath, entries: items, count: items.length });
+      const items: Array<{ name: string; type: "directory" | "file" }> = [];
+      let truncated = false;
+      const dir = await fs.opendir(validPath);
+      try {
+        for await (const entry of dir) {
+          if (ignoreMatchers.some((m) => m.test(entry.name))) continue;
+          if (entry.isSymbolicLink()) continue;
+          if (items.length >= DIRECTORY_LIST_MAX_ENTRIES) {
+            truncated = true;
+            break;
+          }
+          items.push({ name: entry.name, type: entry.isDirectory() ? "directory" : "file" });
+        }
+      } finally {
+        // for-await normally closes the handle; close defensively when we break
+        // early at the entry cap. Ignore ERR_DIR_CLOSED from an already-closed dir.
+        await dir.close().catch((err: NodeJS.ErrnoException) => {
+          if (err.code !== "ERR_DIR_CLOSED") throw err;
+        });
+      }
+      await audit({ tool: "list_directory", action: "list", target: validPath, status: "ok", details: { truncated } });
+      return toolResult("list_directory", {
+        path: validPath,
+        entries: items,
+        count: items.length,
+        truncated,
+        max_entries: DIRECTORY_LIST_MAX_ENTRIES,
+      });
     }
   );
 
@@ -685,7 +782,7 @@ export function registerFilesystemTools(server: McpServer): void {
     }
   );
 
-  server.registerTool("search_files", { title: "Search Files", description: "Search file contents for a text pattern.", inputSchema: { path: z.string(), pattern: z.string(), glob: z.string().optional().default("*"), max_results: z.number().optional().default(50) }, annotations: toolAnnotations("read") }, async ({ path: searchPath, pattern, glob: globPattern, max_results }) => {
+  server.registerTool("search_files", { title: "Search Files", description: "Search file contents for a text pattern.", inputSchema: { path: z.string(), pattern: z.string(), glob: z.string().optional().default("*"), max_results: z.number().int().positive().max(500).optional().default(50) }, annotations: toolAnnotations("read") }, async ({ path: searchPath, pattern, glob: globPattern, max_results }) => {
     const validPath = await validatePath(searchPath);
     const results: string[] = [];
     await searchDirectory(validPath, new RegExp(pattern, "i"), globPattern, results, max_results);
@@ -693,11 +790,19 @@ export function registerFilesystemTools(server: McpServer): void {
     return toolResult("search_files", { path: validPath, pattern, matches: results, count: results.length });
   });
 
-  server.registerTool("directory_tree", { title: "Directory Tree", description: "Get recursive directory structure as JSON.", inputSchema: { path: z.string(), max_depth: z.number().optional().default(4) }, annotations: toolAnnotations("read") }, async ({ path: dirPath, max_depth }) => {
+  server.registerTool("directory_tree", { title: "Directory Tree", description: "Get recursive directory structure as JSON.", inputSchema: { path: z.string(), max_depth: z.number().int().nonnegative().max(20).optional().default(4) }, annotations: toolAnnotations("read") }, async ({ path: dirPath, max_depth }) => {
     const validPath = await validatePath(dirPath);
-    const tree = await buildTree(validPath, 0, max_depth);
+    const state: TreeBuildState = { nodes: 0, truncated: false };
+    const tree = await buildTree(validPath, 0, max_depth, state);
     await audit({ tool: "directory_tree", action: "tree", target: validPath, status: "ok" });
-    return toolResult("directory_tree", { path: validPath, tree, max_depth });
+    return toolResult("directory_tree", {
+      path: validPath,
+      tree,
+      max_depth,
+      nodes: state.nodes,
+      truncated: state.truncated,
+      max_nodes: DIRECTORY_TREE_MAX_NODES,
+    });
   });
 
   server.registerTool("list_allowed_directories", { title: "List Allowed Directories", description: "Show default working directory and machine access scope.", inputSchema: {}, annotations: toolAnnotations("read") }, async () => {

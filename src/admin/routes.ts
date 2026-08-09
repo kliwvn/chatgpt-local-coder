@@ -41,6 +41,12 @@ const NUMERIC_ENV_LIMITS: Record<string, [number, number]> = {
   PROCESS_MAX_RUNNING: [1, 128],
   PROCESS_HISTORY_MAX: [1, 1_000],
   PROCESS_LOG_MAX_CHARS: [4_096, 2_000_000],
+  SHELL_OUTPUT_MAX_CHARS: [4_096, 1_000_000],
+  GIT_OUTPUT_MAX_CHARS: [4_096, 2_000_000],
+  READ_TEXT_MAX_BYTES: [65_536, 6_291_456],
+  READ_BASE64_MAX_BYTES: [65_536, 2_097_152],
+  MCP_TOOL_RESULT_MAX_BYTES: [262_144, 8_388_608],
+  MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES: [16_384, 524_288],
   MCP_SESSION_TTL_MS: [15_000, 86_400_000],
   MCP_SESSION_CLEANUP_MS: [1_000, 600_000],
   MCP_SESSION_DELETE_GRACE_MS: [1_000, 600_000],
@@ -105,6 +111,13 @@ function validateAdminEnv(text: string): string | null {
   const cleanup = parsed.MCP_SESSION_CLEANUP_MS ? Number(parsed.MCP_SESSION_CLEANUP_MS) : null;
   if (ttl && cleanup && cleanup > ttl) {
     return "MCP_SESSION_CLEANUP_MS must not exceed MCP_SESSION_TTL_MS";
+  }
+  const wireMax = parsed.MCP_TOOL_RESULT_MAX_BYTES ? Number(parsed.MCP_TOOL_RESULT_MAX_BYTES) : null;
+  const duplicateMax = parsed.MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES
+    ? Number(parsed.MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES)
+    : null;
+  if (wireMax && duplicateMax && duplicateMax > wireMax) {
+    return "MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES must not exceed MCP_TOOL_RESULT_MAX_BYTES";
   }
   return null;
 }

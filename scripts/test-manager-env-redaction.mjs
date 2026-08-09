@@ -160,7 +160,30 @@ try {
     throw new Error("invalid ACTIVITY_LOG_MAX was persisted despite validation failure");
   }
 
-  console.log("OK manager env redaction: secrets masked/preserved, invalid runtime limits rejected");
+  // 6. Cross-field output-budget invariants must be validated at the Manager
+  // boundary. A text-duplication threshold above the total wire budget would
+  // re-enable oversized duplicate responses and must never reach disk.
+  const invalidBudgetSave = await jsonFetch(`${base}/api/instances/test/env`, {
+    method: "PUT",
+    body: JSON.stringify({
+      values: {
+        MCP_TOOL_RESULT_MAX_BYTES: "262144",
+        MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES: "524288",
+      },
+    }),
+  });
+  if (invalidBudgetSave.body?.ok !== false) {
+    throw new Error(`invalid output budget relation was accepted: ${JSON.stringify(invalidBudgetSave.body)}`);
+  }
+  const afterInvalidBudget = await fs.readFile(path.join(dir, "instances", "test", ".env"), "utf-8");
+  if (
+    afterInvalidBudget.includes("MCP_TOOL_RESULT_MAX_BYTES=262144") ||
+    afterInvalidBudget.includes("MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES=524288")
+  ) {
+    throw new Error("invalid output budget relation was persisted despite validation failure");
+  }
+
+  console.log("OK manager env redaction: secrets masked/preserved, runtime/output budget limits rejected safely");
 } finally {
   server?.kill();
   await fs.rm(dir, { recursive: true, force: true });

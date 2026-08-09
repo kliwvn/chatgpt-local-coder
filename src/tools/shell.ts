@@ -8,10 +8,9 @@ import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import { envBoundedInteger } from "../lib/env-utils.js";
 import {
-  bootstrapShellSession,
   execInShellSession,
   getShellStatus,
-  resetShellSession,
+  resetShellSessionQueued,
 } from "../lib/persistent-shell.js";
 
 interface ManagedProcess {
@@ -172,8 +171,6 @@ export async function shutdownManagedProcesses(): Promise<void> {
 }
 
 export function registerShellTools(server: McpServer, defaultCwd: string, timeoutSec: number): void {
-  void bootstrapShellSession(defaultCwd);
-
   server.registerTool(
     "run_command",
     {
@@ -231,7 +228,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     },
     async ({ path: dirPath }) => {
       const cwd = dirPath ? await validatePath(dirPath) : defaultCwd;
-      resetShellSession(cwd);
+      await resetShellSessionQueued(cwd);
       return toolResult("shell_reset", { cwd }, { summary: `shell cwd reset to ${cwd}` });
     }
   );

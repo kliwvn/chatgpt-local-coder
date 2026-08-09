@@ -30,6 +30,7 @@ import {
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
 import { envIntegerOrThrow } from "./lib/env-utils.js";
 import { getManagedProcessStats, shutdownManagedProcesses } from "./tools/shell.js";
+import { ensureShellBootstrap } from "./lib/persistent-shell.js";
 
 const PORT = envIntegerOrThrow("PORT", 3000, 1, 65_535);
 const ADMIN_PORT = envIntegerOrThrow("ADMIN_PORT", 3001, 1, 65_535);
@@ -62,6 +63,10 @@ const workspaceRoots = resolveWorkspaceRoots();
 const workspaceRoot = workspaceRoots[0] || process.cwd();
 setDefaultCwd(workspaceRoot);
 setWorkspaceRoots(workspaceRoots);
+// Restore durable shell cwd/history once at process startup. Per-MCP-session
+// server creation only observes this already-resolved promise, avoiding repeated
+// disk reads and stale async writes under ChatGPT transport churn.
+await ensureShellBootstrap(workspaceRoot);
 
 const upstreamManager = await initUpstreamManager();
 
