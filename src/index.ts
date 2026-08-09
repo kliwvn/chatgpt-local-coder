@@ -27,10 +27,12 @@ import {
   type InstructionContext,
 } from "./lib/instruction-context.js";
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
+import { envIntegerOrThrow } from "./lib/env-utils.js";
 
-const PORT = parseInt(process.env.PORT || "3000", 10);
-const ADMIN_PORT = parseInt(process.env.ADMIN_PORT || "3001", 10);
-const SHELL_TIMEOUT = parseInt(process.env.SHELL_TIMEOUT || "120", 10);
+const PORT = envIntegerOrThrow("PORT", 3000, 1, 65_535);
+const ADMIN_PORT = envIntegerOrThrow("ADMIN_PORT", 3001, 1, 65_535);
+const SHELL_TIMEOUT = envIntegerOrThrow("SHELL_TIMEOUT", 120, 1, 86_400);
+if (PORT === ADMIN_PORT) throw new Error("PORT and ADMIN_PORT must differ");
 const SESSION_RECOVERY =
   (process.env.MCP_SESSION_RECOVERY || "true").toLowerCase() !== "false";
 

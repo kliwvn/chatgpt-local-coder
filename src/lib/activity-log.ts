@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "fs/promises";
 import { getAuditPath } from "./audit.js";
 import { redactSensitiveText, redactSensitiveValue } from "./redaction.js";
+import { envBoundedInteger } from "./env-utils.js";
 
 export function formatLogTime(d: Date | string = new Date()): string {
   const dt = typeof d === "string" ? new Date(d) : d;
@@ -28,7 +29,10 @@ export interface ActivityEntry {
   details?: Record<string, unknown>;
 }
 
-const MAX_ENTRIES = parseInt(process.env.ACTIVITY_LOG_MAX || "500", 10);
+// Invalid/negative values previously made the trim loop either infinite
+// (e.g. -1) or disabled trimming via NaN. Keep the in-memory feed bounded even
+// when .env was edited outside the Manager validation path.
+const MAX_ENTRIES = envBoundedInteger("ACTIVITY_LOG_MAX", 500, 1, 100_000);
 const entries: ActivityEntry[] = [];
 const listeners = new Set<(entry: ActivityEntry) => void>();
 

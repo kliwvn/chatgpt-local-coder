@@ -59,6 +59,25 @@ try {
   const noteLines = memoryText.split(/\r?\n/).filter((line) => line.startsWith("- "));
   if (noteLines.length !== 30 || new Set(noteLines).size !== 30) throw new Error(`auto-memory lost update: ${noteLines.length}/30`);
 
+  // Auto memory is a recent-memory cache, not an append-only journal. Once it
+  // exceeds the retention limit, newest notes must remain visible and the raw
+  // file must stay bounded instead of growing forever while load() keeps reading
+  // only old entries.
+  await Promise.all(
+    Array.from({ length: 210 }, (_, i) =>
+      memory.appendAutoMemory("C:/concurrent-memory", `recent-note-${String(i).padStart(3, "0")}`)
+    )
+  );
+  const boundedMemoryText = await fs.readFile(path.join(root, "codex-home", "projects", projectDirs[0], "MEMORY.md"), "utf8");
+  const boundedLines = boundedMemoryText.split(/\r?\n/).filter((line) => line.startsWith("- "));
+  if (boundedLines.length > 200) throw new Error(`auto-memory line retention exceeded: ${boundedLines.length}/200`);
+  if (Buffer.byteLength(boundedMemoryText, "utf8") > 25_000) {
+    throw new Error(`auto-memory byte retention exceeded: ${Buffer.byteLength(boundedMemoryText, "utf8")}/25000`);
+  }
+  const loadedMemory = await memory.loadAutoMemory("C:/concurrent-memory");
+  if (!loadedMemory?.includes("recent-note-209")) throw new Error("auto-memory dropped newest retained note");
+  if (loadedMemory.includes("unique-note-00")) throw new Error("auto-memory retained stale oldest note after compaction");
+
   process.env.MCP_SHELL_STATE_DIR = path.join(root, "shell-state");
   const shell = await import("../dist/lib/global-shell-state.js");
   await Promise.all(Array.from({ length: 30 }, (_, i) => shell.saveGlobalShellState("C:/concurrent-shell", "C:/concurrent-shell", `command-${String(i).padStart(2, "0")}`, null)));
@@ -67,7 +86,7 @@ try {
     throw new Error(`shell-state lost update: ${state?.recent_commands?.length ?? 0}/20`);
   }
 
-  console.log("state-concurrency: ok (checkpoint 30/30, rewind/edit no-deadlock, memory 30/30, shell recent 20/20)");
+  console.log("state-concurrency: ok (checkpoint 30/30, rewind/edit no-deadlock, memory concurrent+bounded-recent, shell recent 20/20)");
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }

@@ -151,6 +151,34 @@ try {
     "symlinked workspace root did not canonicalize consistently"
   );
 
+  // Full-disk mode relaxes the boundary, not filesystem identity. A real path
+  // and a junction/symlink alias to the same file must still canonicalize to the
+  // same mutation key or concurrent agents can bypass same-file serialization.
+  process.env.FULL_DISK_ACCESS = "true";
+  const aliasRealFile = path.join(realWorkspace, "alias-race.txt");
+  const aliasLinkedFile = path.join(linkedWorkspace, "alias-race.txt");
+  await fs.writeFile(aliasRealFile, "A B\n");
+  const canonicalReal = await validatePath(aliasRealFile);
+  const canonicalAlias = await validatePath(aliasLinkedFile);
+  assert(
+    path.normalize(canonicalReal).toLowerCase() === path.normalize(canonicalAlias).toLowerCase(),
+    "full-disk mode returned different identities for real path and junction/symlink alias"
+  );
+  await Promise.all([
+    withFileMutation(canonicalReal, async () => {
+      const current = await fs.readFile(canonicalReal, "utf8");
+      await delay(20);
+      await atomicWriteFile(canonicalReal, current.replace("A", "AA"), "utf8");
+    }),
+    withFileMutation(canonicalAlias, async () => {
+      const current = await fs.readFile(canonicalAlias, "utf8");
+      await delay(20);
+      await atomicWriteFile(canonicalAlias, current.replace("B", "BB"), "utf8");
+    }),
+  ]);
+  assert((await fs.readFile(aliasRealFile, "utf8")) === "AA BB\n", "full-disk alias mutation lost an update");
+  process.env.FULL_DISK_ACCESS = "false";
+
   // Scheduler: same-file writes serialize, unrelated siblings stay parallel,
   // and directory operations conflict with descendants.
   const shared = path.join(realWorkspace, "shared.txt");

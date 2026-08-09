@@ -212,8 +212,8 @@ async function readConfig() {
 
 async function readPidFile(p) {
   try {
-    const pid = parseInt((await fsp.readFile(p, "utf-8")).trim(), 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    const pid = Number((await fsp.readFile(p, "utf-8")).trim());
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
   }
@@ -605,7 +605,20 @@ async function warmUpMcp(port) {
   }
 }
 
-async function startServer(name) {
+const serverLifecycleChains = new Map();
+
+function enqueueServerLifecycle(name, operation) {
+  const previous = serverLifecycleChains.get(name) || Promise.resolve();
+  const run = previous.then(operation, operation);
+  const settled = run.then(() => undefined, () => undefined);
+  serverLifecycleChains.set(name, settled);
+  settled.finally(() => {
+    if (serverLifecycleChains.get(name) === settled) serverLifecycleChains.delete(name);
+  });
+  return run;
+}
+
+async function startServerUnlocked(name) {
   const st = await serverStatus(name);
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
   if (st.invalidConfig) return { ok: false, error: "PORT is invalid; fix configuration before starting Local Coder." };
@@ -625,6 +638,10 @@ async function startServer(name) {
     return { ok: false, error: `Session policy không hợp lệ — sửa trong Cấu hình: ${policy.errors.join("; ")}` };
   }
   const env = await readInstanceEnv(name);
+  const runtimeLimits = validateRuntimeLimits(env);
+  if (!runtimeLimits.ok) {
+    return { ok: false, error: `Runtime limits không hợp lệ — sửa trong Cấu hình: ${runtimeLimits.errors.join("; ")}` };
+  }
   await rotateLogFile(inst.serverLog);
   const pid = spawnDetached(process.execPath, [SERVER_ENTRY], inst.serverLog, {
     ...env,
@@ -648,7 +665,7 @@ async function startServer(name) {
   return { ok: true, running: true, port: st.port, pid, health: await serverHealth(st.port) };
 }
 
-async function stopServer(name) {
+async function stopServerUnlocked(name) {
   const st = await serverStatus(name);
   if (!st.running) return { ok: true, alreadyStopped: true, port: st.port };
   const inst = instPaths(name);
@@ -657,7 +674,7 @@ async function stopServer(name) {
   // Prefer an in-process graceful shutdown on Windows too. OS-level SIGTERM /
   // taskkill bypasses Node signal handlers there; the localhost admin endpoint
   // can close MCP sessions/SSE + upstream transports before listeners exit.
-  const adminPort = parseInt(env.ADMIN_PORT || "3001", 10);
+  const adminPort = Number(env.ADMIN_PORT || "3001");
   try {
     const headers = {};
     if (env.ADMIN_TOKEN) headers["x-admin-token"] = env.ADMIN_TOKEN;
@@ -684,8 +701,64 @@ async function stopServer(name) {
   if (!killed && st.pid) killed = killPidTree(st.pid);
   invalidatePortPidCache();
   await writePidFile(inst.serverPid, null);
-  await waitFor(async () => !(await isPortOpen(st.port)), 10000);
+  const stopped = await waitFor(async () => !(await isPortOpen(st.port)), 10000);
+  if (!stopped) {
+    const current = await serverStatus(name);
+    return {
+      ok: false,
+      error: `Server did not release PORT ${st.port} after stop request${current.pid ? ` (PID ${current.pid})` : ""}.`,
+      port: st.port,
+      pid: current.pid || st.pid || null,
+      stopped: false,
+      graceful: false,
+      forced: killed,
+    };
+  }
   return { ok: true, port: st.port, stopped: true, graceful: false, forced: killed };
+}
+
+async function startServer(name) {
+  return enqueueServerLifecycle(name, () => startServerUnlocked(name));
+}
+
+async function stopServer(name) {
+  return enqueueServerLifecycle(name, () => stopServerUnlocked(name));
+}
+
+async function restartServer(name) {
+  return enqueueServerLifecycle(name, async () => {
+    const before = await serverStatus(name);
+    const stopped = await stopServerUnlocked(name);
+    if (!stopped.ok) return { ...stopped, restarted: false, previousPid: before.pid || null };
+
+    const started = await startServerUnlocked(name);
+    if (!started.ok) {
+      return {
+        ...started,
+        restarted: false,
+        previousPid: before.pid || null,
+        stop: stopped,
+      };
+    }
+
+    if (before.running && before.pid && started.pid === before.pid) {
+      return {
+        ...started,
+        ok: false,
+        restarted: false,
+        error: `Restart completed without a PID change (still ${started.pid}); refusing to report a successful restart.`,
+        previousPid: before.pid,
+      };
+    }
+
+    return {
+      ...started,
+      ok: true,
+      restarted: true,
+      previousPid: before.pid || null,
+      gracefulStop: stopped.graceful === true,
+    };
+  });
 }
 
 
@@ -756,7 +829,20 @@ async function ensureTunnelClient() {
   }
 }
 
-async function startTunnel(name) {
+const tunnelLifecycleChains = new Map();
+
+function enqueueTunnelLifecycle(name, operation) {
+  const previous = tunnelLifecycleChains.get(name) || Promise.resolve();
+  const run = previous.then(operation, operation);
+  const settled = run.then(() => undefined, () => undefined);
+  tunnelLifecycleChains.set(name, settled);
+  settled.finally(() => {
+    if (tunnelLifecycleChains.get(name) === settled) tunnelLifecycleChains.delete(name);
+  });
+  return run;
+}
+
+async function startTunnelUnlocked(name) {
   const env = await readInstanceEnv(name);
   const st = await tunnelStatus(name);
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
@@ -799,7 +885,7 @@ async function startTunnel(name) {
       "",
     ].join("\n");
     await fsp.mkdir(inst.dir, { recursive: true });
-    await fsp.writeFile(profileFile, yaml, "utf-8");
+    await atomicWriteFile(profileFile, yaml, "utf8");
 
     await fsp.writeFile(inst.tunnelLog, "");
     spawnHiddenDetached(client.path, ["run", "--profile-file", profileFile], inst.tunnelLog, {
@@ -847,12 +933,12 @@ async function startTunnel(name) {
   return { ok: true, mode: "cloudflare", url };
 }
 
-async function stopTunnel(name) {
+async function stopTunnelUnlocked(name) {
   const st = await tunnelStatus(name);
   if (!st.running) return { ok: true, alreadyStopped: true, mode: st.mode };
   const inst = instPaths(name);
   const env = await readInstanceEnv(name);
-  const port = parseInt(env.PORT || "3000", 10);
+  const port = Number(env.PORT || "3000");
   // Chỉ giết tunnel của CHÍNH instance này (lọc theo profile / cổng) — tree-kill cả codex worker con
   let killed = false;
   for (const p of pidsWithCmdLine("tunnel-client.exe", inst.profile)) {
@@ -866,7 +952,33 @@ async function stopTunnel(name) {
   invalidateProcessScanCache();
   // No blind image-name fallback: a stale PID/name can belong to an unrelated tunnel.
   await writePidFile(inst.tunnelPid, null);
-  return { ok: true, mode: st.mode, stopped: true };
+  const stopped = await waitFor(async () => {
+    if (st.mode === "openai") return !(await tunnelClientHealth(st.healthPort));
+    return pidsWithCmdLine("cloudflared.exe", `localhost:${port}`).length === 0;
+  }, 10000, 150);
+  if (!stopped) {
+    return { ok: false, mode: st.mode, stopped: false, error: "Tunnel process did not stop within 10 seconds." };
+  }
+  return { ok: true, mode: st.mode, stopped: true, forced: killed };
+}
+
+async function startTunnel(name) {
+  return enqueueTunnelLifecycle(name, () => startTunnelUnlocked(name));
+}
+
+async function stopTunnel(name) {
+  return enqueueTunnelLifecycle(name, () => stopTunnelUnlocked(name));
+}
+
+async function restartTunnel(name) {
+  return enqueueTunnelLifecycle(name, async () => {
+    const before = await tunnelStatus(name);
+    const stopped = await stopTunnelUnlocked(name);
+    if (!stopped.ok) return { ...stopped, restarted: false };
+    const started = await startTunnelUnlocked(name);
+    if (!started.ok) return { ...started, restarted: false, stop: stopped };
+    return { ...started, ok: true, restarted: true, previousMode: before.mode };
+  });
 }
 
 async function downloadCloudflared() {
@@ -874,7 +986,7 @@ async function downloadCloudflared() {
   const res = await fetch(CLOUDFLARED_DOWNLOAD_URL, { signal: AbortSignal.timeout(120000) });
   if (!res.ok) return { ok: false, error: `Tải thất bại: HTTP ${res.status}` };
   const buf = Buffer.from(await res.arrayBuffer());
-  await fsp.writeFile(CLOUDFLARED, buf);
+  await atomicWriteFile(CLOUDFLARED, buf);
   return { ok: true, bytes: buf.length };
 }
 
@@ -957,6 +1069,17 @@ const SESSION_POLICY_DEFAULTS = {
   MCP_MAX_SESSIONS: 64,
 };
 
+const RUNTIME_LIMIT_SPECS = [
+  ["SHELL_TIMEOUT", 120, 1, 86400],
+  ["ACTIVITY_LOG_MAX", 500, 1, 100000],
+  ["AUTO_MEMORY_MAX_BYTES", 25000, 1024, 10000000],
+  ["AUTO_MEMORY_MAX_LINES", 200, 1, 10000],
+  ["CHECKPOINT_MAX_COUNT", 500, 1, 100000],
+  ["CHECKPOINT_RETENTION_DAYS", 30, 1, 3650],
+  ["CHECKPOINT_MAX_FILE_BYTES", 5242880, 1024, 1073741824],
+  ["AUDIT_LOG_MAX_BYTES", 10485760, 1024, 1073741824],
+];
+
 /**
  * Fill missing/empty session-policy keys in an existing instance .env so the
  * documented defaults are persisted (survive manager restarts) instead of
@@ -1014,6 +1137,20 @@ function validateSessionPolicy(env) {
   return { ok: errors.length === 0, errors, values };
 }
 
+function validateRuntimeLimits(env) {
+  const values = {};
+  const errors = [];
+  for (const [key, fallback, min, max] of RUNTIME_LIMIT_SPECS) {
+    const raw = String(env[key] ?? "").trim();
+    const value = raw === "" ? fallback : Number(raw);
+    values[key] = value;
+    if (!Number.isInteger(value) || value < min || value > max) {
+      errors.push(`${key} phải là số nguyên ${min}–${max} (hiện tại: ${raw || `(mặc định ${fallback})`})`);
+    }
+  }
+  return { ok: errors.length === 0, errors, values };
+}
+
 async function checkConfig(name, overrides) {
   const env = { ...(await readInstanceEnv(name)), ...(overrides || {}) };
   const items = [];
@@ -1061,9 +1198,19 @@ async function checkConfig(name, overrides) {
   const cleanupRelationError = sessionPolicy.errors.find((msg) => msg.startsWith("MCP_SESSION_CLEANUP_MS không"));
   if (cleanupRelationError) push(false, "Session cleanup/TTL", cleanupRelationError);
 
-  // FULL_DISK_ACCESS — sandbox fail-closed
+  const runtimeLimits = validateRuntimeLimits(env);
+  for (const [key, value] of Object.entries(runtimeLimits.values)) {
+    const error = runtimeLimits.errors.find((msg) => msg.startsWith(key));
+    push(!error, key, error || String(value));
+  }
+
+  // FULL_DISK_ACCESS controls path-aware tools, not native shell OS isolation.
   const fda = (env.FULL_DISK_ACCESS ?? "false").toLowerCase();
-  push(["true", "false"].includes(fda), "FULL_DISK_ACCESS", fda === "true" ? "true — truy cập toàn máy" : "false — sandbox (chỉ workspace)");
+  push(
+    ["true", "false"].includes(fda),
+    "FULL_DISK_ACCESS",
+    fda === "true" ? "true — path-aware tools dùng path toàn máy" : "false — path-aware tools chỉ workspace roots"
+  );
 
   // EXTRA_WORKSPACE_PATHS — mỗi path phải tồn tại
   const extraRaw = (env.EXTRA_WORKSPACE_PATHS || "").trim();
@@ -1085,11 +1232,11 @@ async function checkConfig(name, overrides) {
 
   // Project memory giới hạn
   const memBytesRaw = (env.PROJECT_MEMORY_MAX_BYTES || "").trim();
-  const memBytes = memBytesRaw === "" ? null : parseInt(memBytesRaw, 10);
+  const memBytes = memBytesRaw === "" ? null : Number(memBytesRaw);
   const memBytesOk = memBytes === null || (Number.isInteger(memBytes) && memBytes >= 0);
   push(memBytesOk, "PROJECT_MEMORY_MAX_BYTES", memBytes === null ? "(mặc định ~25KB)" : memBytes === 0 ? "0 — không giới hạn" : `${memBytes} bytes`);
   const memLinesRaw = (env.PROJECT_MEMORY_MAX_LINES || "").trim();
-  const memLines = memLinesRaw === "" ? null : parseInt(memLinesRaw, 10);
+  const memLines = memLinesRaw === "" ? null : Number(memLinesRaw);
   const memLinesOk = memLines === null || (Number.isInteger(memLines) && memLines >= 0);
   push(memLinesOk, "PROJECT_MEMORY_MAX_LINES", memLines === null ? "(mặc định 200)" : memLines === 0 ? "0 — không giới hạn" : `${memLines} dòng`);
 
@@ -1326,6 +1473,8 @@ async function saveInstanceEnvUnlocked(name, body) {
   const parsed = parseDotEnv(next);
   const sessionPolicy = validateSessionPolicy(parsed);
   if (!sessionPolicy.ok) return { ok: false, error: sessionPolicy.errors.join("; ") };
+  const runtimeLimits = validateRuntimeLimits(parsed);
+  if (!runtimeLimits.ok) return { ok: false, error: runtimeLimits.errors.join("; ") };
 
   const port = Number(parsed.PORT);
   const adminPort = Number(parsed.ADMIN_PORT);
@@ -1563,9 +1712,11 @@ async function handleApi(req, res, url, body) {
 
     if (req.method === "POST" && sub === "/server/start") return json(res, 200, await startServer(name));
     if (req.method === "POST" && sub === "/server/stop") return json(res, 200, await stopServer(name));
+    if (req.method === "POST" && sub === "/server/restart") return json(res, 200, await restartServer(name));
 
     if (req.method === "POST" && sub === "/tunnel/start") return json(res, 200, await startTunnel(name));
     if (req.method === "POST" && sub === "/tunnel/stop") return json(res, 200, await stopTunnel(name));
+    if (req.method === "POST" && sub === "/tunnel/restart") return json(res, 200, await restartTunnel(name));
 
     if (req.method === "POST" && sub === "/pick-folder") {
       const env = await readInstanceEnv(name);
@@ -1719,12 +1870,20 @@ async function handleApi(req, res, url, body) {
     return json(res, 200, await stopServer(dname));
   }
 
+  if (req.method === "POST" && p === "/api/server/restart") {
+    return json(res, 200, await restartServer(dname));
+  }
+
   if (req.method === "POST" && p === "/api/tunnel/start") {
     return json(res, 200, await startTunnel(dname));
   }
 
   if (req.method === "POST" && p === "/api/tunnel/stop") {
     return json(res, 200, await stopTunnel(dname));
+  }
+
+  if (req.method === "POST" && p === "/api/tunnel/restart") {
+    return json(res, 200, await restartTunnel(dname));
   }
 
   if (req.method === "POST" && p === "/api/tunnel/download") {
@@ -1811,7 +1970,11 @@ async function main() {
   await ensureStateDirs();
   await ensureInstances();
   const env = await readEnv();
-  managerPortNum = parseInt(process.env.MANAGER_PORT || env.MANAGER_PORT || "3300", 10);
+  const managerPortRaw = process.env.MANAGER_PORT || env.MANAGER_PORT || "3300";
+  managerPortNum = Number(managerPortRaw);
+  if (!Number.isInteger(managerPortNum) || managerPortNum <= 0 || managerPortNum >= 65536) {
+    throw new Error(`MANAGER_PORT must be an integer in 1-65535; received ${JSON.stringify(managerPortRaw)}`);
+  }
   const port = managerPortNum;
   const noOpen = process.argv.includes("--no-open");
 
@@ -1832,8 +1995,8 @@ async function main() {
           return;
         }
         const env = await readInstanceEnv(name);
-        const adminPort = parseInt(env.ADMIN_PORT || "", 10);
-        if (!adminPort) {
+        const adminPort = Number(env.ADMIN_PORT || "");
+        if (!Number.isInteger(adminPort) || adminPort <= 0 || adminPort >= 65536) {
           json(res, 400, { ok: false, error: `Instance '${name}' chưa có ADMIN_PORT` });
           return;
         }

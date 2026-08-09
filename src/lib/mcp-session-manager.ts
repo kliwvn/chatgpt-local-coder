@@ -7,6 +7,7 @@ import { createMcpServer } from "../server-factory.js";
 import { getUpstreamManager } from "./mcp-upstream-manager.js";
 import { formatLogTime } from "./activity-log.js";
 import { getFullDiskAccess } from "./path-security.js";
+import { envIntegerOrThrow } from "./env-utils.js";
 
 const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
 
@@ -16,11 +17,6 @@ export class SessionCapacityError extends Error {
     super("MCP session capacity reached; all sessions are busy");
     this.name = "SessionCapacityError";
   }
-}
-
-function positiveEnvInt(name: string, fallback: number): number {
-  const parsed = Number.parseInt(process.env[name] || "", 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function sessionLogId(sessionId: string): string {
@@ -33,10 +29,13 @@ function sessionLogId(sessionId: string): string {
 // complete McpServer/tool registries. Two idle minutes is deliberately
 // conservative for this POST-heavy connector: connected SSE and in-flight ops
 // are exempt, and a later stale POST is transparently reconstructed by recovery.
-const SESSION_TTL_MS = positiveEnvInt("MCP_SESSION_TTL_MS", 2 * 60 * 1000);
-const SESSION_CLEANUP_INTERVAL_MS = positiveEnvInt("MCP_SESSION_CLEANUP_MS", 15 * 1000);
-const SESSION_DELETE_GRACE_MS = positiveEnvInt("MCP_SESSION_DELETE_GRACE_MS", 45 * 1000);
-const MAX_SESSION_COUNT = positiveEnvInt("MCP_MAX_SESSIONS", 64);
+const SESSION_TTL_MS = envIntegerOrThrow("MCP_SESSION_TTL_MS", 2 * 60 * 1000, 15_000, 86_400_000);
+const SESSION_CLEANUP_INTERVAL_MS = envIntegerOrThrow("MCP_SESSION_CLEANUP_MS", 15 * 1000, 1_000, 600_000);
+const SESSION_DELETE_GRACE_MS = envIntegerOrThrow("MCP_SESSION_DELETE_GRACE_MS", 45 * 1000, 1_000, 600_000);
+const MAX_SESSION_COUNT = envIntegerOrThrow("MCP_MAX_SESSIONS", 64, 8, 4_096);
+if (SESSION_CLEANUP_INTERVAL_MS > SESSION_TTL_MS) {
+  throw new Error("MCP_SESSION_CLEANUP_MS must not exceed MCP_SESSION_TTL_MS");
+}
 // Internal shutdown safety bound. Keep this below the process-level graceful
 // shutdown deadline so one wedged SDK transport cannot stall all sessions.
 const SESSION_RESOURCE_CLOSE_TIMEOUT_MS = 2000;

@@ -22,11 +22,16 @@ const fakeServerPort = await freePort();
 const fakeTunnelPort = await freePort();
 const createConflictPort = await freePort();
 const adminPort = await freePort();
+const restartServerPort = await freePort();
+const restartAdminPort = await freePort();
+const restartHealthPort = await freePort();
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-manager-safety-"));
 const instances = path.join(root, "instances");
 const stateDir = path.join(root, "state");
 const demo = path.join(instances, "demo");
+const restartDemo = path.join(instances, "restart-demo");
 await fs.mkdir(demo, { recursive: true });
+await fs.mkdir(restartDemo, { recursive: true });
 
 const fakeServer = http.createServer((req, res) => {
   if (req.url === "/health") {
@@ -66,6 +71,24 @@ await fs.writeFile(path.join(demo, ".env"), [
 ].join("\n"));
 await fs.writeFile(path.join(demo, "config.json"), JSON.stringify({ connectorName: "demo", healthPort: fakeTunnelPort, autoStart: false }));
 await fs.writeFile(path.join(demo, "server.log"), "line-1\n" + "x".repeat(5000) + "\nline-last\n");
+await fs.writeFile(path.join(restartDemo, ".env"), [
+  `PORT=${restartServerPort}`,
+  `ADMIN_PORT=${restartAdminPort}`,
+  `WORKSPACE_PATH=${process.cwd()}`,
+  "OPENAI_TUNNEL_ID=",
+  "OPENAI_TUNNEL_API_KEY=",
+  `OPENAI_TUNNEL_HEALTH_PORT=${restartHealthPort}`,
+  "CHATGPT_TOOL_PROFILE=slim",
+  "FULL_DISK_ACCESS=false",
+  "SHELL_TIMEOUT=120",
+  "MCP_SESSION_RECOVERY=true",
+  "MCP_SESSION_TTL_MS=120000",
+  "MCP_SESSION_CLEANUP_MS=15000",
+  "MCP_SESSION_DELETE_GRACE_MS=45000",
+  "MCP_MAX_SESSIONS=64",
+  "",
+].join("\n"));
+await fs.writeFile(path.join(restartDemo, "config.json"), JSON.stringify({ connectorName: "restart-demo", healthPort: restartHealthPort, autoStart: false }));
 
 const manager = spawn(process.execPath, ["manager/server.mjs", "--no-open"], {
   cwd: process.cwd(),
@@ -79,6 +102,7 @@ const manager = spawn(process.execPath, ["manager/server.mjs", "--no-open"], {
   stdio: ["ignore", "pipe", "pipe"],
 });
 let managerOutput = "";
+let managedRestartPid = null;
 manager.stdout.on("data", (d) => (managerOutput += d));
 manager.stderr.on("data", (d) => (managerOutput += d));
 
@@ -138,6 +162,34 @@ try {
   assert.equal(fakeServer.listening, true);
   assert.equal(fakeTunnel.listening, true);
 
+  const managerHtml = await fs.readFile(path.join(process.cwd(), "manager", "index.html"), "utf8");
+  const managerApp = await fs.readFile(path.join(process.cwd(), "manager", "app.js"), "utf8");
+  const managerServerSource = await fs.readFile(path.join(process.cwd(), "manager", "server.mjs"), "utf8");
+  assert.match(managerHtml, /id="btn-server-restart"[^>]*>[^<]*Khởi động lại Gateway/);
+  assert.match(managerApp, /\/server\/restart/);
+  assert.match(
+    managerServerSource,
+    /if \(before\.running && before\.pid && started\.pid === before\.pid\) \{\s*return \{\s*\.\.\.started,\s*ok: false,\s*restarted: false,/,
+    "same-PID restart guard must override started.ok instead of being overwritten by object spread"
+  );
+
+  const managedStart = (await post("/api/instances/restart-demo/server/start")).body;
+  assert.equal(managedStart.ok, true, `managed server start failed: ${JSON.stringify(managedStart)}`);
+  assert.ok(Number.isInteger(managedStart.pid));
+  managedRestartPid = managedStart.pid;
+  const managedRestart = (await post("/api/instances/restart-demo/server/restart")).body;
+  assert.equal(managedRestart.ok, true, `managed restart failed: ${JSON.stringify(managedRestart)}`);
+  assert.equal(managedRestart.restarted, true);
+  assert.equal(managedRestart.previousPid, managedStart.pid);
+  assert.ok(Number.isInteger(managedRestart.pid) && managedRestart.pid !== managedStart.pid, "restart must replace the gateway PID");
+  managedRestartPid = managedRestart.pid;
+  const restartListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
+  assert.equal(restartListing.server.running, true);
+  assert.equal(restartListing.server.pid, managedRestart.pid);
+  const managedStop = (await post("/api/instances/restart-demo/server/stop")).body;
+  assert.equal(managedStop.ok, true, `managed server stop failed: ${JSON.stringify(managedStop)}`);
+  managedRestartPid = null;
+
   const occupiedCreate = (await post("/api/instances", { name: "occupied", port: createConflictPort, workspacePath: process.cwd() })).body;
   assert.equal(occupiedCreate.ok, false);
   const badPort = (await post("/api/instances", { name: "bad-port", port: `${createConflictPort}junk`, workspacePath: process.cwd() })).body;
@@ -149,8 +201,14 @@ try {
   assert.equal(log2.unchanged, true);
   assert.equal(log2.log, "");
 
-  console.log("manager-safety: ok (identity, env 20/20, profiles 30/30, secret-safe, conditional log)");
+  console.log("manager-safety: ok (identity, env 20/20, profiles 30/30, secret-safe, restart PID swap, conditional log)");
 } finally {
+  if (managedRestartPid) {
+    if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(managedRestartPid), "/T", "/F"], { windowsHide: true });
+    else {
+      try { process.kill(managedRestartPid, "SIGTERM"); } catch {}
+    }
+  }
   manager.kill("SIGTERM");
   await sleep(300);
   if (manager.exitCode == null && process.platform === "win32") spawnSync("taskkill", ["/PID", String(manager.pid), "/T", "/F"], { windowsHide: true });

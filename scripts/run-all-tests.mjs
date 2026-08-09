@@ -59,6 +59,7 @@ const unitScripts = [
   "scripts/test-checkpoints.mjs",
   "scripts/test-mcp-upstream.mjs",
   "scripts/test-activity-log.mjs",
+  "scripts/test-config-safety.mjs",
   "scripts/test-redaction.mjs",
   "scripts/test-audit-path.mjs",
   "scripts/test-state-concurrency.mjs",

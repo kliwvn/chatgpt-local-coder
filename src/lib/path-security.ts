@@ -83,13 +83,15 @@ export async function validatePath(inputPath: string): Promise<string> {
     ? path.resolve(trimmed)
     : path.resolve(defaultCwd, trimmed);
 
-  if (getFullDiskAccess()) return resolved;
-
-  // A lexical path can stay under the workspace while a symlink/junction points
-  // outside it. Canonicalize the target (or nearest existing ancestor for create
-  // paths) and return that canonical path so later I/O cannot follow a swapped
-  // link after the boundary check.
+  // Canonicalize in both sandboxed and full-disk modes so aliases that resolve to
+  // the same filesystem object share one identity. This is required for the
+  // mutation scheduler/checkpoint layer: otherwise a real path and a junction or
+  // symlink alias can bypass same-file locking when FULL_DISK_ACCESS=true.
+  // For create paths, canonicalize the nearest existing ancestor and retain the
+  // missing suffix so the returned path is stable before the target exists.
   const canonical = await canonicalizeForBoundary(resolved);
+
+  if (getFullDiskAccess()) return canonical;
 
   if (!isWithinWorkspace(canonical)) {
     throw new Error(

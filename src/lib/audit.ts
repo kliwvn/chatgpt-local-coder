@@ -2,6 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { appendActivity } from "./activity-log.js";
 import { redactSensitiveValue } from "./redaction.js";
+import { envBoundedInteger } from "./env-utils.js";
 
 export type AuditStatus = "ok" | "error" | "blocked" | "dry-run";
 
@@ -26,10 +27,7 @@ function resolveAuditPath(): string {
 }
 
 const auditPath = resolveAuditPath();
-const parsedAuditMaxBytes = Number.parseInt(process.env.AUDIT_LOG_MAX_BYTES || "", 10);
-const auditMaxBytes = Number.isFinite(parsedAuditMaxBytes) && parsedAuditMaxBytes >= 1024
-  ? parsedAuditMaxBytes
-  : 10 * 1024 * 1024;
+const auditMaxBytes = envBoundedInteger("AUDIT_LOG_MAX_BYTES", 10 * 1024 * 1024, 1_024, 1_073_741_824);
 let auditWriteChain: Promise<void> = Promise.resolve();
 
 async function appendAuditRecord(record: Record<string, unknown>): Promise<void> {

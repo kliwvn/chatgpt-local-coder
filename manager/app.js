@@ -25,7 +25,7 @@ const toast = (msg, kind = "ok") => {
 
 let busy = false;
 const ACTION_IDS = [
-  "btn-install", "btn-server", "btn-tunnel", "btn-save", "btn-check",
+  "btn-install", "btn-server", "btn-server-restart", "btn-tunnel", "btn-save", "btn-check",
   "btn-profile-save", "btn-profile-del", "btn-tunnel-dl", "btn-del-inst", "add-create",
 ];
 const setBusy = (b) => {
@@ -108,6 +108,7 @@ function renderServerTunnel(s) {
   setDot("inst-server-dot", srv.running, srv.running ? "Server: ch?y" : serverConflict ? "Server: xung ??t c?ng" : "Server: d?ng");
   $("btn-server").textContent = srv.running ? "T?t" : "B?t";
   $("btn-server").disabled = busy;
+  $("btn-server-restart").disabled = busy || !srv.running || serverConflict;
   const roots =
     (srv.health && srv.health.instructions && srv.health.instructions.workspace_roots) ||
     (s.env.WORKSPACE_PATH ? [s.env.WORKSPACE_PATH] : []);
@@ -446,16 +447,18 @@ async function doSave() {
     if ($("chk-restart").checked) {
       const b = state.lastBundle;
       if (b && b.server.running) {
-        await api(instUrl(name, "/server/stop"), "POST");
-        await api(instUrl(name, "/server/start"), "POST");
+        const restarted = await api(instUrl(name, "/server/restart"), "POST");
+        if (!restarted.ok) throw new Error(restarted.error || "Restart Gateway thất bại");
       } else if (b && !b.server.running) {
-        await api(instUrl(name, "/server/start"), "POST");
+        const started = await api(instUrl(name, "/server/start"), "POST");
+        if (!started.ok) throw new Error(started.error || "Khởi động Gateway thất bại");
       }
       if (b && b.tunnel.running) {
-        await api(instUrl(name, "/tunnel/stop"), "POST");
-        await api(instUrl(name, "/tunnel/start"), "POST");
+        const restartedTunnel = await api(instUrl(name, "/tunnel/restart"), "POST");
+        if (!restartedTunnel.ok) throw new Error(restartedTunnel.error || "Restart Tunnel thất bại");
       } else if (b && !b.tunnel.running) {
-        await api(instUrl(name, "/tunnel/start"), "POST");
+        const startedTunnel = await api(instUrl(name, "/tunnel/start"), "POST");
+        if (!startedTunnel.ok) throw new Error(startedTunnel.error || "Khởi động Tunnel thất bại");
       }
     }
     await loadInstances(false);
@@ -538,6 +541,29 @@ async function toggleServer() {
   loadInstances(false);
 }
 
+async function restartGateway() {
+  if (!state.current) return;
+  const name = state.current;
+  const beforePid = state.lastBundle?.server?.pid || null;
+  setBusy(true);
+  toast("Đang khởi động lại Gateway…");
+  try {
+    const r = await api(instUrl(name, "/server/restart"), "POST");
+    if (!r.ok || !r.restarted) throw new Error(r.error || "Gateway restart failed");
+    const pidText = beforePid && r.pid ? ` (PID ${beforePid} → ${r.pid})` : r.pid ? ` (PID ${r.pid})` : "";
+    toast(`Gateway đã khởi động lại${pidText}; Tunnel được giữ nguyên.`, "ok");
+    LOG_STATE.sourceLog = "";
+    LOG_STATE.lastSize = 0;
+    LOG_STATE.lastMtime = 0;
+    await loadInstances(false);
+    if (state.current === name) await selectInstance(name);
+  } catch (err) {
+    toast("Khởi động lại Gateway lỗi: " + err.message, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function toggleTunnel() {
   if (!state.current) return;
   const name = state.current;
@@ -583,9 +609,9 @@ async function doAddInstance() {
     toast("Nhập tên workspace", "err");
     return;
   }
-  const parsedPort = port ? parseInt(port, 10) : undefined;
-  if (port && (Number.isNaN(parsedPort) || parsedPort <= 0 || parsedPort > 65535)) {
-    toast("Cổng không hợp lệ (1-65535)", "err");
+  const parsedPort = port ? Number(port) : undefined;
+  if (port && (!Number.isInteger(parsedPort) || parsedPort < 3000 || parsedPort > 3999)) {
+    toast("Cổng không hợp lệ (3000-3999)", "err");
     return;
   }
   setBusy(true);
@@ -699,6 +725,7 @@ function init() {
   $("btn-check").addEventListener("click", doCheck);
   $("btn-save").addEventListener("click", doSave);
   $("btn-server").addEventListener("click", toggleServer);
+  $("btn-server-restart").addEventListener("click", restartGateway);
   $("btn-tunnel").addEventListener("click", toggleTunnel);
   $("btn-tunnel-dl").addEventListener("click", doTunnelDownload);
   $("btn-copy-url").addEventListener("click", copyUrl);

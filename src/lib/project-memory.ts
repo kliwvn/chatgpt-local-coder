@@ -22,9 +22,9 @@ const DEFAULT_MAX_LINES = parseLimit(process.env.PROJECT_MEMORY_MAX_LINES, 200);
 
 /** 0 = không giới hạn; trống / không hợp lệ = fallback (mặc định). */
 function parseLimit(raw: string | undefined, fallback: number): number {
-  const n = parseInt(raw || "", 10);
+  const n = Number(raw?.trim() || "NaN");
   if (n === 0) return Infinity;
-  return Number.isInteger(n) && n > 0 ? n : fallback;
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
 }
 
 export interface ProjectMemorySection {

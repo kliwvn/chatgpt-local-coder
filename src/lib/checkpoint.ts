@@ -3,6 +3,7 @@ import path from "path";
 import { randomUUID, createHash } from "node:crypto";
 import { atomicWriteFile } from "./atomic-write.js";
 import { withFileMutations } from "./file-mutation.js";
+import { envBoundedInteger } from "./env-utils.js";
 
 export interface CheckpointFileSnapshot {
   path: string;
@@ -66,18 +67,15 @@ function getStoreRoot(): string {
 }
 
 function getMaxCount(): number {
-  const n = parseInt(process.env.CHECKPOINT_MAX_COUNT || String(DEFAULT_MAX_COUNT), 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_COUNT;
+  return envBoundedInteger("CHECKPOINT_MAX_COUNT", DEFAULT_MAX_COUNT, 1, 100_000);
 }
 
 function getRetentionDays(): number {
-  const n = parseInt(process.env.CHECKPOINT_RETENTION_DAYS || String(DEFAULT_RETENTION_DAYS), 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_RETENTION_DAYS;
+  return envBoundedInteger("CHECKPOINT_RETENTION_DAYS", DEFAULT_RETENTION_DAYS, 1, 3_650);
 }
 
 function getMaxFileBytes(): number {
-  const n = parseInt(process.env.CHECKPOINT_MAX_FILE_BYTES || String(DEFAULT_MAX_FILE_BYTES), 10);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_FILE_BYTES;
+  return envBoundedInteger("CHECKPOINT_MAX_FILE_BYTES", DEFAULT_MAX_FILE_BYTES, 1_024, 1_073_741_824);
 }
 
 function checkpointDir(id: string): string {

@@ -104,7 +104,7 @@ npm start
 | **Multi-workspace** | Mỗi workspace = 1 MCP server (PORT riêng) + 1 tunnel + 1 connector ChatGPT riêng. Workspaces lưu trong `manager/instances/` |
 | **Cài Đặt** | Kiểm tra Node/TS, `npm install` + `npm run build` một nút — đã cài thì báo "Trạng thái: Đã cài đặt OK" |
 | **Cấu hình workspace** | `WORKSPACE_PATH` + folder picker (chọn thư mục bằng dialog Windows), đổi tên, xóa, profile |
-| **Focus Server / Tunnel** | Start/stop server, nhân nuôi process/tunnel đang chạy, tunnel OpenAI ổn định (không phải cập nhật URL connector mỗi lần restart) |
+| **Focus Server / Tunnel** | Start/stop server; **Khởi động lại Gateway** thực hiện graceful restart + xác nhận PID mới trong khi giữ Tunnel đang chạy; lifecycle server/tunnel được serialize theo workspace để tránh double-spawn/race |
 | **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear. "Tất cả" = toàn bộ server.log (MCP + TOOL + lỗi); chi tiết tool/audit đầy đủ nằm trong audit file `.mcp-audit.log` |
 | **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel (dot xanh), path đầy đủ, `WORKSPACE_PATH → EXTRA_WORKSPACE_PATHS → FULL_DISK_ACCESS`, port + PID |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Focus Tunnel |
@@ -283,6 +283,10 @@ AUDIT_LOG_PATH=.mcp-audit.log
 AUDIT_LOG_MAX_BYTES=10485760
 ACTIVITY_LOG_MAX=500
 
+# Bounded recent cross-session auto-memory
+AUTO_MEMORY_MAX_BYTES=25000
+AUTO_MEMORY_MAX_LINES=200
+
 # OpenAI Secure Tunnel (optional)
 OPENAI_TUNNEL_ID=
 OPENAI_TUNNEL_API_KEY=
@@ -303,6 +307,7 @@ OPENAI_TUNNEL_API_KEY=
 | `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
 | `CHECKPOINT_ENABLED` / `CHECKPOINT_MAX_FILE_BYTES` | `true` / `5242880` | Checkpoint code trước khi sửa (rewind); file > 5MB bị skip |
 | `PROJECT_MEMORY_MAX_BYTES` / `PROJECT_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn CLAUDE.md/AGENTS.md inject vào instructions. Đặt `0` = không giới hạn |
+| `AUTO_MEMORY_MAX_BYTES` / `AUTO_MEMORY_MAX_LINES` | `25000` / `200` | Giới hạn recent cross-session auto-memory; `MEMORY.md` được compact atomic và ưu tiên note mới nhất thay vì tăng vô hạn |
 | `AUDIT_LOG_PATH` | `.mcp-audit.log` | JSONL audit log. Với managed instance, path tương đối được resolve trong `manager/instances/<name>/` để không trộn log giữa workspace |
 | `AUDIT_LOG_MAX_BYTES` | `10485760` | Giới hạn audit log hiện tại ~10MB; rotate sang `.1` trước khi append tiếp |
 | `ACTIVITY_LOG_MAX` | `500` | Số dòng activity giữ trong RAM cho feed admin (`/api/activity`) |

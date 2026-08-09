@@ -26,7 +26,17 @@ const SECRET_KEY_PATTERN =
   /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
 const REDACTED_MASK = "********";
 
-const SESSION_POLICY_LIMITS: Record<string, [number, number]> = {
+const NUMERIC_ENV_LIMITS: Record<string, [number, number]> = {
+  PORT: [1, 65_535],
+  ADMIN_PORT: [1, 65_535],
+  SHELL_TIMEOUT: [1, 86_400],
+  ACTIVITY_LOG_MAX: [1, 100_000],
+  AUTO_MEMORY_MAX_BYTES: [1_024, 10_000_000],
+  AUTO_MEMORY_MAX_LINES: [1, 10_000],
+  CHECKPOINT_MAX_COUNT: [1, 100_000],
+  CHECKPOINT_RETENTION_DAYS: [1, 3_650],
+  CHECKPOINT_MAX_FILE_BYTES: [1_024, 1_073_741_824],
+  AUDIT_LOG_MAX_BYTES: [1_024, 1_073_741_824],
   MCP_SESSION_TTL_MS: [15_000, 86_400_000],
   MCP_SESSION_CLEANUP_MS: [1_000, 600_000],
   MCP_SESSION_DELETE_GRACE_MS: [1_000, 600_000],
@@ -80,7 +90,7 @@ function serializeDotEnv(values: Record<string, string>, original: string): stri
 
 function validateAdminEnv(text: string): string | null {
   const parsed = parseDotEnv(text);
-  for (const [key, [min, max]] of Object.entries(SESSION_POLICY_LIMITS)) {
+  for (const [key, [min, max]] of Object.entries(NUMERIC_ENV_LIMITS)) {
     if (!(key in parsed) || parsed[key] === "") continue;
     const n = Number(parsed[key]);
     if (!Number.isInteger(n) || n < min || n > max) {

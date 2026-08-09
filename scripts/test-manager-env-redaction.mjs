@@ -146,7 +146,21 @@ try {
   }
   if (!afterValues.includes("SHELL_TIMEOUT=90")) throw new Error("values save lost the non-secret edit");
 
-  console.log("OK manager env redaction: GET masked (both routes), sentinel round-trip preserves secrets");
+  // 5. Manager must reject invalid runtime limits instead of persisting values
+  // that the server would later have to silently repair/fallback at startup.
+  const invalidLimitSave = await jsonFetch(`${base}/api/instances/test/env`, {
+    method: "PUT",
+    body: JSON.stringify({ values: { ACTIVITY_LOG_MAX: "-1" } }),
+  });
+  if (invalidLimitSave.body?.ok !== false) {
+    throw new Error(`invalid ACTIVITY_LOG_MAX was accepted: ${JSON.stringify(invalidLimitSave.body)}`);
+  }
+  const afterInvalid = await fs.readFile(path.join(dir, "instances", "test", ".env"), "utf-8");
+  if (afterInvalid.includes("ACTIVITY_LOG_MAX=-1")) {
+    throw new Error("invalid ACTIVITY_LOG_MAX was persisted despite validation failure");
+  }
+
+  console.log("OK manager env redaction: secrets masked/preserved, invalid runtime limits rejected");
 } finally {
   server?.kill();
   await fs.rm(dir, { recursive: true, force: true });
