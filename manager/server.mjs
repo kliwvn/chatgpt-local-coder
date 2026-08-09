@@ -378,6 +378,19 @@ function instPaths(name) {
   };
 }
 
+function isLegacyRuntimeStateValue(value, legacyPath) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  const resolved = path.resolve(ROOT, raw);
+  const legacy = path.resolve(legacyPath);
+  return IS_WIN ? resolved.toLowerCase() === legacy.toLowerCase() : resolved === legacy;
+}
+
+function managedRuntimeStatePath(value, legacyPath, managedPath) {
+  const raw = String(value || "").trim();
+  return !raw || isLegacyRuntimeStateValue(raw, legacyPath) ? managedPath : raw;
+}
+
 async function migrateLegacyRuntimeState(name, env, inst) {
   if (name !== "default") return;
   const candidates = [
@@ -385,26 +398,43 @@ async function migrateLegacyRuntimeState(name, env, inst) {
     { envKey: "MCP_SHELL_STATE_DIR", legacy: path.join(ROOT, ".mcp-state"), target: path.join(inst.dir, "shell-state") },
   ];
   for (const item of candidates) {
-    if (String(env[item.envKey] || "").trim()) continue;
+    const configured = String(env[item.envKey] || "").trim();
+    const legacyConfigured = isLegacyRuntimeStateValue(configured, item.legacy);
+    if (configured && !legacyConfigured) continue;
+    let legacyExists = false;
     try {
       await fsp.access(item.legacy);
+      legacyExists = true;
     } catch {
-      continue;
+      // A legacy-equivalent setting can remain after the directory was already
+      // cleaned manually. Remove the stale setting below so runtime/UI agree.
     }
-    try {
-      await fsp.access(item.target);
-      console.warn(`[manager] Legacy runtime state left in place because target exists: ${item.legacy} -> ${item.target}`);
-      continue;
-    } catch {}
-    await fsp.mkdir(inst.dir, { recursive: true });
-    try {
-      await retryTransientFsMutation(() => fsp.rename(item.legacy, item.target));
-    } catch (err) {
-      if (err?.code !== "EXDEV") throw err;
-      await fsp.cp(item.legacy, item.target, { recursive: true, force: false, errorOnExist: true });
-      await fsp.rm(item.legacy, { recursive: true, force: true });
+    if (legacyExists) {
+      try {
+        await fsp.access(item.target);
+        throw new Error(`Legacy runtime state migration conflict: both ${item.legacy} and ${item.target} exist`);
+      } catch (err) {
+        if (err?.code !== "ENOENT") throw err;
+      }
+      await fsp.mkdir(inst.dir, { recursive: true });
+      try {
+        await retryTransientFsMutation(() => fsp.rename(item.legacy, item.target));
+      } catch (err) {
+        if (err?.code !== "EXDEV") throw err;
+        await fsp.cp(item.legacy, item.target, { recursive: true, force: false, errorOnExist: true });
+        await fsp.rm(item.legacy, { recursive: true, force: true });
+      }
+      console.log(`[manager] Migrated legacy runtime state: ${item.legacy} -> ${item.target}`);
     }
-    console.log(`[manager] Migrated legacy runtime state: ${item.legacy} -> ${item.target}`);
+    if (legacyConfigured) {
+      await enqueueFileMutation(inst.env, async () => {
+        const rawEnv = await readInstanceEnvRaw(name);
+        const current = parseDotEnv(rawEnv);
+        if (!isLegacyRuntimeStateValue(current[item.envKey], item.legacy)) return;
+        await atomicWriteFile(inst.env, serializeDotEnv({ [item.envKey]: null }, rawEnv), "utf8");
+      });
+      delete env[item.envKey];
+    }
   }
 }
 
@@ -755,8 +785,8 @@ async function startServerUnlocked(name) {
     // because every managed server process is spawned with cwd=ROOT.
     MCP_ENV_FILE: inst.env,
     MCP_INSTANCE_NAME: name,
-    CHECKPOINT_PATH: String(env.CHECKPOINT_PATH || "").trim() || path.join(inst.dir, "checkpoints"),
-    MCP_SHELL_STATE_DIR: String(env.MCP_SHELL_STATE_DIR || "").trim() || path.join(inst.dir, "shell-state"),
+    CHECKPOINT_PATH: managedRuntimeStatePath(env.CHECKPOINT_PATH, path.join(ROOT, ".mcp-checkpoints"), path.join(inst.dir, "checkpoints")),
+    MCP_SHELL_STATE_DIR: managedRuntimeStatePath(env.MCP_SHELL_STATE_DIR, path.join(ROOT, ".mcp-state"), path.join(inst.dir, "shell-state")),
   });
   invalidatePortPidCache();
   await writePidFile(inst.serverPid, pid);

@@ -113,7 +113,7 @@ npm start
 
 Manager và server chạy độc lập: manager quản lý, server xử lý MCP. Tắt manager không làm chết server đang chạy.
 
-Managed instances giữ checkpoint/shell runtime state trong thư mục instance (`manager/instances/<name>/checkpoints` và `shell-state`) thay vì tạo `.mcp-checkpoints` / `.mcp-state` ở repo root. Instance `default` tự migrate legacy repo-root state khi khởi động nếu chưa có target và người dùng chưa cấu hình custom path.
+Managed instances giữ checkpoint/shell runtime state trong thư mục instance (`manager/instances/<name>/checkpoints` và `shell-state`) thay vì tạo `.mcp-checkpoints` / `.mcp-state` ở repo root. Instance `default` tự migrate legacy repo-root state khi khởi động nếu chưa có target và người dùng chưa cấu hình custom path; các giá trị legacy tương đương như `CHECKPOINT_PATH=.mcp-checkpoints` cũng được nhận diện, migrate và gỡ khỏi `.env` sau khi chuyển state thành công.
 
 ## 🔌 Connect ChatGPT
 
