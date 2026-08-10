@@ -1,7 +1,7 @@
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { validatePath } from "./path-security.js";
+import { getWorkspaceRoots, setWorkspaceRoots, validatePath } from "./path-security.js";
 import { readUtf8FilePrefix } from "./bounded-file.js";
 
 const ROOT_MEMORY_FILES = [
@@ -304,35 +304,45 @@ export async function loadProjectMemory(
   const maxBytes = opts?.maxBytes ?? DEFAULT_MAX_BYTES;
   const maxLines = opts?.maxLines ?? DEFAULT_MAX_LINES;
   const root = path.resolve(workspaceRoot);
-  const workspace_roots = opts?.workspaceRoots ?? [root];
+  const workspace_roots =
+    opts?.workspaceRoots && opts.workspaceRoots.length > 0 ? opts.workspaceRoots : [root];
   const sections: ProjectMemorySection[] = [];
   const totalBytes = { value: 0 };
 
-  if (opts?.includeUserMemory !== false) {
-    for (const userPath of USER_MEMORY_CANDIDATES) {
-      if (!(await fileExists(userPath))) continue;
-      await appendSection(sections, totalBytes, maxBytes, maxLines, userPath, "user");
-      break;
-    }
-  }
-
-  for (const rel of ROOT_MEMORY_FILES) {
-    const filePath = path.join(root, rel);
-    if (!(await fileExists(filePath))) continue;
-    await appendSection(sections, totalBytes, maxBytes, maxLines, filePath, "project");
-  }
-
-  const rulesDir = path.join(root, ".claude", "rules");
-  if (totalBytes.value < maxBytes && (await fileExists(rulesDir))) {
-    try {
-      const safeRulesDir = await validatePath(rulesDir);
-      for (const ruleFile of await listUnconditionalRuleFiles(safeRulesDir)) {
-        await appendSection(sections, totalBytes, maxBytes, maxLines, ruleFile, "rule");
+  // The workspaceRoots option is the sandbox boundary for this load: swap it into
+  // path-security for the duration so project/rules files and @imports are validated
+  // against exactly these roots, then restore the process-wide roots.
+  const previousRoots = getWorkspaceRoots();
+  setWorkspaceRoots(workspace_roots);
+  try {
+    if (opts?.includeUserMemory !== false) {
+      for (const userPath of USER_MEMORY_CANDIDATES) {
+        if (!(await fileExists(userPath))) continue;
+        await appendSection(sections, totalBytes, maxBytes, maxLines, userPath, "user");
+        break;
       }
-    } catch {
-      // A project-controlled rules symlink/junction outside the configured roots
-      // is intentionally ignored when the path sandbox is enabled.
     }
+
+    for (const rel of ROOT_MEMORY_FILES) {
+      const filePath = path.join(root, rel);
+      if (!(await fileExists(filePath))) continue;
+      await appendSection(sections, totalBytes, maxBytes, maxLines, filePath, "project");
+    }
+
+    const rulesDir = path.join(root, ".claude", "rules");
+    if (totalBytes.value < maxBytes && (await fileExists(rulesDir))) {
+      try {
+        const safeRulesDir = await validatePath(rulesDir);
+        for (const ruleFile of await listUnconditionalRuleFiles(safeRulesDir)) {
+          await appendSection(sections, totalBytes, maxBytes, maxLines, ruleFile, "rule");
+        }
+      } catch {
+        // A project-controlled rules symlink/junction outside the configured roots
+        // is intentionally ignored when the path sandbox is enabled.
+      }
+    }
+  } finally {
+    setWorkspaceRoots(previousRoots);
   }
 
   return {
