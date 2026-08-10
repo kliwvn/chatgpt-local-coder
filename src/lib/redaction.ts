@@ -43,13 +43,13 @@ export function redactSensitiveText(input: string): string {
 
   // Shell/env assignments: OPENAI_API_KEY=x, $env:ADMIN_TOKEN='x', token="x".
   text = text.replace(
-    /((?:\$?env:)?)([A-Za-z_][A-Za-z0-9_-]{0,100})\s*=\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
+    /((?:\$?env:)?)([A-Za-z_][A-Za-z0-9_.-]{0,100})\s*=\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
     redactAssignment
   );
 
   // JSON/object-like serialized assignments: "api_key":"x", 'token':'x'.
   text = text.replace(
-    /(["']?)([A-Za-z_][A-Za-z0-9_-]{0,100})\1\s*:\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
+    /(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,100})\1\s*:\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
     redactColonAssignment
   );
 

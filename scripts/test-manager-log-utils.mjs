@@ -2,7 +2,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { redactSensitiveLogText, rotateLogFile, tailFile } from "../manager/log-utils.mjs";
+import { redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "../manager/log-utils.mjs";
 import { redactSensitiveText } from "../dist/lib/redaction.js";
 
 const managerApp = await fs.readFile(new URL("../manager/app.js", import.meta.url), "utf8");
@@ -40,6 +40,7 @@ try {
     "Authorization: Basic ZmFrZTpmYWtl --next keep-me",
     "Proxy-Authorization: Token fakeProxy123 --next keep-me",
     "api-key=fakeHyphen123 --next keep-me",
+    "x.api.key=fakeDotted123 --next keep-me",
     JSON.stringify({ API_KEY: "fakeJsonSecret123", "api-key": "fakeHyphenJson123", plain: "ok" }),
     "plain=keep-me",
   ];
@@ -52,6 +53,18 @@ try {
   }
   const redactedJson = redactSensitiveLogText(JSON.stringify({ API_KEY: "fakeJsonSecret123", plain: "ok" }));
   assert.deepEqual(JSON.parse(redactedJson), { API_KEY: "********", plain: "ok" }, "Manager redaction must preserve valid JSON/JSONL");
+
+  const historical = path.join(dir, "historical.log");
+  await fs.writeFile(historical, `x.api.key=${secret}\nAuthorization: Bearer ${bearer}\nplain=keep-me\n`, "utf8");
+  assert.equal(await scrubLogFile(historical), true, "historical managed log should be scrubbed on disk");
+  const historicalDisk = await fs.readFile(historical, "utf8");
+  assert.equal(historicalDisk.includes(secret), false);
+  assert.equal(historicalDisk.includes(bearer), false);
+  assert.match(historicalDisk, /plain=keep-me/);
+  assert.equal(await scrubLogFile(historical), false, "already-scrubbed log should be a no-op");
+  const unsrubbable = path.join(dir, "unsrubbable.log");
+  await fs.mkdir(unsrubbable);
+  await assert.rejects(scrubLogFile(unsrubbable), "non-ENOENT scrub failures must fail closed instead of pretending the log is clean");
 
   const log = path.join(dir, "server.log");
   await fs.writeFile(log, "first-generation", "utf8");

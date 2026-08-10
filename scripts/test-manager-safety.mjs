@@ -102,6 +102,8 @@ await fs.writeFile(path.join(restartDemo, ".env"), [
   "",
 ].join("\n"));
 await fs.writeFile(path.join(restartDemo, "config.json"), JSON.stringify({ connectorName: "restart-demo", healthPort: restartHealthPort, autoStart: false }));
+const restartHistoricalSecret = "restart-historical-secret-778899";
+await fs.writeFile(path.join(restartDemo, "server.log"), `x.api.key=${restartHistoricalSecret}\nplain=keep-before-start\n`, "utf8");
 
 const manager = spawn(process.execPath, ["manager/server.mjs", "--no-open"], {
   cwd: process.cwd(),
@@ -228,6 +230,11 @@ try {
   assert.equal(managedStart.ok, true, `managed server start failed: ${JSON.stringify(managedStart)}`);
   assert.ok(Number.isInteger(managedStart.pid));
   managedRestartPid = managedStart.pid;
+  const startLogOnDisk = await fs.readFile(path.join(restartDemo, "server.log"), "utf8");
+  assert.equal(startLogOnDisk.includes(restartHistoricalSecret), false, "managed server start must scrub historical secrets at rest");
+  assert.match(startLogOnDisk, /plain=keep-before-start/, "managed server scrub must preserve non-secret history");
+  const restartEnvAfterStart = await fs.readFile(path.join(restartDemo, ".env"), "utf8");
+  assert.match(restartEnvAfterStart, /^AUDIT_LOG_PATH=\.mcp-audit\.log$/m, "existing managed instance must backfill an instance-local audit path before start");
   const managedRestart = (await post("/api/instances/restart-demo/server/restart")).body;
   assert.equal(managedRestart.ok, true, `managed restart failed: ${JSON.stringify(managedRestart)}`);
   assert.equal(managedRestart.restarted, true);
@@ -265,6 +272,13 @@ try {
   assert.equal(occupiedCreate.ok, false);
   const badPort = (await post("/api/instances", { name: "bad-port", port: `${createConflictPort}junk`, workspacePath: process.cwd() })).body;
   assert.equal(badPort.ok, false, "port parsing must reject numeric prefixes with junk suffixes");
+
+  const auditLocalCreate = (await post("/api/instances", { name: "audit-local", workspacePath: process.cwd(), autoStart: false })).body;
+  assert.equal(auditLocalCreate.ok, true, `audit-local create failed: ${JSON.stringify(auditLocalCreate)}`);
+  const auditLocalEnv = await fs.readFile(path.join(instances, "audit-local", ".env"), "utf8");
+  assert.match(auditLocalEnv, /^AUDIT_LOG_PATH=\.mcp-audit\.log$/m, "new managed instances must default to an instance-local audit path");
+  const auditLocalDelete = (await api("/api/instances/audit-local", { method: "DELETE" })).body;
+  assert.equal(auditLocalDelete.ok, true, `audit-local delete failed: ${JSON.stringify(auditLocalDelete)}`);
 
   const log1 = (await api("/api/instances/demo/log?kind=server&max=300000")).body;
   assert.ok(log1.log.includes("line-last"));

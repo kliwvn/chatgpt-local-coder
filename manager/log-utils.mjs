@@ -1,4 +1,5 @@
 ﻿import fs from "node:fs/promises";
+import { atomicWriteFile } from "./fs-utils.mjs";
 
 export const DEFAULT_MANAGED_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const REDACTED_MASK = "********";
@@ -36,11 +37,11 @@ export function redactSensitiveLogText(input) {
   );
   text = text.replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{6,}={0,2}/gi, `Bearer ${REDACTED_MASK}`);
   text = text.replace(
-    /((?:\$?env:)?)([A-Za-z_][A-Za-z0-9_-]{0,100})\s*=\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
+    /((?:\$?env:)?)([A-Za-z_][A-Za-z0-9_.-]{0,100})\s*=\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
     redactAssignment
   );
   text = text.replace(
-    /(["']?)([A-Za-z_][A-Za-z0-9_-]{0,100})\1\s*:\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
+    /(["']?)([A-Za-z_][A-Za-z0-9_.-]{0,100})\1\s*:\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
     redactColonAssignment
   );
   text = text.replace(
@@ -49,6 +50,20 @@ export function redactSensitiveLogText(input) {
   );
   text = text.replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b/g, `sk-${REDACTED_MASK}`);
   return text;
+}
+
+/** Rewrite a stopped managed process log with secrets redacted at rest. */
+export async function scrubLogFile(file) {
+  try {
+    const raw = await fs.readFile(file, "utf8");
+    const sanitized = redactSensitiveLogText(raw);
+    if (sanitized === raw) return false;
+    await atomicWriteFile(file, sanitized, "utf8");
+    return true;
+  } catch (err) {
+    if (err?.code === "ENOENT") return false;
+    throw err;
+  }
 }
 
 /** Read the tail without emitting U+FFFD when the byte window starts mid-codepoint. */

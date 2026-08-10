@@ -68,9 +68,34 @@ try {
   for (const value of [secret, bearer, flagSecret, openAiSecret]) assert.equal(entryJson.includes(value), false);
   assert.equal(Object.prototype.hasOwnProperty.call(entry.details || {}, "arguments"), false, "raw MCP arguments must not be stored in activity");
 
+  const legacyAuditSecret = "legacy-audit-secret-112233";
+  const legacyAuditBackupSecret = "legacy-audit-backup-secret-445566";
+  await fs.writeFile(
+    process.env.AUDIT_LOG_PATH,
+    JSON.stringify({ time: new Date().toISOString(), details: { API_KEY: legacyAuditSecret } }) +
+      `\nAuthorization: Bearer ${legacyAuditSecret}\n`,
+    "utf8"
+  );
+  await fs.mkdir(`${process.env.AUDIT_LOG_PATH}.1`);
+
   const audit = await import("../dist/lib/audit.js");
+  await audit.audit({ tool: "run_command", action: "migration-first-attempt", status: "error", details: { command, API_KEY: secret } });
+  const afterFailedMigration = await fs.readFile(process.env.AUDIT_LOG_PATH, "utf8");
+  assert.equal(afterFailedMigration.includes(legacyAuditSecret), false, "active history should be scrubbed before a later generation failure");
+  assert.equal(afterFailedMigration.includes("migration-first-attempt"), false, "audit append must fail closed when historical scrub cannot complete");
+
+  await fs.rm(`${process.env.AUDIT_LOG_PATH}.1`, { recursive: true, force: true });
+  await fs.writeFile(
+    `${process.env.AUDIT_LOG_PATH}.1`,
+    JSON.stringify({ time: new Date().toISOString(), details: { "x.api.key": legacyAuditBackupSecret } }) + "\n",
+    "utf8"
+  );
   await audit.audit({ tool: "run_command", action: "command", status: "error", details: { command, API_KEY: secret } });
-  const newest = (await fs.readFile(process.env.AUDIT_LOG_PATH, "utf8")).trim().split(/\r?\n/).at(-1) || "";
+  const auditDisk = await fs.readFile(process.env.AUDIT_LOG_PATH, "utf8");
+  const auditBackupDisk = await fs.readFile(`${process.env.AUDIT_LOG_PATH}.1`, "utf8");
+  assert.equal(auditDisk.includes(legacyAuditSecret), false, "historical active audit log retained plaintext secret");
+  assert.equal(auditBackupDisk.includes(legacyAuditBackupSecret), false, "historical rotated audit log retained plaintext secret");
+  const newest = auditDisk.trim().split(/\r?\n/).at(-1) || "";
   for (const value of [secret, bearer, flagSecret, openAiSecret]) assert.equal(newest.includes(value), false, "audit record leaked secret");
   JSON.parse(newest);
 

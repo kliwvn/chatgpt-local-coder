@@ -26,7 +26,7 @@ import path from "node:path";
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { isSecretKeyName, redactSensitiveLogText, rotateLogFile, tailFile } from "./log-utils.mjs";
+import { isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
 import {
   atomicWriteFile,
   enqueueKeyedMutation,
@@ -759,10 +759,10 @@ async function startServerUnlocked(name) {
     return { ok: false, error: "dist/index.js chưa tồn tại — bấm 'Cài Đặt' trước." };
   }
   const inst = instPaths(name);
-  // Persist documented session-policy defaults for instances created before
-  // these keys existed (e.g. "default"), so policy survives manager restarts
-  // instead of silently relying on the server process fallback.
-  await ensureSessionPolicyDefaults(name);
+  // Persist managed-runtime defaults for instances created before these keys
+  // existed (e.g. "default"), including an instance-local audit path, instead
+  // of silently relying on process-level fallbacks.
+  await ensureManagedRuntimeDefaults(name);
   // Chặn start nếu policy không hợp lệ: server sẽ chạy với process-default
   // (vd TTL=120000) trong khi UI hiển thị giá trị đã lưu → UI khác thực tế.
   const policy = validateSessionPolicy(await readInstanceEnv(name));
@@ -775,6 +775,12 @@ async function startServerUnlocked(name) {
     return { ok: false, error: `Runtime limits không hợp lệ — sửa trong Cấu hình: ${runtimeLimits.errors.join("; ")}` };
   }
   await migrateLegacyRuntimeState(name, env, inst);
+  // serverStatus above established that this managed server is stopped, so no
+  // child owns these process logs. Scrub historical generations before append /
+  // rotation so old credentials do not remain at rest indefinitely.
+  for (const file of [inst.serverLog, `${inst.serverLog}.1`, `${inst.serverLog}.2`]) {
+    await scrubLogFile(file);
+  }
   await rotateLogFile(inst.serverLog);
   const pid = spawnDetached(process.execPath, [SERVER_ENTRY], inst.serverLog, {
     ...env,
@@ -1238,12 +1244,12 @@ const RUNTIME_LIMIT_SPECS = [
 ];
 
 /**
- * Fill missing/empty session-policy keys in an existing instance .env so the
- * documented defaults are persisted (survive manager restarts) instead of
- * silently relying on the server's process-level fallback. Invalid values are
- * left untouched and surfaced by validateSessionPolicy/checkConfig instead.
+ * Fill missing/empty managed-runtime defaults in an existing instance .env.
+ * Besides session policy, AUDIT_LOG_PATH must stay relative to MCP_ENV_FILE so
+ * multiple managed instances do not silently share the repo-root audit log.
+ * Invalid non-empty values are left untouched for normal validation/reporting.
  */
-async function ensureSessionPolicyDefaults(name) {
+async function ensureManagedRuntimeDefaults(name) {
   const file = instPaths(name).env;
   return enqueueFileMutation(file, async () => {
     try {
@@ -1253,7 +1259,8 @@ async function ensureSessionPolicyDefaults(name) {
       if (!raw.includes("=")) return { changed: false };
       const env = parseDotEnv(raw);
       const updates = {};
-      for (const [key, fallback] of Object.entries(SESSION_POLICY_DEFAULTS)) {
+      const managedDefaults = { ...SESSION_POLICY_DEFAULTS, AUDIT_LOG_PATH: ".mcp-audit.log" };
+      for (const [key, fallback] of Object.entries(managedDefaults)) {
         const current = String(env[key] ?? "").trim();
         if (current === "") updates[key] = String(fallback);
       }
@@ -1542,6 +1549,7 @@ async function createInstance(body) {
     `MCP_SESSION_CLEANUP_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS}`,
     `MCP_SESSION_DELETE_GRACE_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS}`,
     `MCP_MAX_SESSIONS=${SESSION_POLICY_DEFAULTS.MCP_MAX_SESSIONS}`,
+    "AUDIT_LOG_PATH=.mcp-audit.log",
     "",
   ].join("\n");
   await atomicWriteFile(inst.env, envText, "utf8");
