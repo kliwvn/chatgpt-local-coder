@@ -2,7 +2,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { rotateLogFile, tailFile } from "../manager/log-utils.mjs";
+import { redactSensitiveLogText, rotateLogFile, tailFile } from "../manager/log-utils.mjs";
+import { redactSensitiveText } from "../dist/lib/redaction.js";
 
 const managerApp = await fs.readFile(new URL("../manager/app.js", import.meta.url), "utf8");
 assert.match(managerApp, /COMMAND \(\?:FAILED\|NO MATCH\)/, "MCP-only filter must include command outcomes");
@@ -20,6 +21,37 @@ try {
   assert.equal(await tailFile(utf8, 4), "Z", "tail should skip leading UTF-8 continuation bytes");
   assert.equal((await tailFile(utf8, 64)).includes("\uFFFD"), false, "full tail must not inject replacement chars");
   assert.equal(await tailFile(utf8, 64), "xx🙂Z", "tail must preserve a complete trailing multibyte codepoint");
+
+  const secret = "manager-log-secret-123456";
+  const bearer = "managerBearerToken123456";
+  const redacted = redactSensitiveLogText(
+    `$env:OPENAI_TUNNEL_API_KEY=${secret}; Authorization: Bearer ${bearer}; --token ${secret}; sk-proj-abcdefghijk123456`
+  );
+  assert.equal(redacted.includes(secret), false);
+  assert.equal(redacted.includes(bearer), false);
+  assert.match(redacted, /OPENAI_TUNNEL_API_KEY=\*{8}/);
+  assert.match(redacted, /Authorization:\s*\*{8}/i);
+  assert.match(redacted, /--token\s+\*{8}/i);
+  assert.match(redacted, /sk-\*{8}/);
+
+  const parityCorpus = [
+    "$env:OPENAI_TUNNEL_API_KEY=fakeSecret123; --token fakeToken123",
+    "curl -H 'Authorization: Bearer fakeBearer123' --next keep-me",
+    "Authorization: Basic ZmFrZTpmYWtl --next keep-me",
+    "Proxy-Authorization: Token fakeProxy123 --next keep-me",
+    "api-key=fakeHyphen123 --next keep-me",
+    JSON.stringify({ API_KEY: "fakeJsonSecret123", "api-key": "fakeHyphenJson123", plain: "ok" }),
+    "plain=keep-me",
+  ];
+  for (const sample of parityCorpus) {
+    assert.equal(
+      redactSensitiveLogText(sample),
+      redactSensitiveText(sample),
+      "Manager/runtime redactors must stay in sync"
+    );
+  }
+  const redactedJson = redactSensitiveLogText(JSON.stringify({ API_KEY: "fakeJsonSecret123", plain: "ok" }));
+  assert.deepEqual(JSON.parse(redactedJson), { API_KEY: "********", plain: "ok" }, "Manager redaction must preserve valid JSON/JSONL");
 
   const log = path.join(dir, "server.log");
   await fs.writeFile(log, "first-generation", "utf8");

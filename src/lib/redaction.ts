@@ -4,15 +4,20 @@ export const SECRET_KEY_PATTERN =
   /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|AUTHORIZATION|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
 
 export function isSecretKeyName(key: string): boolean {
-  return SECRET_KEY_PATTERN.test(key.replace(/^\$?env:/i, ""));
+  const normalized = key.replace(/^\$?env:/i, "").replace(/[-.]/g, "_");
+  return SECRET_KEY_PATTERN.test(normalized);
 }
 
 function redactAssignment(match: string, prefix: string, key: string, _value: string): string {
   return isSecretKeyName(key) ? `${prefix}${key}=${REDACTED_MASK}` : match;
 }
 
-function redactColonAssignment(match: string, quote: string, key: string, _value: string): string {
-  return isSecretKeyName(key) ? `${quote}${key}${quote}:${REDACTED_MASK}` : match;
+function redactColonAssignment(match: string, quote: string, key: string, value: string): string {
+  if (!isSecretKeyName(key)) return match;
+  // Preserve the source value's quote style. JSON string fields stay valid,
+  // while shell/log object-like text keeps its original unquoted shape.
+  const valueQuote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : "";
+  return `${quote}${key}${quote}:${valueQuote}${REDACTED_MASK}${valueQuote}`;
 }
 
 /**
@@ -22,11 +27,16 @@ function redactColonAssignment(match: string, quote: string, key: string, _value
 export function redactSensitiveText(input: string): string {
   let text = String(input);
 
-  // Authorization must be handled before generic key:value masking; otherwise
-  // "Authorization: Bearer <token>" could mask only the word Bearer and leave
-  // the credential behind.
+  // Authorization must be handled before generic key:value masking. Mask the
+  // complete quoted header when possible, then conservatively mask the remainder
+  // of an unquoted header value. This covers Basic/Digest/AWS-style schemes too,
+  // instead of masking only the scheme token and leaving the credential behind.
   text = text.replace(
-    /((?:proxy-)?authorization\s*[:=]\s*)(?:bearer\s+)?("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
+    /(["'])((?:proxy-)?authorization\s*[:=]\s*)(?!\*{4,})[^"'\r\n]*\1/gi,
+    `$1$2${REDACTED_MASK}$1`
+  );
+  text = text.replace(
+    /((?:proxy-)?authorization\s*[:=])(?!(?:[ \t]*\*{4,}))[ \t]*(?:(?:basic|bearer|token)\s+[^\s,;&'\"]+|(?:digest|aws4-hmac-sha256)\s+[^;\r\n]+|[^\s,;&'\"]+)/gi,
     `$1${REDACTED_MASK}`
   );
   text = text.replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{6,}={0,2}/gi, `Bearer ${REDACTED_MASK}`);
@@ -49,11 +59,7 @@ export function redactSensitiveText(input: string): string {
     `$1${REDACTED_MASK}`
   );
 
-  // HTTP authorization values, including Bearer tokens.
-  text = text.replace(
-    /((?:proxy-)?authorization\s*[:=]\s*)(?:bearer\s+)?("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
-    `$1${REDACTED_MASK}`
-  );
+  // Standalone Bearer values can also appear outside an Authorization field.
   text = text.replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{6,}={0,2}/gi, `Bearer ${REDACTED_MASK}`);
 
   // OpenAI-style keys that appear without a key name/context.

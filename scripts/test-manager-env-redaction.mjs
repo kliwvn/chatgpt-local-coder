@@ -55,6 +55,7 @@ try {
     "OPENAI_TUNNEL_ID=test-id-123",
     "OPENAI_TUNNEL_API_KEY=sk-test-super-secret-9999",
     "ADMIN_TOKEN=admin-token-abc-12345",
+    "AUTHORIZATION=manager-authorization-secret-24680",
     `OPENAI_TUNNEL_HEALTH_PORT=${port + 3}`,
   ].join("\n");
   await fs.writeFile(path.join(dir, "instances", "test", ".env"), envText, "utf-8");
@@ -96,6 +97,7 @@ try {
     throw new Error("OPENAI_TUNNEL_API_KEY leaked plaintext on instance env GET");
   }
   if (values.ADMIN_TOKEN !== MASK) throw new Error(`ADMIN_TOKEN not masked: ${JSON.stringify(values.ADMIN_TOKEN)}`);
+  if (values.AUTHORIZATION !== MASK) throw new Error(`AUTHORIZATION not masked: ${JSON.stringify(values.AUTHORIZATION)}`);
   if (values.PORT !== String(port + 1)) throw new Error("non-secret value changed on the wire");
 
   // 2. Legacy env GET — masked.
@@ -110,6 +112,9 @@ try {
   }
   if (legacyGet.body.values.ADMIN_TOKEN !== MASK) {
     throw new Error("legacy env ADMIN_TOKEN not masked");
+  }
+  if (legacyGet.body.values.AUTHORIZATION !== MASK) {
+    throw new Error("legacy env AUTHORIZATION not masked");
   }
 
   // 3. Raw editor round-trip: send the masked raw, changing only CHATGPT_AUTO_APPROVE.
@@ -129,12 +134,15 @@ try {
   if (!afterRaw.includes("ADMIN_TOKEN=admin-token-abc-12345")) {
     throw new Error("raw save erased ADMIN_TOKEN");
   }
+  if (!afterRaw.includes("AUTHORIZATION=manager-authorization-secret-24680")) {
+    throw new Error("raw save erased AUTHORIZATION");
+  }
   if (!afterRaw.includes("CHATGPT_AUTO_APPROVE=false")) throw new Error("raw save lost the non-secret edit");
 
   // 4. values-path sentinel round-trip.
   const valuesSave = await jsonFetch(`${base}/api/instances/test/env`, {
     method: "PUT",
-    body: JSON.stringify({ values: { SHELL_TIMEOUT: "90", OPENAI_TUNNEL_API_KEY: MASK, ADMIN_TOKEN: MASK } }),
+    body: JSON.stringify({ values: { SHELL_TIMEOUT: "90", OPENAI_TUNNEL_API_KEY: MASK, ADMIN_TOKEN: MASK, AUTHORIZATION: MASK } }),
   });
   if (!valuesSave.body?.ok) throw new Error(`values save failed: ${JSON.stringify(valuesSave.body)}`);
   const afterValues = await fs.readFile(path.join(dir, "instances", "test", ".env"), "utf-8");
@@ -143,6 +151,9 @@ try {
   }
   if (!afterValues.includes("ADMIN_TOKEN=admin-token-abc-12345")) {
     throw new Error("values save erased ADMIN_TOKEN");
+  }
+  if (!afterValues.includes("AUTHORIZATION=manager-authorization-secret-24680")) {
+    throw new Error("values save erased AUTHORIZATION");
   }
   if (!afterValues.includes("SHELL_TIMEOUT=90")) throw new Error("values save lost the non-secret edit");
 

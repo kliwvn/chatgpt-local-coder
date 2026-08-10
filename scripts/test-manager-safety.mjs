@@ -79,7 +79,11 @@ await fs.writeFile(path.join(demo, ".env"), [
   "",
 ].join("\n"));
 await fs.writeFile(path.join(demo, "config.json"), JSON.stringify({ connectorName: "demo", healthPort: fakeTunnelPort, autoStart: false }));
-await fs.writeFile(path.join(demo, "server.log"), "line-1\n" + "x".repeat(5000) + "\nline-last\n");
+const historicalLogSecret = "historical-manager-log-secret-123456";
+await fs.writeFile(
+  path.join(demo, "server.log"),
+  "line-1\n" + "x".repeat(5000) + `\nAuthorization: Bearer ${historicalLogSecret}\nOPENAI_TUNNEL_API_KEY=${historicalLogSecret}\nline-last\n`
+);
 await fs.writeFile(path.join(restartDemo, ".env"), [
   `PORT=${restartServerPort}`,
   `ADMIN_PORT=${restartAdminPort}`,
@@ -160,7 +164,7 @@ try {
   assert.match(diskEnv, new RegExp(`ADMIN_TOKEN=${adminSecret}`));
 
   const profileSecret = "profile-secret-must-not-persist";
-  await Promise.all(Array.from({ length: 30 }, (_, i) => post("/api/profiles", { name: `p${i}`, values: { WORKSPACE_PATH: `D:/p${i}`, OPENAI_TUNNEL_API_KEY: profileSecret, ADMIN_TOKEN: profileSecret } })));
+  await Promise.all(Array.from({ length: 30 }, (_, i) => post("/api/profiles", { name: `p${i}`, values: { WORKSPACE_PATH: `D:/p${i}`, OPENAI_TUNNEL_API_KEY: profileSecret, ADMIN_TOKEN: profileSecret, AUTHORIZATION: profileSecret, "api-key": profileSecret } })));
   const profiles = (await api("/api/profiles")).body.profiles;
   assert.equal(Object.keys(profiles).length, 30);
   assert.equal(JSON.stringify(profiles).includes(profileSecret), false);
@@ -264,6 +268,9 @@ try {
 
   const log1 = (await api("/api/instances/demo/log?kind=server&max=300000")).body;
   assert.ok(log1.log.includes("line-last"));
+  assert.equal(log1.log.includes(historicalLogSecret), false, "manager log API must redact historical secrets");
+  assert.match(log1.log, /OPENAI_TUNNEL_API_KEY=\*{8}/);
+  assert.match(log1.log, /Authorization:\s*\*{8}/i);
   const log2 = (await api(`/api/instances/demo/log?kind=server&max=300000&if_size=${log1.size}&if_mtime=${log1.mtime}`)).body;
   assert.equal(log2.unchanged, true);
   assert.equal(log2.log, "");

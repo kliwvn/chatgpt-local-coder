@@ -15,6 +15,7 @@ import { getDefaultCwd, getFullDiskAccess } from "../lib/path-security.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
 import { atomicWriteFile } from "../lib/atomic-write.js";
 import { readUtf8FileBounded } from "../lib/bounded-file.js";
+import { REDACTED_MASK, isSecretKeyName as isSecretKey } from "../lib/redaction.js";
 import {
   getRecentActivity,
   loadAuditHistory,
@@ -22,9 +23,6 @@ import {
   type ActivityEntry,
 } from "../lib/activity-log.js";
 
-const SECRET_KEY_PATTERN =
-  /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
-const REDACTED_MASK = "********";
 const ADMIN_ENV_MAX_BYTES = 2 * 1024 * 1024;
 
 const NUMERIC_ENV_LIMITS: Record<string, [number, number]> = {
@@ -53,9 +51,6 @@ const NUMERIC_ENV_LIMITS: Record<string, [number, number]> = {
   MCP_MAX_SESSIONS: [8, 4096],
 };
 
-function isSecretKey(key: string): boolean {
-  return SECRET_KEY_PATTERN.test(key);
-}
 function parseDotEnv(text: string): Record<string, string> {
   const out: Record<string, string> = {};
   for (const line of text.split("\n")) {
@@ -140,9 +135,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     envMutationChain = run.then(() => undefined, () => undefined);
     return run;
   }
-  // Header names that carry credentials even though they don't match
-  // SECRET_KEY_PATTERN (e.g. "authorization" — the AUTH alternative requires
-  // `_`/end so it won't match "Authorization").
+  // Header names that always carry credentials, plus generic secret-key matching.
   const SENSITIVE_HEADER_NAMES = new Set([
     "authorization",
     "proxy-authorization",

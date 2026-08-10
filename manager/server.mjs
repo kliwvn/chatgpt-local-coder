@@ -26,7 +26,7 @@ import path from "node:path";
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { rotateLogFile, tailFile } from "./log-utils.mjs";
+import { isSecretKeyName, redactSensitiveLogText, rotateLogFile, tailFile } from "./log-utils.mjs";
 import {
   atomicWriteFile,
   enqueueKeyedMutation,
@@ -97,11 +97,9 @@ const TUNNEL_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 const ENV_LINE_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
 /* Secret keys masked on the wire. ADMIN_TOKEN also gates the instance admin
  * API, so it must never reach the browser either. */
-const SECRET_KEY_RE =
-  /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
 const MASK_SENTINEL = "********";
 
-function isSecretKey(key) { return SECRET_KEY_RE.test(String(key)); }
+function isSecretKey(key) { return isSecretKeyName(key); }
 function withoutSecrets(values) {
   const out = {};
   if (!values || typeof values !== "object") return out;
@@ -1883,7 +1881,7 @@ async function handleApi(req, res, url, body) {
         // UI round-trips the sentinel unchanged. OPENAI_TUNNEL_API_KEY keeps its
         // set/last4 shape for the structured form's key hint.
         if (k === "OPENAI_TUNNEL_API_KEY" && v) masked[k] = { set: true, last4: v.slice(-4) };
-        else if (SECRET_KEY_RE.test(k) && v) masked[k] = MASK_SENTINEL;
+        else if (isSecretKey(k) && v) masked[k] = MASK_SENTINEL;
         else masked[k] = v;
       }
       return json(res, 200, { ok: true, path: inst.env, values: masked });
@@ -1928,7 +1926,7 @@ async function handleApi(req, res, url, body) {
         return json(res, 200, { ok: true, kind, unchanged: true, log: "", size: st.size, mtime: st.mtimeMs });
       }
       const rawLog = st ? await tailFile(file, max) : "";
-      let log = rawLog;
+      let log = redactSensitiveLogText(rawLog);
       if (st && st.size > max) {
         const nl = log.indexOf("\n");
         if (nl > 0) log = log.slice(nl + 1);
@@ -1992,7 +1990,7 @@ async function handleApi(req, res, url, body) {
     const masked = {};
     for (const [k, v] of Object.entries(values)) {
       if (k === "OPENAI_TUNNEL_API_KEY" && v) masked[k] = { set: true, last4: v.slice(-4) };
-      else if (SECRET_KEY_RE.test(k) && v) masked[k] = MASK_SENTINEL;
+      else if (isSecretKey(k) && v) masked[k] = MASK_SENTINEL;
       else masked[k] = v;
     }
     return json(res, 200, { ok: true, path: instPaths(dname).env, values: masked });

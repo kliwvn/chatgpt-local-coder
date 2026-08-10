@@ -1,6 +1,55 @@
 ﻿import fs from "node:fs/promises";
 
 export const DEFAULT_MANAGED_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const REDACTED_MASK = "********";
+const SECRET_KEY_RE =
+  /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|AUTHORIZATION|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
+
+export function isSecretKeyName(key) {
+  const normalized = String(key).replace(/^\$?env:/i, "").replace(/[-.]/g, "_");
+  return SECRET_KEY_RE.test(normalized);
+}
+
+function redactAssignment(match, prefix, key) {
+  return isSecretKeyName(key) ? `${prefix}${key}=${REDACTED_MASK}` : match;
+}
+
+function redactColonAssignment(match, quote, key, value) {
+  if (!isSecretKeyName(key)) return match;
+  // Preserve the source value's quote style. JSON string fields stay valid,
+  // while shell/log object-like text keeps its original unquoted shape.
+  const valueQuote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : "";
+  return `${quote}${key}${quote}:${valueQuote}${REDACTED_MASK}${valueQuote}`;
+}
+
+/** Sanitize process-log text before it crosses the Manager API boundary. */
+export function redactSensitiveLogText(input) {
+  let text = String(input ?? "");
+
+  text = text.replace(
+    /(["'])((?:proxy-)?authorization\s*[:=]\s*)(?!\*{4,})[^"'\r\n]*\1/gi,
+    `$1$2${REDACTED_MASK}$1`
+  );
+  text = text.replace(
+    /((?:proxy-)?authorization\s*[:=])(?!(?:[ \t]*\*{4,}))[ \t]*(?:(?:basic|bearer|token)\s+[^\s,;&'\"]+|(?:digest|aws4-hmac-sha256)\s+[^;\r\n]+|[^\s,;&'\"]+)/gi,
+    `$1${REDACTED_MASK}`
+  );
+  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{6,}={0,2}/gi, `Bearer ${REDACTED_MASK}`);
+  text = text.replace(
+    /((?:\$?env:)?)([A-Za-z_][A-Za-z0-9_-]{0,100})\s*=\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
+    redactAssignment
+  );
+  text = text.replace(
+    /(["']?)([A-Za-z_][A-Za-z0-9_-]{0,100})\1\s*:\s*("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&}\])]+)/gi,
+    redactColonAssignment
+  );
+  text = text.replace(
+    /((?:--?|\/)(?:api[-_]?key|token|secret|password|pass|authorization|auth|credential)(?:\s+|=))("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
+    `$1${REDACTED_MASK}`
+  );
+  text = text.replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b/g, `sk-${REDACTED_MASK}`);
+  return text;
+}
 
 /** Read the tail without emitting U+FFFD when the byte window starts mid-codepoint. */
 export async function tailFile(file, maxBytes = 8000) {

@@ -11,16 +11,52 @@ const secret = "super-secret-value-12345";
 const bearer = "bearer-token-value-67890";
 const flagSecret = "flag-token-value-24680";
 const openAiSecret = "sk-proj-abcdefghijk123456789";
+const basicSecret = "dXNlcjpwYXNzd29yZA==";
+const proxySecret = "proxy-token-value-13579";
+const awsSecret = "aws-signature-value-97531";
+const hyphenSecret = "hyphen-key-value-86420";
 const command = `$env:OPENAI_TUNNEL_API_KEY='${secret}'; curl -H 'Authorization: Bearer ${bearer}' --token ${flagSecret} ${openAiSecret}`;
 
 try {
   const redaction = await import("../dist/lib/redaction.js");
+  assert.equal(redaction.isSecretKeyName("AUTHORIZATION"), true);
+  assert.equal(redaction.isSecretKeyName("api-key"), true);
+  assert.equal(redaction.isSecretKeyName("x.api.key"), true);
   const text = redaction.redactSensitiveText(command);
   for (const value of [secret, bearer, flagSecret, openAiSecret]) assert.equal(text.includes(value), false);
 
-  const deep = redaction.redactSensitiveValue({ api_key: secret, headers: { Authorization: `Bearer ${bearer}` }, command, nested: [{ password: flagSecret, plain: "ok" }] });
+  const variants = [
+    `Authorization: Basic ${basicSecret}`,
+    `Proxy-Authorization: Token ${proxySecret}`,
+    `'Authorization: AWS4-HMAC-SHA256 Credential=user, Signature=${awsSecret}'`,
+    `api-key=${hyphenSecret}`,
+  ];
+  for (const variant of variants) {
+    const safe = redaction.redactSensitiveText(variant);
+    for (const value of [basicSecret, proxySecret, awsSecret, hyphenSecret]) assert.equal(safe.includes(value), false, `redaction leaked variant: ${variant.split(":")[0]}`);
+  }
+  const jsonPayload = JSON.stringify({
+    API_KEY: secret,
+    "api-key": hyphenSecret,
+    headers: { Authorization: `Bearer ${bearer}` },
+    plain: "ok",
+  });
+  const redactedJson = redaction.redactSensitiveText(jsonPayload);
+  const parsedRedactedJson = JSON.parse(redactedJson);
+  assert.equal(parsedRedactedJson.API_KEY, redaction.REDACTED_MASK);
+  assert.equal(parsedRedactedJson["api-key"], redaction.REDACTED_MASK);
+  assert.equal(parsedRedactedJson.headers.Authorization.includes(bearer), false);
+  assert.equal(parsedRedactedJson.plain, "ok");
+
+  const quotedAuthWithTail = redaction.redactSensitiveText(`curl -H 'Authorization: Bearer ${bearer}' --next keep-me`);
+  assert.match(quotedAuthWithTail, /Authorization:\s*\*{8}/i);
+  assert.match(quotedAuthWithTail, /--next keep-me$/, "redaction must preserve non-secret command suffix after a quoted Authorization header");
+  const basicWithTail = redaction.redactSensitiveText(`Authorization: Basic ${basicSecret} --next keep-me`);
+  assert.match(basicWithTail, /--next keep-me$/, "Basic auth redaction must not consume following shell flags");
+
+  const deep = redaction.redactSensitiveValue({ api_key: secret, "api-key": hyphenSecret, headers: { Authorization: `Bearer ${bearer}` }, command, nested: [{ password: flagSecret, plain: "ok" }] });
   const deepJson = JSON.stringify(deep);
-  for (const value of [secret, bearer, flagSecret, openAiSecret]) assert.equal(deepJson.includes(value), false);
+  for (const value of [secret, bearer, flagSecret, openAiSecret, hyphenSecret]) assert.equal(deepJson.includes(value), false);
   assert.equal(deep.nested[0].plain, "ok");
 
   const activity = await import("../dist/lib/activity-log.js");
