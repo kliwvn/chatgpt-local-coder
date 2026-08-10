@@ -42,7 +42,7 @@ const SESSION_RESOURCE_CLOSE_TIMEOUT_MS = 2000;
 const RECOVERY_LOOPBACK_TIMEOUT_MS = 5000;
 const RECOVERY_LOOPBACK_RESPONSE_MAX_BYTES = 64 * 1024;
 
-const lastTransportErrors: Record<string, string> = {};
+const lastTransportErrors: Record<string, string> = Object.create(null);
 const sessionOpChains = new Map<string, Promise<void>>();
 
 export interface McpSession {
@@ -71,6 +71,10 @@ export interface SessionCounts {
   registered: number;
   /** Số session có SSE stream đang mở — "đang kết nối thực tế". */
   connected: number;
+  /** Session builds đã reserve capacity nhưng chưa publish. */
+  building?: number;
+  /** Số stale-session recovery đang chạy. */
+  recovering?: number;
   /** Retention policy surfaced for diagnostics/admin UI. */
   maxRetained?: number;
   idleTtlMs?: number;
@@ -125,6 +129,10 @@ const OPENAI_MCP_SESSION_LOG_SAMPLE_EVERY = 25;
 
 export function shouldLogSessionInitializeForClient(name: string, clientInitializedTotal: number): boolean {
   return name !== "openai-mcp" || clientInitializedTotal % OPENAI_MCP_SESSION_LOG_SAMPLE_EVERY === 0;
+}
+
+export function isValidMcpSessionId(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 256 && /^[\x21-\x7e]+$/.test(value);
 }
 
 function extractRequestId(body: unknown): string | number | null {
@@ -209,9 +217,12 @@ async function enqueueSessionOp(sessionId: string, op: () => Promise<void>): Pro
 }
 
 export function createSessionManager(config: SessionManagerConfig): SessionManager {
-  const sessions: Record<string, McpSession> = {};
-  const pendingRecoveries: Record<string, McpSession> = {};
-  const deleteGraceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+  // Session IDs originate on the wire. Null-prototype dictionaries prevent
+  // special property names such as "__proto__"/"constructor" from changing
+  // lookup semantics or being mistaken for real sessions.
+  const sessions: Record<string, McpSession> = Object.create(null);
+  const pendingRecoveries: Record<string, McpSession> = Object.create(null);
+  const deleteGraceTimers: Record<string, ReturnType<typeof setTimeout>> = Object.create(null);
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
   const recoveryInFlight = new Map<string, Promise<McpSession | null>>();
   // Explicit DELETE closes the transport as part of the serialized request.
@@ -589,6 +600,8 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       return {
         registered: Object.keys(sessions).length,
         connected,
+        building: inFlightBuilds,
+        recovering: recoveryInFlight.size,
         maxRetained: MAX_SESSION_COUNT,
         idleTtlMs: SESSION_TTL_MS,
         cleanupIntervalMs: SESSION_CLEANUP_INTERVAL_MS,
@@ -647,7 +660,8 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     },
 
     async createNew(req: Request, res: Response, body: unknown): Promise<void> {
-      const headerSessionId = req.headers["mcp-session-id"] as string | undefined;
+      const rawHeaderSessionId = req.headers["mcp-session-id"];
+      const headerSessionId = isValidMcpSessionId(rawHeaderSessionId) ? rawHeaderSessionId : undefined;
       let session: McpSession;
 
       if (headerSessionId && pendingRecoveries[headerSessionId]) {
@@ -699,10 +713,26 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         }
       };
 
-      if (sid) {
-        await enqueueSessionOp(sid, run);
-      } else {
-        await run();
+      try {
+        if (sid) {
+          await enqueueSessionOp(sid, run);
+        } else {
+          await run();
+        }
+      } catch (err) {
+        // buildSession() deliberately keeps its capacity reservation until the
+        // transport publishes through onsessioninitialized. If handleRequest()
+        // rejects before that callback (malformed/aborted initialize, SDK error,
+        // broken response adapter), the session is still unpublished and no later
+        // callback is guaranteed to release the reservation. Dispose it here so
+        // repeated failed initializes cannot leak servers/transports or eventually
+        // pin inFlightBuilds at MCP_MAX_SESSIONS.
+        const activeSid = session.transport.sessionId;
+        const published = Boolean(activeSid && sessions[activeSid]?.transport === session.transport);
+        if (!published) {
+          await disposePendingSession(session).catch(() => undefined);
+        }
+        throw err;
       }
     },
 
@@ -713,8 +743,9 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       body?: unknown,
       bypassQueue = false
     ): Promise<void> {
-      const sid =
-        session.transport.sessionId || (req.headers["mcp-session-id"] as string | undefined);
+      const rawHeaderSessionId = req.headers["mcp-session-id"];
+      const sid = session.transport.sessionId ||
+        (isValidMcpSessionId(rawHeaderSessionId) ? rawHeaderSessionId : undefined);
       if (sid) touch(sid);
       const isExplicitDelete = Boolean(sid && req.method === "DELETE");
       const run = async () => {
@@ -844,7 +875,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         // sweep can expire them. Busy/SSE-connected sessions are never evicted.
         trimSessionCapacity(0);
         for (const sid of Object.keys(pendingRecoveries)) {
-          if (!sessions[sid]) clearPendingRecovery(sid);
+          // A pending recovery is expected to have no published session while its
+          // loopback initialize is still in flight. Only prune true orphans after
+          // the owning recovery promise has settled/disappeared.
+          if (!sessions[sid] && !recoveryInFlight.has(sid)) clearPendingRecovery(sid);
         }
       }, SESSION_CLEANUP_INTERVAL_MS);
       cleanupTimer.unref?.();

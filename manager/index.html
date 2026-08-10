@@ -83,14 +83,14 @@
 
         <div class="grid2">
           <div class="field">
-            <label for="f-connector">Tên Connector (từ khóa @)</label>
-            <input id="f-connector" class="input" placeholder="VD: Local Coder" />
-            <p class="hint">Tên để gõ @ trên ChatGPT.</p>
-          </div>
-          <div class="field">
             <label for="f-port">PORT</label>
             <input id="f-port" class="input mono" inputmode="numeric" placeholder="3000" />
             <p class="hint">Cổng MCP server — khác các workspace khác.</p>
+          </div>
+          <div class="field">
+            <label for="f-admin-port">ADMIN_PORT</label>
+            <input id="f-admin-port" class="input mono" inputmode="numeric" placeholder="3001" />
+            <p class="hint">Cổng Admin nội bộ — phải khác PORT và các workspace khác.</p>
           </div>
           <div class="field">
             <label for="f-tunnel-id">OPENAI_TUNNEL_ID</label>
@@ -148,6 +148,11 @@
           <div class="field">
             <label for="f-timeout">SHELL_TIMEOUT (giây)</label>
             <input id="f-timeout" class="input mono" inputmode="numeric" placeholder="120" />
+          </div>
+          <div class="field">
+            <label for="f-sync-budget">MCP_SYNC_RESPONSE_BUDGET_MS</label>
+            <input id="f-sync-budget" class="input mono" inputmode="numeric" placeholder="100000" />
+            <p class="hint">Hard budget cho MCP synchronous call; mặc định 100 giây để trả trước deadline tunnel. Job dài dùng start_process.</p>
           </div>
           <div class="field">
             <label for="f-recovery">MCP_SESSION_RECOVERY</label>
@@ -291,7 +296,11 @@
     <div class="field">
       <label for="add-port">PORT (MCP server — để trống = tự chọn)</label>
       <input id="add-port" class="input mono" inputmode="numeric" placeholder="3002" />
-      <p class="hint">Admin UI truy cập qua cổng manager — admin port tự cấp.</p>
+    </div>
+    <div class="field">
+      <label for="add-admin-port">ADMIN_PORT (Admin nội bộ — để trống = tự chọn)</label>
+      <input id="add-admin-port" class="input mono" inputmode="numeric" placeholder="3003" />
+      <p class="hint">Mỗi workspace chạy đồng thời phải có PORT và ADMIN_PORT riêng.</p>
     </div>
     <div class="actions">
       <label class="chk"><input id="add-autostart" type="checkbox" checked /> Tự khởi động khi mở app</label>

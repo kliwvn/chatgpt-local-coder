@@ -21,6 +21,10 @@ function redactAssignment(match, prefix, key) {
 
 function redactColonAssignment(match, quote, key, value) {
   if (!isSecretKeyName(key)) return match;
+  const unquotedValue = value.replace(/^["']|["']$/g, "");
+  // Keep syntax stable when an earlier pass already masked the value. Without
+  // this guard, the generic key:value pass can consume a trailing shell quote.
+  if (unquotedValue === REDACTED_MASK) return match;
   // Preserve the source value's quote style. JSON string fields stay valid,
   // while shell/log object-like text keeps its original unquoted shape.
   const valueQuote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : "";
@@ -30,6 +34,8 @@ function redactColonAssignment(match, quote, key, value) {
 /** Sanitize process-log text before it crosses the Manager API boundary. */
 export function redactSensitiveLogText(input) {
   let text = String(input ?? "");
+
+  text = text.replace(/\b(https?:\/\/)([^\s\/@:]+):([^\s\/@]+)@/gi, `$1${REDACTED_MASK}:${REDACTED_MASK}@`);
 
   text = text.replace(
     /(["'])((?:proxy-)?authorization\s*[:=]\s*)(?!\*{4,})[^"'\r\n]*\1/gi,
@@ -52,6 +58,7 @@ export function redactSensitiveLogText(input) {
     /((?:--?|\/)(?:api[-_]?key|token|secret|password|pass|authorization|auth|credential)(?:\s+|=))("[^"\r\n]*"|'[^'\r\n]*'|[^\s,;&]+)/gi,
     `$1${REDACTED_MASK}`
   );
+  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+\/-]{6,}={0,2}/gi, `Bearer ${REDACTED_MASK}`);
   text = text.replace(/\bsk-(?:proj-)?[A-Za-z0-9_-]{8,}\b/g, `sk-${REDACTED_MASK}`);
   return text;
 }

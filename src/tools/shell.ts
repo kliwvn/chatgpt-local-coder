@@ -8,6 +8,7 @@ import { toolAnnotations } from "../lib/tool-annotations.js";
 import { classifyCommandOutcome } from "../lib/command-outcome.js";
 import { toolResult } from "../lib/tool-result.js";
 import { envBoundedInteger } from "../lib/env-utils.js";
+import { clampSyncTimeoutMs, getSyncResponseBudgetMs } from "../lib/sync-response-budget.js";
 import {
   execInShellSession,
   getShellStatus,
@@ -188,14 +189,22 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async ({ command, working_directory }) => {
       requireCommandAllowed(command);
       const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
-      const result = await execInShellSession(command, defaultCwd, timeoutSec * 1000, cwdOverride);
+      const configuredTimeoutMs = timeoutSec * 1000;
+      const effectiveTimeoutMs = clampSyncTimeoutMs(configuredTimeoutMs);
+      const result = await execInShellSession(command, defaultCwd, effectiveTimeoutMs, cwdOverride);
       const commandOutcome = classifyCommandOutcome(
         command,
         result.exit_code,
         result.stderr,
         result.timed_out
       );
-      const response = { ...result, command_outcome: commandOutcome };
+      const response = {
+        ...result,
+        command_outcome: commandOutcome,
+        configured_timeout_ms: configuredTimeoutMs,
+        effective_timeout_ms: effectiveTimeoutMs,
+        sync_response_budget_ms: getSyncResponseBudgetMs(),
+      };
       await audit({
         tool: "run_command",
         action: "command",

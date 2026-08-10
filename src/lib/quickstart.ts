@@ -18,7 +18,8 @@ All tools return JSON: { ok, tool, summary, data }
 - git_status / git_diff / git_add / git_commit / git_branch / git_restore / git_stash
 - rewind: action=list|preview|restore|status — undo file edits via automatic checkpoints
 - mcp_servers / mcp_tools / mcp_call — delegate to upstream MCP servers on this machine
-- git_push / git_checkout / delete_directory: may be blocked by ChatGPT safety — use run_command fallback
+- delete_file / delete_directory: recoverable Recycle Bin removal; protected roots are refused
+- run_command / start_process: destructive delete, forced git clean/reset, and shell tracked-file restore commands are blocked; never use shell to bypass deletion safety
 
 ## apply_patch — single file
 @@

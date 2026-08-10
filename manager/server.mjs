@@ -10,7 +10,7 @@
  * Instance layout:
  *   manager/instances/<name>/
  *     .env          # PORT, ADMIN_PORT, WORKSPACE_PATH, OPENAI_TUNNEL_ID/KEY...
- *     config.json   # connectorName, lastTunnelUrl, healthPort, autoStart
+ *     config.json   # lastTunnelUrl, healthPort, autoStart
  *     server.pid / tunnel.pid / profile.yaml / server.log / tunnel.log
  *     checkpoints/ / shell-state/  # managed runtime state, isolated from repo root
  *
@@ -27,6 +27,7 @@ import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { copyTruncateLogFile, isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
+import { recycleManagedDirectory } from "./safe-delete.mjs";
 import {
   atomicWriteFile,
   enqueueKeyedMutation,
@@ -112,6 +113,7 @@ function scrubProfiles(profiles) {
   for (const profile of Object.values(profiles)) {
     if (profile && typeof profile === "object" && profile.values && typeof profile.values === "object") {
       profile.values = withoutSecrets(profile.values);
+      delete profile.values.MCP_CONNECTOR_NAME;
     }
   }
   return profiles;
@@ -177,6 +179,15 @@ function pidOnPort(port) {
   return listeningPortPids().get(Number(port)) || null;
 }
 
+function portsForPid(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return [];
+  const ports = [];
+  for (const [port, ownerPid] of listeningPortPids()) {
+    if (ownerPid === pid) ports.push(port);
+  }
+  return ports;
+}
+
 /* LEGACY single-instance .env tại ROOT/.env — chỉ còn dùng để đọc
  * MANAGER_PORT và migrate sang instance "default" lần đầu. */
 async function readEnvRaw() {
@@ -235,7 +246,7 @@ async function mutateJson(file, fallback, mutator) {
 }
 
 async function readConfig() {
-  return readJson(CONFIG_PATH, { connectorName: "", lastTunnelUrl: "" });
+  return readJson(CONFIG_PATH, { lastTunnelUrl: "" });
 }
 
 async function readPidFile(p) {
@@ -421,7 +432,14 @@ async function migrateLegacyRuntimeState(name, env, inst) {
       } catch (err) {
         if (err?.code !== "EXDEV") throw err;
         await fsp.cp(item.legacy, item.target, { recursive: true, force: false, errorOnExist: true });
-        await fsp.rm(item.legacy, { recursive: true, force: true });
+        try {
+          await recycleManagedDirectory(item.legacy, ROOT);
+        } catch (recycleErr) {
+          // item.target was created by this transaction, so permanent rollback of
+          // that new copy is safe; never delete the durable legacy source on error.
+          await fsp.rm(item.target, { recursive: true, force: true }).catch(() => undefined);
+          throw recycleErr;
+        }
       }
       console.log(`[manager] Migrated legacy runtime state: ${item.legacy} -> ${item.target}`);
     }
@@ -510,24 +528,34 @@ async function readInstanceEnv(name) {
 }
 
 async function readInstanceConfig(name) {
-  return readJson(instPaths(name).config, {
-    connectorName: "",
+  const config = await readJson(instPaths(name).config, {
     lastTunnelUrl: "",
     healthPort: 8080,
     autoStart: true,
   });
+  delete config.connectorName;
+  return config;
 }
 
 async function writeInstanceConfig(name, config) {
-  await writeJson(instPaths(name).config, config);
+  const next = { ...config };
+  delete next.connectorName;
+  await writeJson(instPaths(name).config, next);
 }
 
 async function updateInstanceConfig(name, updater) {
   const file = instPaths(name).config;
-  return mutateJson(file, { connectorName: "", lastTunnelUrl: "", healthPort: 8080, autoStart: true }, async (config) => {
+  return mutateJson(file, { lastTunnelUrl: "", healthPort: 8080, autoStart: true }, async (config) => {
     await updater(config);
+    delete config.connectorName;
     return config;
   });
+}
+
+async function removeLegacyConnectorNameConfig() {
+  for (const name of await listInstances()) {
+    await updateInstanceConfig(name, () => undefined);
+  }
 }
 
 /** Tất cả cổng đang được các instance khác dùng (PORT/ADMIN_PORT/healthPort). */
@@ -580,7 +608,6 @@ async function ensureInstances() {
   const legacyHealthPortRaw = String(legacyParsed.OPENAI_TUNNEL_HEALTH_PORT || "8080").trim();
   const legacyHealthPort = Number(legacyHealthPortRaw);
   await writeInstanceConfig("default", {
-    connectorName: legacyConfig.connectorName || "",
     lastTunnelUrl: legacyConfig.lastTunnelUrl || "",
     healthPort: Number.isInteger(legacyHealthPort) && legacyHealthPort > 0 && legacyHealthPort < 65536 ? legacyHealthPort : 8080,
     autoStart: true,
@@ -641,6 +668,17 @@ async function serverHealth(port) {
     const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(2500) });
     if (!res.ok) return null;
     return JSON.parse(await readResponseTextBounded(res, 512 * 1024, "server health response"));
+  } catch {
+    return null;
+  }
+}
+
+async function managerHealth(port) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/health`, { signal: AbortSignal.timeout(1500) });
+    if (!res.ok) return null;
+    const body = JSON.parse(await readResponseTextBounded(res, 64 * 1024, "manager health response"));
+    return body?.ok === true && body?.name === "chatgpt-local-coder-manager" ? body : null;
   } catch {
     return null;
   }
@@ -717,16 +755,67 @@ async function runInstall() {
 async function serverStatus(name) {
   const env = await readInstanceEnv(name);
   const inst = instPaths(name);
-  const port = Number(env.PORT || 0);
-  if (!Number.isInteger(port) || port <= 0 || port >= 65536) {
-    return { running: false, port: 0, pid: await readPidFile(inst.serverPid), health: null, portOccupied: false, invalidConfig: true };
-  }
-  const portOpen = await isPortOpen(port);
-  const health = portOpen ? await serverHealth(port) : null;
-  const running = portOpen && isLocalCoderHealth(health, env);
-  const portPid = portOpen ? pidOnPort(port) : null;
+  const configuredPort = Number(env.PORT || 0);
+  const configuredPortValid = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort < 65536;
   const savedPid = await readPidFile(inst.serverPid);
-  return { running, port, pid: portPid || savedPid || null, health: running ? health : null, portOccupied: portOpen && !running };
+
+  let portOpen = false;
+  let health = null;
+  let portPid = null;
+  if (configuredPortValid) {
+    portOpen = await isPortOpen(configuredPort);
+    health = portOpen ? await serverHealth(configuredPort) : null;
+    portPid = portOpen ? pidOnPort(configuredPort) : null;
+    if (portOpen && isLocalCoderHealth(health, env)) {
+      return {
+        running: true,
+        port: configuredPort,
+        configuredPort,
+        pid: portPid || savedPid || null,
+        health,
+        portOccupied: false,
+        invalidConfig: false,
+        configDrift: false,
+        owned: Boolean(savedPid && (!portPid || savedPid === portPid)),
+      };
+    }
+  }
+
+  // A user can edit an instance .env outside the Manager. If PORT changes while
+  // the managed child is still alive, following only the new configured port
+  // loses the old process and can later start a duplicate workspace. Recover the
+  // child strictly through its saved PID + listening port + Local Coder workspace
+  // identity. A stale/reused PID that does not satisfy all three checks is ignored.
+  if (savedPid && isPidAlive(savedPid)) {
+    for (const actualPort of portsForPid(savedPid)) {
+      if (actualPort === configuredPort) continue;
+      const actualHealth = await serverHealth(actualPort);
+      if (!isLocalCoderHealth(actualHealth, env)) continue;
+      return {
+        running: true,
+        port: actualPort,
+        configuredPort: configuredPortValid ? configuredPort : 0,
+        pid: savedPid,
+        health: actualHealth,
+        portOccupied: configuredPortValid && portOpen && !isLocalCoderHealth(health, env),
+        invalidConfig: !configuredPortValid,
+        configDrift: true,
+        owned: true,
+      };
+    }
+  }
+
+  return {
+    running: false,
+    port: configuredPortValid ? configuredPort : 0,
+    configuredPort: configuredPortValid ? configuredPort : 0,
+    pid: portPid || savedPid || null,
+    health: null,
+    portOccupied: configuredPortValid && portOpen,
+    invalidConfig: !configuredPortValid,
+    configDrift: false,
+    owned: false,
+  };
 }
 
 async function warmUpMcp(port) {
@@ -793,6 +882,13 @@ function enqueueServerLifecycle(name, operation) {
 
 async function startServerUnlocked(name) {
   const st = await serverStatus(name);
+  if (st.running && st.configDrift) {
+    return {
+      ok: false,
+      error: `Managed server PID ${st.pid} is still running on PORT ${st.port}, but .env now configures PORT ${st.configuredPort || "invalid"}. Stop/restart the managed server before starting with the new configuration.`,
+      ...st,
+    };
+  }
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
   if (st.invalidConfig) return { ok: false, error: "PORT is invalid; fix configuration before starting Local Coder." };
   if (st.portOccupied) return { ok: false, error: `PORT ${st.port} is occupied by another process${st.pid ? ` (PID ${st.pid})` : ""}; refusing to start Local Coder.` };
@@ -811,6 +907,17 @@ async function startServerUnlocked(name) {
     return { ok: false, error: `Session policy không hợp lệ — sửa trong Cấu hình: ${policy.errors.join("; ")}` };
   }
   const env = await readInstanceEnv(name);
+  const adminPort = Number(env.ADMIN_PORT || 0);
+  if (!Number.isInteger(adminPort) || adminPort <= 0 || adminPort >= 65536) {
+    return { ok: false, error: "ADMIN_PORT is invalid; fix configuration before starting Local Coder." };
+  }
+  if (adminPort === st.port) {
+    return { ok: false, error: "PORT and ADMIN_PORT must differ before starting Local Coder." };
+  }
+  if (await isPortOpen(adminPort)) {
+    const adminPid = pidOnPort(adminPort);
+    return { ok: false, error: `ADMIN_PORT ${adminPort} is occupied by another process${adminPid ? ` (PID ${adminPid})` : ""}; refusing to start Local Coder.` };
+  }
   const runtimeLimits = validateRuntimeLimits(env);
   if (!runtimeLimits.ok) {
     return { ok: false, error: `Runtime limits không hợp lệ — sửa trong Cấu hình: ${runtimeLimits.errors.join("; ")}` };
@@ -839,9 +946,15 @@ async function startServerUnlocked(name) {
   if (!up) {
     killPidTree(pid);
     invalidatePortPidCache();
-    await writePidFile(inst.serverPid, null);
+    const stopped = await waitFor(() => !isPidAlive(pid), 5000, 150);
+    if (stopped) await writePidFile(inst.serverPid, null);
     const tail = await tailFile(inst.serverLog);
-    return { ok: false, error: "Server không khởi động được. Log cuối:\n" + tail.slice(-1500) };
+    return {
+      ok: false,
+      error: "Server không khởi động được." + (stopped ? "" : ` PID ${pid} vẫn còn sống; giữ server.pid để có thể stop/recover an toàn.`) + " Log cuối:\n" + tail.slice(-1500),
+      pid: stopped ? null : pid,
+      cleanupFailed: !stopped,
+    };
   }
   await warmUpMcp(st.port); // làm ấm trước khi tunnel probe (timeout 2s)
   return { ok: true, running: true, port: st.port, pid, health: await serverHealth(st.port) };
@@ -852,6 +965,16 @@ async function stopServerUnlocked(name) {
   if (!st.running) return { ok: true, alreadyStopped: true, port: st.port };
   const inst = instPaths(name);
   const env = await readInstanceEnv(name);
+  const pidFile = await readPidFile(inst.serverPid);
+  if (!pidFile || pidFile !== st.pid || !st.owned) {
+    return {
+      ok: false,
+      error: `Refusing to stop an unowned Local Coder process on PORT ${st.port}${st.pid ? ` (PID ${st.pid})` : ""}; managed PID metadata does not match.`,
+      port: st.port,
+      pid: st.pid || null,
+      stopped: false,
+    };
+  }
 
   // Prefer an in-process graceful shutdown on Windows too. OS-level SIGTERM /
   // taskkill bypasses Node signal handlers there; the localhost admin endpoint
@@ -887,11 +1010,8 @@ async function stopServerUnlocked(name) {
   }
 
   let killed = false;
-  const pidFile = await readPidFile(inst.serverPid);
-  if (pidFile && pidFile === st.pid) killed = killPidTree(pidFile);
-  if (!killed && st.pid) killed = killPidTree(st.pid);
+  if (pidFile === st.pid) killed = killPidTree(pidFile);
   invalidatePortPidCache();
-  await writePidFile(inst.serverPid, null);
   const stopped = await waitFor(
     async () => !isPidAlive(st.pid) && !(await isPortOpen(st.port)),
     5000,
@@ -909,6 +1029,7 @@ async function stopServerUnlocked(name) {
       forced: killed,
     };
   }
+  await writePidFile(inst.serverPid, null);
   return { ok: true, port: st.port, stopped: true, graceful: false, forced: killed, processExited: true };
 }
 
@@ -961,6 +1082,7 @@ async function restartServer(name) {
 async function tunnelStatus(name) {
   const env = await readInstanceEnv(name);
   const config = await readInstanceConfig(name);
+  const inst = instPaths(name);
   const tunnelId = env.OPENAI_TUNNEL_ID || "";
   const apiKey = env.OPENAI_TUNNEL_API_KEY || "";
   const mode = tunnelId && apiKey ? "openai" : "cloudflare";
@@ -968,18 +1090,102 @@ async function tunnelStatus(name) {
   const healthPortValid = Number.isInteger(healthPort) && healthPort > 0 && healthPort < 65536;
   const controlPlaneUrl = tunnelId ? `https://api.openai.com/v1/tunnel/${tunnelId}` : null;
   const oaPortOpen = healthPortValid ? await isPortOpen(healthPort) : false;
-  const oaRunning = oaPortOpen ? await tunnelClientHealth(healthPort) : false;
+  const oaHealthy = oaPortOpen ? await tunnelClientHealth(healthPort) : false;
+  const oaPids = pidsWithCmdLine("tunnel-client.exe", inst.profile).filter(isPidAlive);
   const serverPort = Number(env.PORT || 0);
-  const cfPids = mode === "cloudflare" && Number.isInteger(serverPort)
+  const desiredCfPids = mode === "cloudflare" && Number.isInteger(serverPort)
     ? pidsWithCmdLine("cloudflared.exe", `localhost:${serverPort}`)
     : [];
-  const cfRunning = cfPids.length > 0;
-  const running = mode === "openai" ? oaRunning : cfRunning;
+  const savedPid = await readPidFile(inst.tunnelPid);
+  const localCfPids = savedPid ? pidsWithCmdLine("cloudflared.exe", "localhost:") : [];
+  const savedCfRunning = Boolean(savedPid && isPidAlive(savedPid) && localCfPids.includes(savedPid));
+  const desiredCfPid = desiredCfPids[0] || null;
+  const desiredCfOwned = Boolean(savedPid && desiredCfPids.includes(savedPid));
   const cloudflaredExists = fs.existsSync(CLOUDFLARED);
-  if (mode === "openai") {
-    return { running, mode, tunnelId, kind: oaRunning ? "openai" : null, url: oaRunning ? controlPlaneUrl : null, healthPort, cloudflaredExists, invalidConfig: !healthPortValid, portOccupied: oaPortOpen && !oaRunning };
+
+  // The profile path is instance-unique, so a tunnel-client process carrying it
+  // is safely attributable to this instance even if its current .env changed.
+  // Cloudflared has no profile file, therefore ownership additionally requires
+  // the saved PID to still be a cloudflared local-url tunnel process.
+  if (oaPids.length > 0 && savedCfRunning) {
+    return {
+      running: true,
+      mode,
+      kind: "mixed",
+      pid: oaPids[0],
+      owned: true,
+      configDrift: true,
+      ambiguous: true,
+      healthPort,
+      cloudflaredExists,
+      invalidConfig: !healthPortValid,
+      portOccupied: oaPortOpen && !oaHealthy,
+    };
   }
-  return { running, mode: "cloudflare", kind: cfRunning ? "cloudflare" : null, url: cfRunning ? config.lastTunnelUrl : null, cloudflaredExists, healthPort, pid: cfPids[0] || null, invalidConfig: !healthPortValid, portOccupied: false };
+  if (oaPids.length > 0) {
+    const desired = mode === "openai" && oaHealthy;
+    return {
+      running: true,
+      mode,
+      tunnelId,
+      kind: "openai",
+      pid: oaPids[0],
+      owned: true,
+      configDrift: !desired,
+      healthy: oaHealthy,
+      url: desired ? controlPlaneUrl : config.lastTunnelUrl || null,
+      healthPort,
+      cloudflaredExists,
+      invalidConfig: !healthPortValid,
+      portOccupied: oaPortOpen && !oaHealthy,
+    };
+  }
+  if (savedCfRunning) {
+    const desired = mode === "cloudflare" && desiredCfOwned;
+    return {
+      running: true,
+      mode,
+      kind: "cloudflare",
+      pid: savedPid,
+      owned: true,
+      configDrift: !desired,
+      url: config.lastTunnelUrl || null,
+      healthPort,
+      cloudflaredExists,
+      invalidConfig: !healthPortValid,
+      portOccupied: false,
+    };
+  }
+  if (desiredCfPid) {
+    // A cloudflared process points at the desired port, but without matching
+    // managed PID metadata we must not assume ownership or kill it.
+    return {
+      running: true,
+      mode,
+      kind: "cloudflare",
+      pid: desiredCfPid,
+      owned: false,
+      configDrift: false,
+      url: config.lastTunnelUrl || null,
+      healthPort,
+      cloudflaredExists,
+      invalidConfig: !healthPortValid,
+      portOccupied: false,
+    };
+  }
+  return {
+    running: false,
+    mode,
+    kind: null,
+    pid: savedPid || null,
+    owned: false,
+    configDrift: false,
+    url: null,
+    healthPort,
+    cloudflaredExists,
+    invalidConfig: !healthPortValid,
+    portOccupied: mode === "openai" && oaPortOpen && !oaHealthy,
+  };
 }
 
 async function ensureTunnelClient() {
@@ -1027,21 +1233,25 @@ function enqueueTunnelLifecycle(name, operation) {
 async function startTunnelUnlocked(name) {
   const env = await readInstanceEnv(name);
   const st = await tunnelStatus(name);
+  if (st.running && (!st.owned || st.configDrift)) {
+    return {
+      ok: false,
+      error: st.owned
+        ? `Managed ${st.kind || "tunnel"} process is still running with configuration drift; stop it before starting the newly configured Tunnel.`
+        : `A ${st.kind || "tunnel"} process is already using this instance configuration but is not owned by this Manager; refusing to replace or kill it.`,
+      ...st,
+    };
+  }
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
   if (st.invalidConfig) return { ok: false, error: "OPENAI_TUNNEL_HEALTH_PORT is invalid; fix configuration before starting Tunnel." };
   if (st.portOccupied) return { ok: false, error: `Tunnel health port ${st.healthPort} is occupied by another process; refusing to start Tunnel.` };
   const inst = instPaths(name);
   const port = Number(env.PORT || 0);
   const serverState = await serverStatus(name);
-  if (!serverState.running) {
+  if (!serverState.running || serverState.configDrift) {
     const reason = serverState.portOccupied ? "the server port is occupied by another process" : "Local Coder server is not running";
-    return { ok: false, error: `Cannot start Tunnel: ${reason} on port ${port}.` };
+    return { ok: false, error: serverState.configDrift ? `Cannot start Tunnel: managed Local Coder is still running on old PORT ${serverState.port} while .env configures PORT ${port}.` : `Cannot start Tunnel: ${reason} on port ${port}.` };
   }
-
-  // Remove only stale tunnel processes belonging to this instance.
-  for (const p of pidsWithCmdLine("tunnel-client.exe", inst.profile)) killPidTree(p);
-  for (const p of pidsWithCmdLine("cloudflared.exe", `localhost:${port}`)) killPidTree(p);
-  invalidateProcessScanCache();
 
   if (st.mode === "openai") {
     const healthPort = st.healthPort;
@@ -1071,6 +1281,7 @@ async function startTunnelUnlocked(name) {
     ].join("\n");
     await fsp.mkdir(inst.dir, { recursive: true });
     await atomicWriteFile(profileFile, yaml, "utf8");
+    await writePidFile(inst.tunnelPid, null);
 
     await fsp.writeFile(inst.tunnelLog, "");
     spawnHiddenDetached(client.path, ["run", "--profile-file", profileFile], inst.tunnelLog, {
@@ -1081,7 +1292,8 @@ async function startTunnelUnlocked(name) {
     invalidateProcessScanCache();
     const up = await waitFor(() => tunnelClientHealth(healthPort), 45000);
     if (!up) {
-      for (const p of pidsWithCmdLine(profileFile)) killPidTree(p); // tree-kill: cả codex worker nữa
+      for (const p of pidsWithCmdLine("tunnel-client.exe", profileFile)) killPidTree(p);
+      invalidateProcessScanCache();
       await writePidFile(inst.tunnelPid, null);
       const tail = await tailFile(inst.tunnelLog);
       return { ok: false, error: "OpenAI tunnel không khởi động được. Log cuối:\n" + tail.slice(-1500) };
@@ -1110,9 +1322,16 @@ async function startTunnelUnlocked(name) {
   }
   if (!url) {
     killPidTree(pid);
-    await writePidFile(inst.tunnelPid, null);
+    invalidateProcessScanCache();
+    const stopped = await waitFor(() => !isPidAlive(pid), 5000, 150);
+    if (stopped) await writePidFile(inst.tunnelPid, null);
     const tail = await tailFile(inst.tunnelLog);
-    return { ok: false, error: "Không nhận được URL tunnel. Log cuối:\n" + tail.slice(-1500) };
+    return {
+      ok: false,
+      error: "Không nhận được URL tunnel." + (stopped ? "" : ` PID ${pid} vẫn còn sống; giữ tunnel.pid để có thể stop/recover an toàn.`) + " Log cuối:\n" + tail.slice(-1500),
+      pid: stopped ? null : pid,
+      cleanupFailed: !stopped,
+    };
   }
   await updateInstanceConfig(name, (config) => { config.lastTunnelUrl = url; });
   return { ok: true, mode: "cloudflare", url };
@@ -1122,29 +1341,28 @@ async function stopTunnelUnlocked(name) {
   const st = await tunnelStatus(name);
   if (!st.running) return { ok: true, alreadyStopped: true, mode: st.mode };
   const inst = instPaths(name);
-  const env = await readInstanceEnv(name);
-  const port = Number(env.PORT || "3000");
-  // Chỉ giết tunnel của CHÍNH instance này (lọc theo profile / cổng) — tree-kill cả codex worker con
+  if (!st.owned) {
+    return {
+      ok: false,
+      mode: st.mode,
+      stopped: false,
+      error: `Refusing to stop an unowned ${st.kind || "tunnel"} process${st.pid ? ` (PID ${st.pid})` : ""}.`,
+    };
+  }
+  const targets = new Set(pidsWithCmdLine("tunnel-client.exe", inst.profile).filter(isPidAlive));
+  const savedPid = await readPidFile(inst.tunnelPid);
+  if (savedPid && pidsWithCmdLine("cloudflared.exe", "localhost:").includes(savedPid) && isPidAlive(savedPid)) targets.add(savedPid);
+  if (targets.size === 0) return { ok: false, mode: st.mode, stopped: false, error: "Managed Tunnel is reported running but no owned process can be identified safely." };
+
   let killed = false;
-  for (const p of pidsWithCmdLine("tunnel-client.exe", inst.profile)) {
-    killPidTree(p);
-    killed = true;
-  }
-  for (const p of pidsWithCmdLine("cloudflared.exe", `localhost:${port}`)) {
-    killPidTree(p);
-    killed = true;
-  }
+  for (const pid of targets) killed = killPidTree(pid) || killed;
   invalidateProcessScanCache();
-  // No blind image-name fallback: a stale PID/name can belong to an unrelated tunnel.
-  await writePidFile(inst.tunnelPid, null);
-  const stopped = await waitFor(async () => {
-    if (st.mode === "openai") return !(await tunnelClientHealth(st.healthPort));
-    return pidsWithCmdLine("cloudflared.exe", `localhost:${port}`).length === 0;
-  }, 10000, 150);
+  const stopped = await waitFor(() => [...targets].every((pid) => !isPidAlive(pid)), 10000, 150);
   if (!stopped) {
-    return { ok: false, mode: st.mode, stopped: false, error: "Tunnel process did not stop within 10 seconds." };
+    return { ok: false, mode: st.mode, stopped: false, error: "Managed Tunnel process did not stop within 10 seconds; PID metadata was preserved for a safe retry." };
   }
-  return { ok: true, mode: st.mode, stopped: true, forced: killed };
+  await writePidFile(inst.tunnelPid, null);
+  return { ok: true, mode: st.mode, kind: st.kind, stopped: true, forced: killed };
 }
 
 async function startTunnel(name) {
@@ -1258,9 +1476,11 @@ const SESSION_POLICY_DEFAULTS = {
   MCP_SESSION_DELETE_GRACE_MS: 45000,
   MCP_MAX_SESSIONS: 64,
 };
+const SYNC_RESPONSE_BUDGET_DEFAULT_MS = 100000;
 
 const RUNTIME_LIMIT_SPECS = [
   ["SHELL_TIMEOUT", 120, 1, 86400],
+  ["MCP_SYNC_RESPONSE_BUDGET_MS", SYNC_RESPONSE_BUDGET_DEFAULT_MS, 1000, 115000],
   ["ACTIVITY_LOG_MAX", 500, 1, 100000],
   ["PROJECT_MEMORY_MAX_BYTES", 25000, 0, 5000000],
   ["PROJECT_MEMORY_MAX_LINES", 200, 0, 10000],
@@ -1300,7 +1520,11 @@ async function ensureManagedRuntimeDefaults(name) {
       if (!raw.includes("=")) return { changed: false };
       const env = parseDotEnv(raw);
       const updates = {};
-      const managedDefaults = { ...SESSION_POLICY_DEFAULTS, AUDIT_LOG_PATH: ".mcp-audit.log" };
+      const managedDefaults = {
+        ...SESSION_POLICY_DEFAULTS,
+        MCP_SYNC_RESPONSE_BUDGET_MS: SYNC_RESPONSE_BUDGET_DEFAULT_MS,
+        AUDIT_LOG_PATH: ".mcp-audit.log",
+      };
       for (const [key, fallback] of Object.entries(managedDefaults)) {
         const current = String(env[key] ?? "").trim();
         if (current === "") updates[key] = String(fallback);
@@ -1505,6 +1729,7 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
       CHATGPT_TOOL_PROFILE: env.CHATGPT_TOOL_PROFILE || "slim",
       CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
       SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
+      MCP_SYNC_RESPONSE_BUDGET_MS: env.MCP_SYNC_RESPONSE_BUDGET_MS || String(SYNC_RESPONSE_BUDGET_DEFAULT_MS),
       MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
       MCP_SESSION_TTL_MS: env.MCP_SESSION_TTL_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS),
       MCP_SESSION_CLEANUP_MS: env.MCP_SESSION_CLEANUP_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS),
@@ -1519,7 +1744,6 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
       OPENAI_TUNNEL_HEALTH_PORT: String(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || "8080"),
     },
     config: {
-      connectorName: config.connectorName || "",
       autoStart: config.autoStart !== false,
       lastTunnelUrl: config.lastTunnelUrl || "",
     },
@@ -1530,7 +1754,15 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
   };
 }
 
-async function createInstance(body) {
+let instanceCreateChain = Promise.resolve();
+
+function enqueueInstanceCreate(operation) {
+  const run = instanceCreateChain.then(operation, operation);
+  instanceCreateChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function createInstanceUnlocked(body) {
   const name = String(body.name || "").trim().toLowerCase();
   if (!INSTANCE_NAME_RE.test(name)) {
     return { ok: false, error: "Tên instance: 2–32 ký tự, chỉ chữ thường/số/gạch ngang, bắt đầu bằng chữ hoặc số." };
@@ -1585,6 +1817,7 @@ async function createInstance(body) {
     "CHATGPT_TOOL_PROFILE=slim",
     "CHATGPT_AUTO_APPROVE=true",
     "SHELL_TIMEOUT=120",
+    `MCP_SYNC_RESPONSE_BUDGET_MS=${SYNC_RESPONSE_BUDGET_DEFAULT_MS}`,
     "MCP_SESSION_RECOVERY=true",
     `MCP_SESSION_TTL_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS}`,
     `MCP_SESSION_CLEANUP_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS}`,
@@ -1595,12 +1828,17 @@ async function createInstance(body) {
   ].join("\n");
   await atomicWriteFile(inst.env, envText, "utf8");
   await writeInstanceConfig(name, {
-    connectorName: body.connectorName ? String(body.connectorName).slice(0, 80) : "",
     lastTunnelUrl: "",
     healthPort,
     autoStart: body.autoStart !== false,
   });
   return { ok: true, name, port, adminPort, healthPort, workspace: ws };
+}
+
+async function createInstance(body) {
+  // Port discovery and instance persistence must be one catalog transaction.
+  // Otherwise concurrent creates can choose the same free port pair.
+  return enqueueInstanceCreate(() => createInstanceUnlocked(body));
 }
 
 async function deleteInstance(name) {
@@ -1639,12 +1877,16 @@ async function deleteInstance(name) {
     };
   }
 
-  // Windows có thể giữ file vài trăm ms sau taskkill — retry ngắn trước khi báo lỗi
+  // Windows có thể giữ file vài trăm ms sau taskkill — retry Recycle Bin ngắn.
+  // Never fall back to recursive permanent deletion for managed instance state.
   for (let i = 0; i < 5; i++) {
     try {
-      await fsp.rm(inst.dir, { recursive: true, force: true });
+      await recycleManagedDirectory(inst.dir, INSTANCES_DIR);
       break;
-    } catch {
+    } catch (err) {
+      if (i === 4) {
+        return { ok: false, error: `Không thể chuyển instance '${name}' vào Recycle Bin: ${String(err?.message || err)}` };
+      }
       await new Promise((r) => setTimeout(r, 400));
     }
   }
@@ -1735,6 +1977,13 @@ async function saveInstanceEnvUnlocked(name, body) {
   // Treating the old value as 0 makes every unrelated config save look like a
   // port change while the instance's own tunnel is listening on 8080.
   const oldHealthPort = Number(originalValues.OPENAI_TUNNEL_HEALTH_PORT || 8080);
+  const changesRuntimePort = port !== oldPort || adminPort !== oldAdminPort;
+  if (changesRuntimePort && oldPort > 0 && await isPortOpen(oldPort)) {
+    const oldHealth = await serverHealth(oldPort);
+    if (isLocalCoderHealth(oldHealth, originalValues)) {
+      return { ok: false, error: "Server đang chạy — hãy dừng Server trước khi đổi PORT hoặc ADMIN_PORT." };
+    }
+  }
   if (port !== oldPort && await isPortOpen(port)) return { ok: false, error: `PORT ${port} is occupied by another process.` };
   if (adminPort !== oldAdminPort && await isPortOpen(adminPort)) return { ok: false, error: `ADMIN_PORT ${adminPort} is occupied by another process.` };
   if (hp !== oldHealthPort && await isPortOpen(hp)) return { ok: false, error: `Tunnel health port ${hp} is occupied by another process.` };
@@ -1811,19 +2060,27 @@ function serveStatic(res, filePath) {
   });
 }
 /** Proxy /admin/* → 127.0.0.1:<ADMIN_PORT> của instance (gộp admin UI vào cổng manager). */
-function proxyAdmin(req, res, targetPort, pathname) {
+function proxyAdmin(req, res, targetPort, pathname, adminToken = "") {
   let done = false;
   const finish = (fn) => (...args) => {
     if (done) return;
     done = true;
     fn(...args);
   };
+  const forwardedHeaders = { ...req.headers, host: `127.0.0.1:${targetPort}` };
+  if (adminToken) {
+    // The manager already owns the instance .env. Authenticate server-to-server
+    // without ever exposing ADMIN_TOKEN to browser JS. Remove a stale browser
+    // Authorization header because adminAuth prioritizes it over x-admin-token.
+    delete forwardedHeaders.authorization;
+    forwardedHeaders["x-admin-token"] = adminToken;
+  }
   const options = {
     hostname: "127.0.0.1",
     port: targetPort,
     path: pathname + (req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : ""),
     method: req.method,
-    headers: { ...req.headers, host: `127.0.0.1:${targetPort}` },
+    headers: forwardedHeaders,
   };
   const proxyReq = http.request(options, finish((proxyRes) => {
     const headers = {};
@@ -1870,7 +2127,7 @@ async function handleApi(req, res, url, body) {
           node: process.version,
           error: String((err && err.message) || err),
           env: {},
-          config: { connectorName: "", autoStart: true, lastTunnelUrl: "" },
+          config: { autoStart: true, lastTunnelUrl: "" },
           server: { running: false, port: 0, pid: null, health: null },
           tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
           check: { ok: false, items: [], error: String((err && err.message) || err) },
@@ -1886,7 +2143,7 @@ async function handleApi(req, res, url, body) {
       error: "Chưa có instance nào — tạo workspace trước.",
       instances: [],
       env: {},
-      config: { connectorName: "" },
+      config: {},
       server: { running: false, port: 3000, pid: null, health: null },
       tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
     };
@@ -1940,7 +2197,6 @@ async function handleApi(req, res, url, body) {
     if (req.method === "GET" && sub === "/config") return json(res, 200, { ok: true, ...(await readInstanceConfig(name)) });
     if (req.method === "PUT" && sub === "/config") {
       const config = await updateInstanceConfig(name, (config) => {
-        if (typeof body.connectorName === "string") config.connectorName = body.connectorName.slice(0, 80);
         if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
         if (typeof body.autoStart === "boolean") config.autoStart = body.autoStart;
       });
@@ -1993,7 +2249,7 @@ async function handleApi(req, res, url, body) {
       migrated: false,
       error: "Chưa có instance nào — tạo qua POST /api/instances",
       env: {},
-      config: { connectorName: "" },
+      config: {},
       server: { running: false, port: 3000, pid: null, health: null },
       tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
     });
@@ -2020,6 +2276,7 @@ async function handleApi(req, res, url, body) {
         CHATGPT_TOOL_PROFILE: env.CHATGPT_TOOL_PROFILE || "slim",
         CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
         SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
+        MCP_SYNC_RESPONSE_BUDGET_MS: env.MCP_SYNC_RESPONSE_BUDGET_MS || String(SYNC_RESPONSE_BUDGET_DEFAULT_MS),
         MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
         MCP_SESSION_TTL_MS: env.MCP_SESSION_TTL_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS),
         MCP_SESSION_CLEANUP_MS: env.MCP_SESSION_CLEANUP_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS),
@@ -2029,7 +2286,7 @@ async function handleApi(req, res, url, body) {
         OPENAI_TUNNEL_API_KEY_SET: Boolean(env.OPENAI_TUNNEL_API_KEY),
         OPENAI_TUNNEL_HEALTH_PORT: String(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || "8080"),
       },
-      config: { connectorName: config.connectorName || "" },
+      config: {},
     });
   }
 
@@ -2056,7 +2313,6 @@ async function handleApi(req, res, url, body) {
 
   if (req.method === "PUT" && p === "/api/config") {
     const config = await updateInstanceConfig(dname, (config) => {
-      if (typeof body.connectorName === "string") config.connectorName = body.connectorName.slice(0, 80);
       if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
     });
     return json(res, 200, { ok: true, config });
@@ -2075,7 +2331,9 @@ async function handleApi(req, res, url, body) {
     }
     const profiles = await mutateJson(PROFILES_PATH, {}, (profiles) => {
       scrubProfiles(profiles);
-      profiles[profileName] = { savedAt: new Date().toISOString(), values: withoutSecrets(body.values || {}) };
+      const values = withoutSecrets(body.values || {});
+      delete values.MCP_CONNECTOR_NAME;
+      profiles[profileName] = { savedAt: new Date().toISOString(), values };
       return profiles;
     });
     return json(res, 200, { ok: true, profiles });
@@ -2212,6 +2470,7 @@ let managerPortNum = 3300;
 async function main() {
   await ensureStateDirs();
   await ensureInstances();
+  await removeLegacyConnectorNameConfig();
   const env = await readEnv();
   const managerPortRaw = process.env.MANAGER_PORT || env.MANAGER_PORT || "3300";
   managerPortNum = Number(managerPortRaw);
@@ -2244,7 +2503,7 @@ async function main() {
           return;
         }
         const adminPath = url.pathname.replace(/^\/admin/, "") || "/";
-        proxyAdmin(req, res, adminPort, adminPath);
+        proxyAdmin(req, res, adminPort, adminPath, String(env.ADMIN_TOKEN || ""));
         return;
       }
       const file = url.pathname === "/" ? "index.html" : path.basename(url.pathname);
@@ -2255,11 +2514,16 @@ async function main() {
     }
   });
 
-  server.on("error", (err) => {
+  server.on("error", async (err) => {
     if (err.code === "EADDRINUSE") {
-      console.log(`[Manager] Cổng ${port} đã có manager chạy — mở http://127.0.0.1:${port}`);
-      if (!noOpen) openExternal(`http://127.0.0.1:${port}`);
-      process.exit(0);
+      const existingManager = await managerHealth(port);
+      if (existingManager) {
+        console.log(`[Manager] Cổng ${port} đã có Local Coder Manager chạy — mở http://127.0.0.1:${port}`);
+        if (!noOpen) openExternal(`http://127.0.0.1:${port}`);
+        process.exit(0);
+      }
+      console.error(`[Manager] Cổng ${port} đang bị process khác chiếm; không coi đó là Local Coder Manager.`);
+      process.exit(1);
     }
     console.error("[Manager] Lỗi:", err.message);
     process.exit(1);
@@ -2291,6 +2555,10 @@ async function main() {
               ? `[Auto] ${name}: Server đã bật (pid ${srv.pid})`
               : `[Auto] ${name}: Server lỗi: ${String(srv.error || "").slice(0, 160)}`
         );
+        if (!srv.ok) {
+          console.log(`[Auto] ${name}: bỏ qua Tunnel vì Server chưa chạy an toàn.`);
+          continue;
+        }
         const tun = await startTunnel(name);
         console.log(
           tun.alreadyRunning

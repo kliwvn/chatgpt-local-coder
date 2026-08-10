@@ -16,6 +16,7 @@
 import http from "node:http";
 import {
   createSessionManager,
+  isValidMcpSessionId,
   loopbackMcpPost,
   shouldLogSessionInitializeForClient,
 } from "../dist/lib/mcp-session-manager.js";
@@ -80,6 +81,35 @@ async function main() {
   } else {
     ok("session initialize sampling is client-local");
   }
+
+  const sessionIdCases = [
+    ["550e8400-e29b-41d4-a716-446655440000", true],
+    ["__proto__", true],
+    ["constructor", true],
+    ["", false],
+    ["contains space", false],
+    ["line\nbreak", false],
+    ["x".repeat(257), false],
+    [["array-is-not-a-header-token"], false],
+  ];
+  const sessionIdMismatch = sessionIdCases.find(
+    ([value, expected]) => isValidMcpSessionId(value) !== expected
+  );
+  if (sessionIdMismatch) fail("session ID validation is bounded/control-safe", JSON.stringify(sessionIdMismatch));
+  else ok("session ID validation is bounded/control-safe");
+
+  const prototypeProbeManager = createSessionManager({
+    workspaceRoot: process.cwd(),
+    shellTimeout: 30,
+    workspaceRoots: [process.cwd()],
+    port: 3997,
+  });
+  if (prototypeProbeManager.get("__proto__") !== undefined || prototypeProbeManager.get("constructor") !== undefined) {
+    fail("wire session IDs cannot alias object prototype properties");
+  } else {
+    ok("wire session IDs cannot alias object prototype properties");
+  }
+  await prototypeProbeManager.shutdown();
 
   const hangingServer = http.createServer((_req, _res) => {
     // Intentionally never respond: recovery loopback must abort itself rather
@@ -201,6 +231,71 @@ async function main() {
   if (fake.closed < 1) fail("failed build closes the server", `close() called ${fake.closed} times`);
   else if (fake.closed > 1) fail("failed build closes the server", `close() called ${fake.closed} times (expected exactly 1)`);
   else ok("failed build closes the server");
+
+  // --- handleRequest failure AFTER buildSession() returns but BEFORE the SDK
+  // --- publishes onsessioninitialized. This used to leak the build reservation
+  // --- and registered server because buildSession's catch no longer owned the
+  // --- failure. A malformed response adapter gives us a deterministic failure
+  // --- before publish without reaching into private manager state.
+  let prePublishClosed = 0;
+  const prePublishBaseline = upstreamManager.getRegisteredServerCount();
+  const prePublishManager = createSessionManager({
+    workspaceRoot: process.cwd(),
+    shellTimeout: 30,
+    workspaceRoots: [process.cwd()],
+    port: 3998,
+    createMcpServerOverride: async () => {
+      const server = {
+        server: { getClientVersion: () => undefined },
+        connect: async () => {},
+        close: async () => {
+          prePublishClosed++;
+        },
+      };
+      upstreamManager.registerMcpServer(server);
+      return server;
+    },
+  });
+  const badReq = { headers: {}, method: "POST" };
+  const badRes = { locals: {}, headersSent: false, status() { return this; }, json() {} };
+  let prePublishThrew = false;
+  const originalConsoleError = console.error;
+  try {
+    // The intentionally malformed response adapter makes Hono print the expected
+    // pre-publish TypeError before rejecting. Suppress only that fixture noise so
+    // a green regression test cannot be mistaken for a production error in CI logs.
+    console.error = () => {};
+    await prePublishManager.createNew(badReq, badRes, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "prepublish-leak-test", version: "1" } },
+    });
+  } catch {
+    prePublishThrew = true;
+  } finally {
+    console.error = originalConsoleError;
+  }
+  const prePublishCounts = prePublishManager.counts();
+  if (!prePublishThrew) fail("pre-publish handleRequest rejection propagates", "createNew did not throw");
+  else ok("pre-publish handleRequest rejection propagates");
+  if (prePublishCounts.building !== 0 || prePublishCounts.registered !== 0) {
+    fail(
+      "pre-publish failure releases session reservation",
+      `registered=${prePublishCounts.registered} building=${prePublishCounts.building}`
+    );
+  } else {
+    ok("pre-publish failure releases session reservation");
+  }
+  const afterPrePublish = upstreamManager.getRegisteredServerCount();
+  if (afterPrePublish !== prePublishBaseline) {
+    fail("pre-publish failure unregisters server", `count ${prePublishBaseline} -> ${afterPrePublish}`);
+  } else {
+    ok("pre-publish failure unregisters server");
+  }
+  if (prePublishClosed !== 1) fail("pre-publish failure closes server once", `close() called ${prePublishClosed} times`);
+  else ok("pre-publish failure closes server once");
+  await prePublishManager.shutdown();
 
   // --- Shutdown-race path: createMcpServer resolves but shutdown flips before
   // --- onsessioninitialized. That timing cannot be driven deterministically

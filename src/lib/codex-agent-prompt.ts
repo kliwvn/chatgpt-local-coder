@@ -26,7 +26,8 @@ You are a local coding agent using MCP tools. Path-aware filesystem/git tools ob
 ### Shell rules
 - run_command cwd persists across ChatGPT tool calls (saved to disk) — call shell_status to see current cwd.
 - Long builds: start_process + process_output.
-- git_push, git_checkout, delete_directory may be blocked by ChatGPT — use run_command fallback from tool response.
+- Never bypass filesystem deletion safety through run_command/start_process. delete_file/delete_directory use recoverable Recycle Bin semantics; permanent deletion commands, forced git clean/reset, and shell tracked-file restore are blocked by the executor.
+- Non-destructive git_push / branch switching may use a run_command fallback when a wrapper is blocked, but deletion/restore operations must use their dedicated checkpointed/recoverable tools.
 
 ### Verification
 - Include a verifiable check when the user asks for a fix: failing test first, then fix, then re-run.

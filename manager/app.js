@@ -60,9 +60,11 @@ const curUrl = (sub) => (state.current ? instUrl(state.current, sub) : null);
 const FIELD_ENV = {
   "f-workspace": "WORKSPACE_PATH",
   "f-port": "PORT",
+  "f-admin-port": "ADMIN_PORT",
   "f-profile": "CHATGPT_TOOL_PROFILE",
   "f-auto-approve": "CHATGPT_AUTO_APPROVE",
   "f-timeout": "SHELL_TIMEOUT",
+  "f-sync-budget": "MCP_SYNC_RESPONSE_BUDGET_MS",
   "f-recovery": "MCP_SESSION_RECOVERY",
   "f-session-ttl": "MCP_SESSION_TTL_MS",
   "f-session-cleanup": "MCP_SESSION_CLEANUP_MS",
@@ -374,7 +376,6 @@ async function selectInstance(name, initial) {
 
   // form
   fillForm(env, env.OPENAI_TUNNEL_API_KEY_SET ? { set: true, last4: "••••" } : null);
-  $("f-connector").value = cfg.connectorName || "";
   $("f-autostart").checked = cfg.autoStart !== false;
   $("cfg-inst-name").textContent = name;
   $("log-inst-name").textContent = name;
@@ -462,7 +463,6 @@ async function doSave() {
     const envRes = await api(instUrl(name, "/env"), "PUT", body);
     if (!envRes.ok) throw new Error(envRes.error || "Lưu .env thất bại");
     const cfgRes = await api(instUrl(name, "/config"), "PUT", {
-      connectorName: $("f-connector").value.trim(),
       autoStart: $("f-autostart").checked,
     });
     if (!cfgRes.ok) throw new Error(cfgRes.error || "Lưu cấu hình thất bại");
@@ -508,9 +508,7 @@ async function doProfileSave() {
   if (!name) return;
   setBusy(true);
   try {
-    const values = collectValues();
-    values.MCP_CONNECTOR_NAME = $("f-connector").value.trim();
-    await api("/api/profiles", "POST", { name, values });
+    await api("/api/profiles", "POST", { name, values: collectValues() });
     await loadProfiles();
     toast("Đã lưu profile " + name);
   } catch (err) {
@@ -543,7 +541,6 @@ async function onProfileSelect() {
   const key = vals.OPENAI_TUNNEL_API_KEY;
   delete vals.OPENAI_TUNNEL_API_KEY;
   fillForm(vals, key ? { set: true, last4: String(key).slice(-4) } : null);
-  if (vals.MCP_CONNECTOR_NAME) $("f-connector").value = vals.MCP_CONNECTOR_NAME;
 }
 
 /* ---------------- server / tunnel toggles ---------------- */
@@ -628,13 +625,23 @@ async function doAddInstance() {
   const name = $("add-name").value.trim().toLowerCase();
   const workspacePath = $("add-workspace").value.trim();
   const port = $("add-port").value.trim();
+  const adminPort = $("add-admin-port").value.trim();
   if (!name) {
     toast("Nhập tên workspace", "err");
     return;
   }
   const parsedPort = port ? Number(port) : undefined;
+  const parsedAdminPort = adminPort ? Number(adminPort) : undefined;
   if (port && (!Number.isInteger(parsedPort) || parsedPort < 3000 || parsedPort > 3999)) {
     toast("Cổng không hợp lệ (3000-3999)", "err");
+    return;
+  }
+  if (adminPort && (!Number.isInteger(parsedAdminPort) || parsedAdminPort < 3000 || parsedAdminPort > 3999)) {
+    toast("Admin port không hợp lệ (3000-3999)", "err");
+    return;
+  }
+  if (parsedPort && parsedAdminPort && parsedPort === parsedAdminPort) {
+    toast("PORT và ADMIN_PORT phải khác nhau", "err");
     return;
   }
   setBusy(true);
@@ -643,17 +650,19 @@ async function doAddInstance() {
       name,
       workspacePath,
       port: parsedPort,
+      adminPort: parsedAdminPort,
       autoStart: $("add-autostart").checked,
     });
     if (!r.ok) {
       toast("Lỗi: " + (r.error || ""), "err");
       return;
     }
-    toast(`Đã tạo workspace ${r.name} — MCP cổng ${r.port} (admin tự cấp)`);
+    toast(`Đã tạo workspace ${r.name} — MCP ${r.port} • Admin ${r.adminPort}`);
     $("add-modal").close();
     $("add-name").value = "";
     $("add-workspace").value = "";
     $("add-port").value = "";
+    $("add-admin-port").value = "";
     await loadInstances(false);
     await selectInstance(r.name);
   } catch (err) {
@@ -805,15 +814,15 @@ function init() {
     // Mở thẳng từ trình duyệt (user gesture) — không phụ thuộc server session,
     // vì cmd /c start từ manager chạy trong session khác không hiện trên desktop.
     const url = "https://chatgpt.com/settings/connectors";
-    if (!window.open(url, "_blank", "noopener")) {
-      const a = document.createElement("a");
-      a.href = url;
-      a.target = "_blank";
-      a.rel = "noopener";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    }
+    // Dùng đúng một navigation. window.open(..., "noopener") có thể trả về
+    // null dù tab đã mở, nên fallback dựa trên return value sẽ mở tab lần hai.
+    const a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   });
 
   // folder picker (per current instance): native dialog qua manager server

@@ -5,6 +5,7 @@ import { atomicWriteFile } from "./atomic-write.js";
 import { withFileMutations } from "./file-mutation.js";
 import { envBoundedInteger } from "./env-utils.js";
 import { readBufferFileBounded, readUtf8FileBounded } from "./bounded-file.js";
+import { safeDelete } from "./safe-delete.js";
 
 export interface CheckpointFileSnapshot {
   path: string;
@@ -280,12 +281,8 @@ async function restoreSnapshot(snapshot: CheckpointFileSnapshot): Promise<void> 
 
   if (!snapshot.existed) {
     try {
-      const stat = await fs.stat(target);
-      if (stat.isDirectory()) {
-        await fs.rm(target, { recursive: true, force: true });
-      } else {
-        await fs.unlink(target);
-      }
+      await fs.lstat(target);
+      await safeDelete(target, target);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
@@ -374,9 +371,15 @@ export function getCheckpointConfig(): Record<string, unknown> {
 async function checkpointBeforeUnlocked(
   tool: string,
   paths: string[],
-  options?: { summary?: string; dry_run?: boolean }
+  options?: { summary?: string; dry_run?: boolean; require_complete?: boolean }
 ): Promise<string | null> {
-  if (!isEnabled() || options?.dry_run) return null;
+  if (options?.dry_run) return null;
+  if (!isEnabled()) {
+    if (options?.require_complete) {
+      throw new Error(`CHECKPOINT_REQUIRED: ${tool} requires checkpoints to be enabled before destructive overwrite`);
+    }
+    return null;
+  }
 
   const uniquePaths = [...new Set(paths.map((p) => path.resolve(p)))];
   if (uniquePaths.length === 0) return null;
@@ -390,6 +393,15 @@ async function checkpointBeforeUnlocked(
   const snapshots: CheckpointFileSnapshot[] = [];
   for (const filePath of uniquePaths) {
     snapshots.push(await snapshotFile(filePath, budget));
+  }
+  if (options?.require_complete) {
+    const skipped = snapshots.filter((snapshot) => snapshot.skipped);
+    if (skipped.length) {
+      throw new Error(
+        `CHECKPOINT_INCOMPLETE: refusing ${tool} because recovery snapshot is incomplete: ` +
+          skipped.map((snapshot) => `${snapshot.path}: ${snapshot.skip_reason || "skipped"}`).join("; ")
+      );
+    }
   }
 
   const id = `cp_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
@@ -434,7 +446,7 @@ async function checkpointBeforeUnlocked(
 export async function checkpointBefore(
   tool: string,
   paths: string[],
-  options?: { summary?: string; dry_run?: boolean }
+  options?: { summary?: string; dry_run?: boolean; require_complete?: boolean }
 ): Promise<string | null> {
   return enqueueCheckpointMutation(() => checkpointBeforeUnlocked(tool, paths, options));
 }
@@ -586,7 +598,8 @@ async function restoreToCheckpointUnlocked(targetId: string, plan?: RestorePlan)
 
     if (!snapshot.existed) {
       try {
-        await fs.rm(filePath, { recursive: true, force: true });
+        await fs.lstat(filePath);
+        await safeDelete(filePath, filePath);
         deleted.push(filePath);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;

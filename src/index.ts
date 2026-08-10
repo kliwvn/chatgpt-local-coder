@@ -17,6 +17,7 @@ import {
   createSessionManager,
   extractRequestId,
   isInitializeRequest,
+  isValidMcpSessionId,
   SessionCapacityError,
 } from "./lib/mcp-session-manager.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
@@ -102,6 +103,16 @@ const sessionManager = createSessionManager({
   projectMemoryInstructions: instructionContext.instructionsText,
 });
 
+function validatedSessionId(req: express.Request, res: express.Response): string | undefined | null {
+  const raw = req.headers["mcp-session-id"];
+  if (raw === undefined) return undefined;
+  if (!isValidMcpSessionId(raw)) {
+    sessionManager.sendBadRequest(res, "Bad Request: invalid Mcp-Session-Id header");
+    return null;
+  }
+  return raw;
+}
+
 const app = express();
 // CORS hẹp: chỉ cho phép origin local (localhost/127.0.0.1) — chặn trang web độc hại
 // gọi /mcp từ trình duyệt nạn nhân (tool run_command = toàn quyền shell).
@@ -142,7 +153,8 @@ app.use((req, res, next) => {
   const isMcpRoute = MCP_PATHS_SET.has(req.path);
   res.on("finish", () => {
     const duration = Date.now() - started;
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const rawSessionId = req.headers["mcp-session-id"];
+    const sessionId = isValidMcpSessionId(rawSessionId) ? rawSessionId : undefined;
     const sessionInfo = sessionId ? ` session=${String(sessionId).slice(0, 8)}...` : "";
 
     if (req.method === "POST" && isMcpRoute) {
@@ -198,6 +210,8 @@ app.get("/health", (_req, res) => {
     shellCommandsOsSandboxed: false,
     activeSessions: counts.registered,
     connectedSessions: counts.connected,
+    buildingSessions: counts.building ?? 0,
+    recoveringSessions: counts.recovering ?? 0,
     sessionPolicy: {
       maxRetained: counts.maxRetained,
       idleTtlMs: counts.idleTtlMs,
@@ -235,7 +249,8 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
       });
       return;
     }
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const sessionId = validatedSessionId(req, res);
+    if (sessionId === null) return;
     const requestId = extractRequestId(req.body);
 
     const existing = sessionId ? sessionManager.get(sessionId) : undefined;
@@ -324,7 +339,8 @@ function handleStaleSession(
 
 async function handleMcpGet(req: express.Request, res: express.Response): Promise<void> {
   try {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const sessionId = validatedSessionId(req, res);
+    if (sessionId === null) return;
     if (handleStaleSession(req, res, sessionId)) return;
 
     if (!sessionId) {
@@ -384,7 +400,8 @@ async function handleMcpGet(req: express.Request, res: express.Response): Promis
 
 async function handleMcpDelete(req: express.Request, res: express.Response): Promise<void> {
   try {
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const sessionId = validatedSessionId(req, res);
+    if (sessionId === null) return;
     if (handleStaleSession(req, res, sessionId)) return;
 
     if (!sessionId) {

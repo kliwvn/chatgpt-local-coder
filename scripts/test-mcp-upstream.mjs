@@ -204,6 +204,60 @@ await run("upstream config rejects non-string env/header values", async () => {
   }
 });
 
+await run("upstream config safely preserves prototype-like env/header keys", async () => {
+  const dangerousHeaders = JSON.parse('{"__proto__":"header-value","constructor":"ctor-value","Authorization":"Bearer test"}');
+  const dangerousEnv = JSON.parse('{"__proto__":"env-value","constructor":"ctor-env","NORMAL":"ok"}');
+  const normalized = normalizeUpstreamConfig({
+    version: 1,
+    servers: [{
+      id: "prototype-map",
+      enabled: false,
+      transport: "http",
+      url: "http://127.0.0.1:1/mcp",
+      headers: dangerousHeaders,
+      env: dangerousEnv,
+      expose: "none",
+    }],
+  });
+  const server = normalized.servers[0];
+  assert.equal(Object.getPrototypeOf(server.headers), null);
+  assert.equal(Object.getPrototypeOf(server.env), null);
+  assert.equal(server.headers.__proto__, "header-value");
+  assert.equal(server.headers.constructor, "ctor-value");
+  assert.equal(server.env.__proto__, "env-value");
+  assert.equal(server.env.constructor, "ctor-env");
+});
+
+await run("upstream config bounds normalized tool prefixes", async () => {
+  const punctuation = normalizeUpstreamConfig({
+    version: 1,
+    servers: [{ id: "punctuation-prefix", enabled: true, transport: "http", url: "http://127.0.0.1:1/mcp", expose: "all", tool_prefix: "!!!" }],
+  });
+  assert.equal(punctuation.servers[0].tool_prefix, "___");
+  assert.throws(
+    () => normalizeUpstreamConfig({
+      version: 1,
+      servers: [{ id: "long-prefix", enabled: true, transport: "http", url: "http://127.0.0.1:1/mcp", expose: "all", tool_prefix: "x".repeat(129) }],
+    }),
+    /tool_prefix.*1-128/i,
+  );
+});
+
+await run("concurrent upstream config mutations do not lose updates", async () => {
+  const mutationPath = path.join(tmpDir, "mutation-upstream.json");
+  const manager = new McpUpstreamManager(mutationPath);
+  await manager.init();
+  await Promise.all([
+    manager.upsertServer({ id: "alpha", enabled: false, transport: "http", url: "http://127.0.0.1:1/mcp", expose: "none" }),
+    manager.upsertServer({ id: "beta", enabled: false, transport: "http", url: "http://127.0.0.1:2/mcp", expose: "none" }),
+  ]);
+  const ids = new Set(manager.listServerConfigs().map((server) => server.id));
+  assert.deepEqual(ids, new Set(["alpha", "beta"]));
+  const persisted = await loadUpstreamConfig(mutationPath);
+  assert.deepEqual(new Set(persisted.servers.map((server) => server.id)), new Set(["alpha", "beta"]));
+  await manager.shutdown();
+});
+
 await run("parse claude code mcp config", async () => {
   const fixture = {
     projects: {
@@ -325,6 +379,59 @@ try {
     const [a, b, c] = await Promise.all([manager.connect("race"), manager.connect("race"), manager.connect("race")]);
     if (a !== b || b !== c) throw new Error("concurrent connect returned multiple connection objects");
     await manager.shutdown();
+  });
+
+  await run("idle timeout never disconnects a busy upstream operation", async () => {
+    const manager = new McpUpstreamManager(configPath);
+    await manager.init();
+    await manager.updateConfig({
+      version: 1,
+      servers: [{
+        id: "busy-idle",
+        enabled: true,
+        transport: "http",
+        url: `http://127.0.0.1:${httpPort}/mcp`,
+        expose: "meta_only",
+        idle_timeout_sec: 0.05,
+      }],
+    });
+    const raw = await manager.callTool("busy-idle", "sleep", { ms: 150 });
+    if (!JSON.stringify(raw).includes("150")) throw new Error(`slow tool result missing: ${JSON.stringify(raw)}`);
+    const immediate = await manager.listStatuses({ probe: false });
+    if (!immediate[0]?.connected) throw new Error("busy connection was disconnected before operation completed");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const afterIdle = await manager.listStatuses({ probe: false });
+    if (afterIdle[0]?.connected) throw new Error("connection did not disconnect after becoming idle");
+    await manager.shutdown();
+  });
+
+  await run("upstream synchronous tool calls honor the MCP response budget", async () => {
+    const previousBudget = process.env.MCP_SYNC_RESPONSE_BUDGET_MS;
+    process.env.MCP_SYNC_RESPONSE_BUDGET_MS = "1000";
+    const manager = new McpUpstreamManager(configPath);
+    try {
+      await manager.init();
+      await manager.updateConfig({
+        version: 1,
+        servers: [{
+          id: "sync-budget",
+          enabled: true,
+          transport: "http",
+          url: `http://127.0.0.1:${httpPort}/mcp`,
+          expose: "meta_only",
+        }],
+      });
+      const started = Date.now();
+      await assert.rejects(() => manager.callTool("sync-budget", "sleep", { ms: 1500 }));
+      const elapsed = Date.now() - started;
+      if (elapsed > 3500) throw new Error(`upstream timeout ignored sync response budget: ${elapsed}ms`);
+      const statuses = await manager.listStatuses({ probe: false });
+      if (statuses[0]?.connected) throw new Error("timed-out upstream call kept a stale transport connected");
+    } finally {
+      await manager.shutdown();
+      if (previousBudget === undefined) delete process.env.MCP_SYNC_RESPONSE_BUDGET_MS;
+      else process.env.MCP_SYNC_RESPONSE_BUDGET_MS = previousBudget;
+    }
   });
 
   await run("config change invalidates active upstream connection", async () => {

@@ -1,4 +1,6 @@
 import { spawn } from "child_process";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
@@ -7,6 +9,7 @@ import { requireWriteAllowed } from "../lib/permissions.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import { appendBoundedHead, appendBoundedTail, GIT_OUTPUT_MAX_CHARS } from "../lib/output-budget.js";
+import { checkpointBefore } from "../lib/checkpoint.js";
 
 interface GitRunResult {
   stdout: string;
@@ -228,19 +231,79 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, files, source }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath);
+    const sourceRef = source.trim();
+    if (!sourceRef || sourceRef.startsWith("-") || /[\0\r\n]/.test(sourceRef)) {
+      throw new Error(`GIT_RESTORE_INVALID_SOURCE: refusing ambiguous revision: ${JSON.stringify(source)}`);
+    }
+    const resolvedSourceResult = await gitOrThrow(["rev-parse", "--verify", `${sourceRef}^{tree}`], cwd);
+    const resolvedSource = resolvedSourceResult.stdout.trim().split(/\r?\n/, 1)[0];
+    if (!/^[0-9a-f]{40,64}$/i.test(resolvedSource)) {
+      throw new Error(`GIT_RESTORE_INVALID_SOURCE: could not resolve revision to a tree: ${sourceRef}`);
+    }
+
+    const checkpointPaths: string[] = [];
+    const gitPaths: string[] = [];
+    for (const file of files) {
+      if (
+        !file.trim() ||
+        path.isAbsolute(file) ||
+        file === "." ||
+        file === ".." ||
+        /[\0\r\n*?\[\]]/.test(file) ||
+        file.startsWith(":")
+      ) {
+        throw new Error(`GIT_RESTORE_EXACT_PATH_REQUIRED: refusing broad/pathspec restore target: ${file}`);
+      }
+      const target = path.resolve(cwd, file);
+      const relative = path.relative(cwd, target);
+      if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+        throw new Error(`GIT_RESTORE_EXACT_PATH_REQUIRED: target escapes repository: ${file}`);
+      }
+      const validTarget = await validatePath(target);
+      try {
+        const current = await fs.lstat(validTarget);
+        if (current.isDirectory() || current.isSymbolicLink()) {
+          throw new Error(`GIT_RESTORE_EXACT_FILE_REQUIRED: refusing directory/symlink target: ${file}`);
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+
+      const gitPath = relative.split(path.sep).join("/");
+      const treeEntry = await runGit(["ls-tree", resolvedSource, "--", gitPath], cwd);
+      if (treeEntry.exit_code !== 0 || !treeEntry.stdout.trim()) {
+        throw new Error(`GIT_RESTORE_SOURCE_PATH_MISSING: ${gitPath} is not present in ${sourceRef}`);
+      }
+      const match = /^(\d{6})\s+(\w+)\s+([0-9a-f]+)\t(.+)$/i.exec(treeEntry.stdout.trim());
+      if (
+        !match ||
+        (match[1] !== "100644" && match[1] !== "100755") ||
+        match[2] !== "blob" ||
+        match[4] !== gitPath
+      ) {
+        throw new Error(`GIT_RESTORE_EXACT_FILE_REQUIRED: source target is not one regular tracked file: ${gitPath}`);
+      }
+      checkpointPaths.push(validTarget);
+      gitPaths.push(gitPath);
+    }
+    const checkpointId = await checkpointBefore("git_restore", checkpointPaths, {
+      summary: `git restore from ${source}`,
+      require_complete: true,
+    });
     let r: GitRunResult;
-    const restore = await runGit(["restore", "--source", source, "--", ...files], cwd);
+    const restore = await runGit(["restore", `--source=${resolvedSource}`, "--", ...gitPaths], cwd);
     if (restore.exit_code === 0) {
       r = restore;
     } else {
-      r = await gitOrThrow(["checkout", source, "--", ...files], cwd);
+      r = await gitOrThrow(["checkout", resolvedSource, "--", ...gitPaths], cwd);
     }
     return toolResult("git_restore", {
       path: cwd,
-      files,
+      files: gitPaths,
       source,
+      resolved_source: resolvedSource,
+      checkpoint_id: checkpointId,
       output: r.stdout || r.stderr || "Restored",
-      run_command_fallback: `git restore --source ${source} -- ${files.join(" ")}`,
     });
   });
 
@@ -319,10 +382,10 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   server.registerTool("git_reset", {
     title: "Git Reset",
     description:
-      "Move HEAD to a ref in the local repo. mixed=unstage commits, soft=keep staged, hard=discard working changes.",
+      "Move HEAD to a ref without discarding working-tree files. mixed=unstage commits, soft=keep staged. Hard reset is intentionally disabled.",
     inputSchema: {
       path: z.string().optional(),
-      mode: z.enum(["soft", "mixed", "hard"]).optional().default("mixed"),
+      mode: z.enum(["soft", "mixed"]).optional().default("mixed"),
       ref: z.string().optional().default("HEAD"),
     },
 

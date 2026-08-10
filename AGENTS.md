@@ -9,8 +9,8 @@ MCP server local giống Codex: đọc/ghi file, chạy lệnh, git. Dùng với
 
 ## Quyền truy cập
 
-- **Full machine access** — không giới hạn path, không chặn lệnh
-- Dùng absolute path bất kỳ: `C:\`, `D:\Projects\...`, v.v.
+- `FULL_DISK_ACCESS` chỉ điều khiển scope của **path-aware tools**: `false` = workspace roots; `true` = path toàn máy.
+- **Destructive-command guard luôn bật**, không phụ thuộc `FULL_DISK_ACCESS`: shell không được dùng để permanent-delete, `git clean -f*`, `git reset --hard`, hoặc bypass restore/delete safety.
 - `WORKSPACE_PATH` chỉ là thư mục mặc định cho path tương đối và shell/git
 - `CHATGPT_AUTO_APPROVE=true` — giảm popup xác nhận trên ChatGPT
 
@@ -76,7 +76,7 @@ Bình thường khi:
 | Sửa nhiều đoạn | `multi_edit` |
 | Sửa bằng regex | `replace_regex` |
 | Tạo file mới | `write_file` |
-| Xóa / đổi tên | `delete_file`, `move_file` |
+| Xóa / đổi tên | `delete_file` / `delete_directory` (Recycle Bin), `move_file` |
 | Chạy lệnh ngắn | `run_command` |
 | Build/test dài | `start_process` → `process_output` |
 | Git | `git_status`, `git_diff`, `git_commit`, `git_restore` |
@@ -86,18 +86,16 @@ Bình thường khi:
 
 ## ChatGPT safety layer — tool bị chặn ngẫu nhiên
 
-Một số tool wrapper đôi khi bị OpenAI chặn với *"Lệnh gọi công cụ này đã bị chặn bởi cơ chế kiểm tra an toàn"* — **không phải lỗi server**. Cùng thao tác qua `run_command` thường vẫn chạy được.
+Một số tool wrapper đôi khi có thể bị lớp an toàn của client chặn. Chỉ được dùng `run_command` fallback cho thao tác **không phá hủy**. **Không bao giờ bypass delete/restore bằng shell.** Executor MCP chặn permanent-delete độc lập với hướng dẫn của agent.
 
 | Tool hay bị chặn | Fallback `run_command` |
 |---|---|
 | `git_push` | `git push -u origin <branch>` |
 | `git_checkout` | `git switch <branch>` |
-| `git_restore` | `git restore -- <files>` |
-| `delete_directory` | `Remove-Item -Recurse -Force <path>` (Windows) |
 
-Tool response có thể chứa `run_command_fallback` — dùng lệnh đó nếu wrapper bị chặn.
+`git_restore` phải dùng tool `git_restore` để tạo checkpoint trước khi ghi đè. `delete_file` / `delete_directory` phải dùng tool tương ứng để chuyển target vào Recycle Bin. Không dùng `rm`, `Remove-Item`, `rmdir`, `del`, script Python/Node delete, `git clean -f*` hoặc `git reset --hard` làm fallback.
 
-**Ổn định:** `git_status`, `git_diff`, `git_add`, `git_commit`, `git_log`, `git_branch`, `git_stash`, `git_reset`, `git_pull`.
+**Ổn định:** `git_status`, `git_diff`, `git_add`, `git_commit`, `git_log`, `git_branch`, `git_stash`, `git_reset` (`soft`/`mixed`), `git_pull`.
 
 ## Format `apply_patch` (Codex-style)
 

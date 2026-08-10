@@ -61,7 +61,7 @@ try {
   await fs.writeFile(path.join(dir, "instances", "test", ".env"), envText, "utf-8");
   await fs.writeFile(
     path.join(dir, "instances", "test", "config.json"),
-    JSON.stringify({ connectorName: "", lastTunnelUrl: "", healthPort: port + 3, autoStart: false }),
+    JSON.stringify({ lastTunnelUrl: "", healthPort: port + 3, autoStart: false }),
     "utf-8"
   );
 
@@ -181,6 +181,18 @@ try {
   const afterInvalidEditLimit = await fs.readFile(path.join(dir, "instances", "test", ".env"), "utf-8");
   if (afterInvalidEditLimit.includes("EDIT_TEXT_MAX_BYTES=1")) {
     throw new Error("invalid EDIT_TEXT_MAX_BYTES was persisted despite validation failure");
+  }
+
+  const invalidSyncBudgetSave = await jsonFetch(`${base}/api/instances/test/env`, {
+    method: "PUT",
+    body: JSON.stringify({ values: { MCP_SYNC_RESPONSE_BUDGET_MS: "115001" } }),
+  });
+  if (invalidSyncBudgetSave.body?.ok !== false) {
+    throw new Error(`invalid MCP_SYNC_RESPONSE_BUDGET_MS was accepted: ${JSON.stringify(invalidSyncBudgetSave.body)}`);
+  }
+  const afterInvalidSyncBudget = await fs.readFile(path.join(dir, "instances", "test", ".env"), "utf-8");
+  if (afterInvalidSyncBudget.includes("MCP_SYNC_RESPONSE_BUDGET_MS=115001")) {
+    throw new Error("invalid MCP_SYNC_RESPONSE_BUDGET_MS was persisted despite validation failure");
   }
 
   // 6. Cross-field output-budget invariants must be validated at the Manager

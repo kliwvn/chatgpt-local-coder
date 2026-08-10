@@ -9,6 +9,7 @@ process.env.PROCESS_MAX_RUNNING = "2";
 process.env.PROCESS_HISTORY_MAX = "2";
 process.env.PROCESS_LOG_MAX_CHARS = "4096";
 process.env.FULL_DISK_ACCESS = "true";
+process.env.MCP_SYNC_RESPONSE_BUDGET_MS = "1000";
 
 const { registerShellTools, getManagedProcessStats, shutdownManagedProcesses } = await import("../dist/tools/shell.js");
 const handlers = new Map();
@@ -44,6 +45,15 @@ function nodeCommand(js) {
 }
 
 try {
+  const syncStarted = Date.now();
+  const syncTimed = data(await call("run_command", { command: nodeCommand("setTimeout(() => {}, 1500)") }));
+  const syncElapsed = Date.now() - syncStarted;
+  assert.equal(syncTimed.timed_out, true, "run_command ignored the synchronous MCP response budget");
+  assert.equal(syncTimed.configured_timeout_ms, 30_000);
+  assert.equal(syncTimed.effective_timeout_ms, 1_000);
+  assert.equal(syncTimed.sync_response_budget_ms, 1_000);
+  assert.ok(syncElapsed < 5_000, `run_command exceeded bounded synchronous response time: ${syncElapsed}ms`);
+
   const noisy = data(await call("start_process", { command: nodeCommand("process.stdout.write('x'.repeat(9000))") }));
   await waitFinished(noisy.id);
   const noisyOutput = data(await call("process_output", { id: noisy.id, tail_chars: 200000 }));
@@ -86,7 +96,7 @@ try {
     assert.equal(alive, false, `child pid ${pid} survived managed shutdown`);
   }
 
-  console.log(`shell-process-manager: ok (log<=4096, history<=2, cap=2, shutdown=${shutdownMs}ms)`);
+  console.log(`shell-process-manager: ok (sync-budget=${syncElapsed}ms, log<=4096, history<=2, cap=2, shutdown=${shutdownMs}ms)`);
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }

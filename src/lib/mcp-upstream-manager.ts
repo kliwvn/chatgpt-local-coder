@@ -3,6 +3,8 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { redactSensitiveText } from "./redaction.js";
+import { clampSyncTimeoutMs } from "./sync-response-budget.js";
 
 import {
   loadUpstreamConfig,
@@ -38,6 +40,7 @@ interface UpstreamConnection {
   idleTimer: ReturnType<typeof setTimeout> | null;
   lastError?: string;
   connected: boolean;
+  activeOperations: number;
 }
 
 function positiveEnvInt(name: string, fallback: number, min = 1000, max = 600_000): number {
@@ -61,6 +64,8 @@ export class McpUpstreamManager {
   private servers = new Set<McpServer>();
   private toolsCache = new Map<string, { tools: Tool[]; expiresAt: number }>();
   private readonly toolsCacheTtlMs = 60_000;
+  private configMutationChain: Promise<void> = Promise.resolve();
+  private shuttingDown = false;
 
   constructor(configPath = resolveUpstreamConfigPath()) {
     this.configPath = configPath;
@@ -69,6 +74,20 @@ export class McpUpstreamManager {
 
   async init(): Promise<void> {
     this.config = await loadUpstreamConfig(this.configPath);
+  }
+
+  private enqueueConfigMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.configMutationChain.then(operation, operation);
+    this.configMutationChain = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async applyNormalizedConfig(normalized: UpstreamConfigFile): Promise<UpstreamConfigFile> {
+    await saveUpstreamConfig(normalized, this.configPath);
+    this.config = normalized;
+    await this.disconnectStaleConnections();
+    await this.refreshAllProxies();
+    return this.config;
   }
 
   registerMcpServer(server: McpServer): void {
@@ -101,34 +120,37 @@ export class McpUpstreamManager {
   }
 
   async reloadConfig(): Promise<UpstreamConfigFile> {
-    this.config = await loadUpstreamConfig(this.configPath);
-    await this.disconnectStaleConnections();
-    await this.refreshAllProxies();
-    return this.config;
+    return this.enqueueConfigMutation(async () => {
+      const loaded = await loadUpstreamConfig(this.configPath);
+      this.config = loaded;
+      await this.disconnectStaleConnections();
+      await this.refreshAllProxies();
+      return this.config;
+    });
   }
 
   async updateConfig(next: UpstreamConfigFile): Promise<UpstreamConfigFile> {
     const normalized = normalizeUpstreamConfig(next);
-    await saveUpstreamConfig(normalized, this.configPath);
-    this.config = normalized;
-    await this.disconnectStaleConnections();
-    await this.refreshAllProxies();
-    return this.config;
+    return this.enqueueConfigMutation(() => this.applyNormalizedConfig(normalized));
   }
 
   async upsertServer(server: UpstreamServerConfig): Promise<void> {
-    const next = [...this.config.servers];
-    const idx = next.findIndex((s) => s.id === server.id);
-    if (idx >= 0) next[idx] = server;
-    else next.push(server);
-    await this.updateConfig({ version: 1, servers: next });
+    await this.enqueueConfigMutation(async () => {
+      const next = [...this.config.servers];
+      const idx = next.findIndex((s) => s.id === server.id);
+      if (idx >= 0) next[idx] = server;
+      else next.push(server);
+      await this.applyNormalizedConfig(normalizeUpstreamConfig({ version: 1, servers: next }));
+    });
   }
 
   async removeServer(serverId: string): Promise<boolean> {
-    const next = this.config.servers.filter((s) => s.id !== serverId);
-    if (next.length === this.config.servers.length) return false;
-    await this.updateConfig({ version: 1, servers: next });
-    return true;
+    return this.enqueueConfigMutation(async () => {
+      const next = this.config.servers.filter((s) => s.id !== serverId);
+      if (next.length === this.config.servers.length) return false;
+      await this.applyNormalizedConfig(normalizeUpstreamConfig({ version: 1, servers: next }));
+      return true;
+    });
   }
 
   private async disconnectStaleConnections(): Promise<void> {
@@ -147,9 +169,17 @@ export class McpUpstreamManager {
 
   private scheduleIdleDisconnect(serverId: string, conn: UpstreamConnection): void {
     if (conn.idleTimer) clearTimeout(conn.idleTimer);
+    conn.idleTimer = null;
     const timeoutSec = conn.config.idle_timeout_sec ?? 600;
-    if (timeoutSec <= 0) return;
+    if (timeoutSec <= 0 || conn.activeOperations > 0 || !conn.connected) return;
     conn.idleTimer = setTimeout(() => {
+      conn.idleTimer = null;
+      // The timer belongs to one specific connection generation. Never let an
+      // already-queued timer from an old connection tear down its replacement.
+      if (this.connections.get(serverId) !== conn || !conn.connected) return;
+      // "Idle" means no operation is using the upstream. A long-running tool
+      // must not be killed merely because it runs longer than idle_timeout_sec.
+      if (conn.activeOperations > 0) return;
       void this.disconnect(serverId);
     }, timeoutSec * 1000);
     conn.idleTimer.unref?.();
@@ -157,7 +187,18 @@ export class McpUpstreamManager {
 
   private touch(conn: UpstreamConnection): void {
     conn.lastUsedAt = Date.now();
-    this.scheduleIdleDisconnect(conn.config.id, conn);
+    if (conn.activeOperations === 0) this.scheduleIdleDisconnect(conn.config.id, conn);
+  }
+
+  private beginOperation(conn: UpstreamConnection): void {
+    conn.activeOperations++;
+    if (conn.idleTimer) clearTimeout(conn.idleTimer);
+    conn.idleTimer = null;
+  }
+
+  private endOperation(conn: UpstreamConnection): void {
+    conn.activeOperations = Math.max(0, conn.activeOperations - 1);
+    if (this.connections.get(conn.config.id) === conn && conn.connected) this.touch(conn);
   }
 
   private async createTransport(config: UpstreamServerConfig): Promise<{
@@ -197,6 +238,7 @@ export class McpUpstreamManager {
   }
 
   async connect(serverId: string, force = false): Promise<UpstreamConnection> {
+    if (this.shuttingDown) throw new Error("MCP upstream manager is shutting down");
     const config = this.getServerConfig(serverId);
     if (!config) throw new Error(`Unknown upstream server: ${serverId}`);
     if (!config.enabled) throw new Error(`Upstream server disabled: ${serverId}`);
@@ -231,6 +273,11 @@ export class McpUpstreamManager {
           opened = null;
           throw new Error(`Upstream config changed during connect: ${serverId}`);
         }
+        if (this.shuttingDown) {
+          await opened.transport.close().catch(() => undefined);
+          opened = null;
+          throw new Error("MCP upstream manager is shutting down");
+        }
 
         const conn: UpstreamConnection = {
           config,
@@ -241,6 +288,7 @@ export class McpUpstreamManager {
           idleTimer: null,
           connected: true,
           lastError: undefined,
+          activeOperations: 0,
         };
         if (config.transport === "stdio" && opened.pid) {
           (conn as UpstreamConnection & { pid?: number }).pid = opened.pid;
@@ -280,6 +328,9 @@ export class McpUpstreamManager {
   }
 
   async shutdown(): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    await this.configMutationChain.catch(() => undefined);
     await Promise.allSettled([...this.connectInFlight.values()]);
     for (const id of [...this.connections.keys()]) {
       await this.disconnect(id);
@@ -288,36 +339,44 @@ export class McpUpstreamManager {
 
   async listTools(serverId: string): Promise<Tool[]> {
     const cached = this.toolsCache.get(serverId);
-    if (cached && cached.expiresAt > Date.now()) return cached.tools;
+    if (cached && cached.expiresAt > Date.now()) {
+      const cachedConn = this.connections.get(serverId);
+      if (cachedConn?.connected) this.touch(cachedConn);
+      return cached.tools;
+    }
 
     const conn = await this.connect(serverId);
+    this.beginOperation(conn);
     try {
       const list = await conn.client.listTools(undefined, { timeout: UPSTREAM_DISCOVERY_TIMEOUT_MS });
       const tools = list.tools ?? [];
       conn.tools = tools;
       this.toolsCache.set(serverId, { tools, expiresAt: Date.now() + this.toolsCacheTtlMs });
-      this.touch(conn);
       return tools;
     } catch (err) {
       await this.disconnect(serverId);
       throw err;
+    } finally {
+      this.endOperation(conn);
     }
   }
 
   async callTool(serverId: string, toolName: string, args: Record<string, unknown> = {}): Promise<unknown> {
     const conn = await this.connect(serverId);
-    this.touch(conn);
+    this.beginOperation(conn);
     try {
       return await conn.client.callTool(
         { name: toolName, arguments: args },
         undefined,
-        { timeout: UPSTREAM_TOOL_TIMEOUT_MS }
+        { timeout: clampSyncTimeoutMs(UPSTREAM_TOOL_TIMEOUT_MS) }
       );
     } catch (err) {
       // A timed-out/failed request may leave protocol state ambiguous. Closing
       // the transport aborts the underlying request/process; the next call reconnects.
       await this.disconnect(serverId);
       throw err;
+    } finally {
+      this.endOperation(conn);
     }
   }
 
@@ -333,7 +392,7 @@ export class McpUpstreamManager {
       const conn = await this.connect(serverId, true);
       return this.buildStatus(config, "connected", true, conn.tools, undefined, conn);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = redactSensitiveText(err instanceof Error ? err.message : String(err));
       return this.buildStatus(config, "unreachable", false, [], message);
     }
   }

@@ -15,7 +15,13 @@ import { getDefaultCwd, getFullDiskAccess } from "../lib/path-security.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
 import { atomicWriteFile } from "../lib/atomic-write.js";
 import { readUtf8FileBounded } from "../lib/bounded-file.js";
-import { REDACTED_MASK, isSecretKeyName as isSecretKey } from "../lib/redaction.js";
+import {
+  REDACTED_MASK,
+  isSecretKeyName as isSecretKey,
+  redactSensitiveText,
+  redactSensitiveUrl,
+  restoreSensitiveUrl,
+} from "../lib/redaction.js";
 import {
   getRecentActivity,
   loadAuditHistory,
@@ -29,6 +35,7 @@ const NUMERIC_ENV_LIMITS: Record<string, [number, number]> = {
   PORT: [1, 65_535],
   ADMIN_PORT: [1, 65_535],
   SHELL_TIMEOUT: [1, 86_400],
+  MCP_SYNC_RESPONSE_BUDGET_MS: [1_000, 115_000],
   ACTIVITY_LOG_MAX: [1, 100_000],
   AUTO_MEMORY_MAX_BYTES: [1_024, 10_000_000],
   AUTO_MEMORY_MAX_LINES: [1, 10_000],
@@ -156,6 +163,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       ...config,
       servers: config.servers.map((server) => {
         const masked: UpstreamServerConfig = { ...server };
+        if (server.url) masked.url = redactSensitiveUrl(server.url);
         if (server.headers && typeof server.headers === "object") {
           masked.headers = Object.fromEntries(
             Object.entries(server.headers).map(([k, v]) => [
@@ -185,6 +193,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         const prev = stored.servers.find((s) => s.id === server.id);
         if (!prev) return server;
         const restored: UpstreamServerConfig = { ...server };
+        if (server.url && prev.url) restored.url = restoreSensitiveUrl(server.url, prev.url);
         if (server.headers && prev.headers) {
           restored.headers = { ...server.headers };
           for (const k of Object.keys(restored.headers)) {
@@ -207,7 +216,13 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
   }
   // Single source for session counts so /health, /api/sessions and any future
   // route expose the same numbers under the same key names.
-  const sessionCounts = (): { total: number; connected: number; policy: Record<string, number | null> } => {
+  const sessionCounts = (): {
+    total: number;
+    connected: number;
+    building: number;
+    recovering: number;
+    policy: Record<string, number | null>;
+  } => {
     const counts = options.sessionCounts?.() ?? {
       registered: options.sessionCount(),
       connected: 0,
@@ -215,6 +230,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     return {
       total: counts.registered,
       connected: counts.connected,
+      building: counts.building ?? 0,
+      recovering: counts.recovering ?? 0,
       policy: {
         max_retained: counts.maxRetained ?? null,
         idle_ttl_ms: counts.idleTtlMs ?? null,
@@ -233,6 +250,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       pid: options.pid,
       active_sessions: counts.total,
       connected_sessions: counts.connected,
+      building_sessions: counts.building,
+      recovering_sessions: counts.recovering,
       session_policy: counts.policy,
       mcp_port: options.mcpPort,
       sessions: options.sessionList?.() ?? [],
@@ -255,6 +274,8 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       ok: true,
       total: counts.total,
       connected: counts.connected,
+      building: counts.building,
+      recovering: counts.recovering,
       policy: counts.policy,
       sessions: options.sessionList?.() ?? [],
     });
@@ -357,7 +378,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       const saved = await manager.updateConfig(config);
       res.json({ ok: true, config: maskUpstreamConfig(saved) });
     } catch (err) {
-      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      res.status(400).json({ ok: false, error: redactSensitiveText(err instanceof Error ? err.message : String(err)) });
     }
   });
 
@@ -374,7 +395,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       await manager.upsertServer(server);
       res.json({ ok: true, config: maskUpstreamConfig(manager.getConfig()) });
     } catch (err) {
-      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      res.status(400).json({ ok: false, error: redactSensitiveText(err instanceof Error ? err.message : String(err)) });
     }
   });
 
@@ -392,7 +413,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       const status = await manager.checkHealth(req.params.id);
       res.json({ ok: status.health === "connected", status });
     } catch (err) {
-      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      res.status(400).json({ ok: false, error: redactSensitiveText(err instanceof Error ? err.message : String(err)) });
     }
   });
 
@@ -406,7 +427,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         proxied_tools: config ? manager.getProxiedToolNames(config, tools) : [],
       });
     } catch (err) {
-      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      res.status(400).json({ ok: false, error: redactSensitiveText(err instanceof Error ? err.message : String(err)) });
     }
   });
 

@@ -46,11 +46,13 @@ assert.ok(shell.stdout.length <= 4096);
 assert.ok(shell.stderr.length <= 4096);
 
 const timeoutStarted = Date.now();
-await assert.rejects(
-  () => execInShellSession(process.platform === "win32" ? "Start-Sleep -Seconds 5" : "sleep 5", process.cwd(), 100),
-  /Command timed out after/,
-  "persistent shell timeout did not reject"
+const timedOutShell = await execInShellSession(
+  process.platform === "win32" ? "Start-Sleep -Seconds 5" : "sleep 5",
+  process.cwd(),
+  100
 );
+assert.equal(timedOutShell.timed_out, true, "persistent shell timeout did not return structured timeout state");
+assert.equal(timedOutShell.exit_code, null, "timed-out shell command must not report a successful exit code");
 assert.ok(Date.now() - timeoutStarted < 2500, "persistent shell timeout waited indefinitely for child close");
 
 try {

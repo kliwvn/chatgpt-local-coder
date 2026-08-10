@@ -76,7 +76,7 @@ function normalizeServer(raw: UpstreamServerConfig): UpstreamServerConfig {
     }
     const entries = Object.entries(value);
     if (entries.length > MAX_MAP_ENTRIES) throw new Error(`${label} for ${id} exceeds ${MAX_MAP_ENTRIES} entries`);
-    const out: Record<string, string> = {};
+    const out: Record<string, string> = Object.create(null);
     for (const [key, entry] of entries) {
       if (typeof entry !== "string") throw new Error(`${label}.${key} for ${id} must be a string`);
       if (key.length > 512 || entry.length > MAX_STRING_CHARS) {
@@ -110,6 +110,10 @@ function normalizeServer(raw: UpstreamServerConfig): UpstreamServerConfig {
   const cwd = optionalString(raw.cwd, "cwd");
   const url = optionalString(raw.url, "url");
   const toolPrefix = optionalString(raw.tool_prefix, "tool_prefix") || id;
+  const normalizedToolPrefix = toolPrefix.replace(/[^a-zA-Z0-9_-]/g, "_");
+  if (!normalizedToolPrefix || normalizedToolPrefix.length > 128) {
+    throw new Error(`tool_prefix for ${id} must normalize to 1-128 characters`);
+  }
   const args = normalizeStringList(raw.args, "args", MAX_ARGS);
   const tools = normalizeStringList(raw.tools, "tools", MAX_TOOLS);
 
@@ -131,7 +135,7 @@ function normalizeServer(raw: UpstreamServerConfig): UpstreamServerConfig {
     cwd,
     url,
     headers: normalizeStringMap(raw.headers, "headers"),
-    tool_prefix: toolPrefix.replace(/[^a-zA-Z0-9_-]/g, "_"),
+    tool_prefix: normalizedToolPrefix,
     expose,
     tools,
     idle_timeout_sec: idleTimeout,

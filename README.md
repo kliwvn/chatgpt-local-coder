@@ -221,7 +221,7 @@ Install cloudflared: `winget install Cloudflare.cloudflared`
 | `list_directory` | List folder contents |
 | `directory_tree` | Recursive tree as JSON |
 | `create_directory` | Create folders |
-| `delete_file` / `delete_directory` | Remove files or dirs |
+| `delete_file` / `delete_directory` | Recoverable removal: move file/folder to Windows Recycle Bin; protected roots/aliases are refused |
 | `copy_file` / `move_file` | Copy or rename |
 | `read_file_base64` / `write_file_base64` | Binary file support |
 
@@ -229,9 +229,9 @@ Install cloudflared: `winget install Cloudflare.cloudflared`
 
 | Tool | Description |
 |------|-------------|
-| `run_command` | Run shell commands (`npm test`, builds, …) |
+| `run_command` | Run shell commands (`npm test`, builds, …); destructive delete / forced Git discard commands are blocked before spawn |
 | `shell_status` / `shell_reset` | Persistent shell session |
-| `start_process` | Long-running / background commands |
+| `start_process` | Long-running / background commands; uses the same destructive-command guard as `run_command` |
 | `process_status` / `process_output` / `stop_process` | Manage background jobs |
 
 ### Git
@@ -241,9 +241,9 @@ Install cloudflared: `winget install Cloudflare.cloudflared`
 | `git_status` / `git_diff` / `git_log` | Inspect repo |
 | `git_add` / `git_commit` | Stage and commit |
 | `git_branch` / `git_checkout` | Branch list, create, switch (local only) |
-| `git_restore` | Restore tracked files to last commit |
+| `git_restore` | Restore exact tracked file paths with an automatic checkpoint first |
 | `git_push` / `git_pull` | Sync with configured remote |
-| `git_stash` / `git_reset` | Stash and reset |
+| `git_stash` / `git_reset` | Stash and non-destructive reset (`soft` / `mixed`; hard reset is not exposed) |
 
 ### Claude Code ↔ MCP mapping
 
@@ -330,6 +330,8 @@ OPENAI_TUNNEL_API_KEY=
 
 > **Path sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → các tool có path argument canonicalize path thật (`realpath`/nearest existing ancestor) rồi chặn `..\..`, symlink/junction và multi-file patch escape ra ngoài workspace roots. Recursive `glob`/`grep`/search không follow symlink entries. Project-controlled `CLAUDE.md`/rules imports cũng không được vượt workspace roots. **`run_command` / `start_process` là native shell và không được OS-sandbox bởi setting này**; chỉ working directory của chúng được kiểm tra. Chỉ chạy connector trên máy/code bạn tin cậy.
 
+> **Destructive filesystem safety:** `FULL_DISK_ACCESS=true` **không** tắt destructive guard. `delete_file` / `delete_directory`, multi-file patch delete, Rewind removal of post-checkpoint files, và Manager Delete Instance dùng recoverable Recycle Bin semantics trên fixed local Windows drives; drive/workspace/repo/home roots và symlink/junction/reparse aliases bị từ chối. Nếu không thể bảo đảm Recycle Bin semantics (ví dụ unsupported platform/volume), thao tác fail closed thay vì fallback sang permanent delete. Shell commands như `rm` / `Remove-Item` / `rmdir` / `del`, forced `git clean`, `git reset --hard`, shell `git restore`/checkout-overwrite, cùng inline Python/Node/.NET delete APIs bị chặn trước spawn. Đây vẫn là application-level guard, **không phải OS sandbox cho arbitrary trusted binaries/scripts**.
+
 > **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và **không reset/xóa lịch sử chat, reasoning context hay chất lượng model trực tiếp**. Chi phí thật nằm ở transport handshake, object allocation/tool registration và state/lifecycle nếu server thiết kế sai. Local Coder giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Console/server log chỉ sample `openai-mcp` initialize theo **counter riêng của client ở mốc 25/50/75/...**, nên warm-up/tunnel/recovery không làm lệch nhịp 1/25; dòng sample giữ cả global `initialized=` và `clientInitialized=` để diagnostics mà không spam log. Shell state bootstrap từ disk **một lần mỗi process/workspace** thay vì mỗi transport. `run_command.working_directory` là one-off isolation boundary: command và `cd`/`Set-Location`/`pushd` bên trong chỉ tác động child invocation đó, không mutate hay ghi vào persistent default-shell cwd/history; chỉ call không truyền `working_directory` hoặc `shell_reset` mới dùng state mặc định. Stale-session recovery loopback có timeout nội bộ và chỉ drain tối đa một response prefix nhỏ trước khi cancel, nên wrong/local streaming endpoint không thể làm recovery giữ body trong RAM hoặc chờ stream vô hạn. Explicit DELETE chạy trong cùng per-session op chain với POST, nên phải chờ tool call trước đó hoàn tất rồi session được dispose ngay; `MCP_SESSION_DELETE_GRACE_MS` chỉ còn là fallback cho transport-close ngoài explicit DELETE. Các state bền vững khác (checkpoint index, auto-memory, `.env`/manager config) được serialize/ghi atomic và keyed queue tự giải phóng key sau khi settle. Initialize response vẫn mang đúng một MCP instruction document (không double-wrap). Vì vậy initialize churn hiện có thể tốn CPU/GC/I/O nhỏ, nhưng không làm mất model context; ảnh hưởng gián tiếp tới tool context đã được tách khỏi transport lifecycle.
 
 > **Large tool output / tunnel 413:** OpenAI Secure MCP Tunnel có body limit khoảng 10 MiB. Local Coder giữ result budget mặc định ~7 MiB, không duplicate payload lớn giữa `content.text` và `structuredContent`, cap foreground shell/Git output, và yêu cầu chunk/range cho file lớn. Nếu một local hoặc proxied upstream tool vẫn tạo result vượt budget, server trả `truncated`, `original_payload_bytes`, preview và hint thay vì để request chết bằng HTTP 413. Điều này cũng giảm token/context pressure do log/diff/base64 quá lớn bị nhét lặp vào tool result.
@@ -406,7 +408,7 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 | **Connection failed** | Check `.\start.ps1` + tunnel are both running. URL must be HTTPS. |
 | **502 from tunnel during restart** | The tunnel can remain up while the local server is restarting; a brief 502 means `127.0.0.1:3000` was temporarily unavailable. Manager now drains MCP sessions with bounded graceful close before force fallback, reducing this window. |
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
-| **Tool blocked by OpenAI safety** | Not a server bug. Retry with `run_command` (response may include `run_command_fallback`). Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
+| **Tool blocked by client safety** | Chỉ dùng `run_command` fallback cho thao tác **không phá hủy** như `git push` / branch switch. Không bypass `delete_file`, `delete_directory` hoặc `git_restore` bằng shell; destructive executor guard sẽ từ chối. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
 | **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.bat`). |
 | **Access denied — "Path nằm ngoài workspace"** | Path sandbox mặc định (`FULL_DISK_ACCESS=false`). Mở rộng `EXTRA_WORKSPACE_PATHS` hoặc bật `FULL_DISK_ACCESS=true` trong `.env` instance, restart server trong manager. |
@@ -453,7 +455,7 @@ npm install && npm run build
 
 Mở **http://127.0.0.1:3300**: manager tự cài đặt, cấu hình workspace (folder picker), start server + tunnel, nút mở **Cài Đặt Connector**, **log viewer** (lọc Chỉ MCP), nút **Hướng Dẫn Sử Dụng** — không cần chạy terminal tay.
 
-**Path sandbox:** mặc định `FULL_DISK_ACCESS=false` — các tool có path argument chỉ đọc/ghi trong canonical `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`) và chặn symlink/junction/patch escape. `run_command` / `start_process` vẫn là native shell, **không** được OS-sandbox bởi setting này. Bật `true` chỉ mở scope của path-aware tools ra toàn máy.
+**Path sandbox:** mặc định `FULL_DISK_ACCESS=false` — các tool có path argument chỉ đọc/ghi trong canonical `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`) và chặn symlink/junction/patch escape. `run_command` / `start_process` vẫn là native shell, **không** được OS-sandbox bởi setting này. Bật `true` chỉ mở scope của path-aware tools ra toàn máy; **không tắt destructive-command guard**. `delete_file` / `delete_directory` chuyển target vào Recycle Bin trên fixed local Windows drive và fail closed với protected root/alias/unsupported volume; không còn fallback `Remove-Item -Recurse -Force`.
 
 Chạy thủ công (không dùng manager):
 

@@ -53,7 +53,31 @@ try {
   assert.match(timeoutHook.stderr, /hook timeout/i);
   assert.ok(elapsed < 2500, `hook timeout was not bounded: ${elapsed}ms`);
 
-  console.log("post-edit-hooks: ok (bounded output, normalized timeout, process-tree termination)");
+  const previousBudget = process.env.MCP_SYNC_RESPONSE_BUDGET_MS;
+  process.env.MCP_SYNC_RESPONSE_BUDGET_MS = "1000";
+  try {
+    const budgetCommand = `node -e "setTimeout(()=>{},600)"`;
+    await fs.writeFile(config, JSON.stringify({
+      enabled: true,
+      hooks: [
+        { glob: "**/*.txt", command: budgetCommand, timeout_ms: 1000 },
+        { glob: "**/*.txt", command: budgetCommand, timeout_ms: 1000 },
+        { glob: "**/*.txt", command: budgetCommand, timeout_ms: 1000 },
+      ],
+    }), "utf8");
+    const budgetStarted = Date.now();
+    const budgetResult = await runPostEditHooks([target]);
+    const budgetElapsed = Date.now() - budgetStarted;
+    assert.equal(budgetResult?.sync_response_budget_ms, 1000);
+    assert.equal(budgetResult?.budget_exhausted, true, "serial hooks did not stop when the MCP response budget was exhausted");
+    assert.ok((budgetResult?.post_edit_hooks?.length || 0) <= 2, "post-edit hooks started work after the synchronous deadline");
+    assert.ok(budgetElapsed < 3000, `post-edit hook chain exceeded response budget bound: ${budgetElapsed}ms`);
+  } finally {
+    if (previousBudget === undefined) delete process.env.MCP_SYNC_RESPONSE_BUDGET_MS;
+    else process.env.MCP_SYNC_RESPONSE_BUDGET_MS = previousBudget;
+  }
+
+  console.log("post-edit-hooks: ok (bounded output, normalized timeout, response budget, process-tree termination)");
 } finally {
   delete process.env.POST_EDIT_HOOKS_CONFIG;
   // Windows can briefly retain a directory handle after a forced process-tree

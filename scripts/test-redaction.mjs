@@ -22,6 +22,30 @@ try {
   assert.equal(redaction.isSecretKeyName("AUTHORIZATION"), true);
   assert.equal(redaction.isSecretKeyName("api-key"), true);
   assert.equal(redaction.isSecretKeyName("x.api.key"), true);
+  const urlSecret = "url-token-secret-314159";
+  const userSecret = "url-user-secret-271828";
+  const passwordSecret = "url-password-secret-161803";
+  const rawUrl = `https://${userSecret}:${passwordSecret}@example.invalid/mcp?access_token=${urlSecret}&mode=safe`;
+  const maskedUrl = redaction.redactSensitiveUrl(rawUrl);
+  for (const value of [urlSecret, userSecret, passwordSecret]) {
+    assert.equal(maskedUrl.includes(value), false, "upstream URL redaction leaked credential material");
+  }
+  assert.match(maskedUrl, /mode=safe/, "URL redaction changed non-secret query configuration");
+  const restoredUrl = redaction.restoreSensitiveUrl(maskedUrl, rawUrl);
+  const restored = new URL(restoredUrl);
+  assert.equal(decodeURIComponent(restored.username), userSecret);
+  assert.equal(decodeURIComponent(restored.password), passwordSecret);
+  assert.equal(restored.searchParams.get("access_token"), urlSecret);
+  assert.equal(restored.searchParams.get("mode"), "safe");
+  const changedHost = redaction.restoreSensitiveUrl(
+    `https://${redaction.REDACTED_MASK}:${redaction.REDACTED_MASK}@other.invalid/mcp?access_token=${redaction.REDACTED_MASK}`,
+    rawUrl,
+  );
+  assert.equal(changedHost.includes(urlSecret), false, "URL secret restoration crossed an endpoint identity change");
+  const urlText = redaction.redactSensitiveText(`connect failed: ${rawUrl}`);
+  for (const value of [urlSecret, userSecret, passwordSecret]) {
+    assert.equal(urlText.includes(value), false, "free-text URL error redaction leaked credential material");
+  }
   const text = redaction.redactSensitiveText(command);
   for (const value of [secret, bearer, flagSecret, openAiSecret]) assert.equal(text.includes(value), false);
 
@@ -50,6 +74,7 @@ try {
 
   const quotedAuthWithTail = redaction.redactSensitiveText(`curl -H 'Authorization: Bearer ${bearer}' --next keep-me`);
   assert.match(quotedAuthWithTail, /Authorization:\s*\*{8}/i);
+  assert.match(quotedAuthWithTail, /'Authorization:\s*\*{8}'/, "quoted Authorization redaction must preserve both shell quotes");
   assert.match(quotedAuthWithTail, /--next keep-me$/, "redaction must preserve non-secret command suffix after a quoted Authorization header");
   const basicWithTail = redaction.redactSensitiveText(`Authorization: Basic ${basicSecret} --next keep-me`);
   assert.match(basicWithTail, /--next keep-me$/, "Basic auth redaction must not consume following shell flags");

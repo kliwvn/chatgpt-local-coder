@@ -19,6 +19,7 @@ import { EDIT_TEXT_MAX_BYTES, READ_BASE64_MAX_BYTES, READ_TEXT_MAX_BYTES } from 
 import { readUtf8FileBounded } from "../lib/bounded-file.js";
 import { globToRegExp, matchesCompiledGlob } from "../lib/glob-match.js";
 import { regexLineMatches, regexReplace } from "../lib/regex-guard.js";
+import { safeDelete } from "../lib/safe-delete.js";
 
 const MAX_PARTIAL_TEXT_LINES = 100_000;
 const TAIL_READ_CHUNK_BYTES = 64 * 1024;
@@ -693,7 +694,7 @@ export function registerFilesystemTools(server: McpServer): void {
     "delete_file",
     {
       title: "Delete File",
-      description: "Delete a file from the filesystem.",
+      description: "Remove a file reversibly by moving it to the Windows Recycle Bin. Protected roots are refused.",
       inputSchema: { path: z.string() },
 
       annotations: toolAnnotations("edit"),
@@ -705,9 +706,9 @@ export function registerFilesystemTools(server: McpServer): void {
         const stat = await fs.stat(validPath);
         if (!stat.isFile()) throw new Error("Path is not a file");
         const checkpointId = await checkpointBefore("delete_file", [validPath]);
-        await fs.unlink(validPath);
-        await audit({ tool: "delete_file", action: "delete", target: validPath, status: "ok" });
-        return toolResult("delete_file", { path: validPath, checkpoint_id: checkpointId });
+        const deletion = await safeDelete(filePath, validPath);
+        await audit({ tool: "delete_file", action: "recycle", target: deletion.path, status: "ok" });
+        return toolResult("delete_file", { path: deletion.path, deletion_mode: deletion.mode, checkpoint_id: checkpointId });
       });
     }
   );
@@ -737,7 +738,7 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Remove Local Folder",
       description:
-        "Remove a folder from the local workspace (user-specified path). Does not affect remote servers.",
+        "Remove a folder reversibly by moving it to the Windows Recycle Bin. Workspace/repo/home/drive roots are refused.",
       inputSchema: { path: z.string() },
 
       annotations: toolAnnotations("edit"),
@@ -749,12 +750,12 @@ export function registerFilesystemTools(server: McpServer): void {
         const stat = await fs.stat(validPath);
         if (!stat.isDirectory()) throw new Error("Path is not a directory");
         const checkpointId = await checkpointBefore("delete_directory", [validPath]);
-        await fs.rm(validPath, { recursive: true, force: true });
-        await audit({ tool: "delete_directory", action: "rmdir", target: validPath, status: "ok" });
+        const deletion = await safeDelete(dirPath, validPath);
+        await audit({ tool: "delete_directory", action: "recycle", target: deletion.path, status: "ok" });
         return toolResult("delete_directory", {
-          path: validPath,
+          path: deletion.path,
+          deletion_mode: deletion.mode,
           checkpoint_id: checkpointId,
-          run_command_fallback: `Remove-Item -Recurse -Force "${validPath}"`,
         });
       });
     }
@@ -831,7 +832,7 @@ export function registerFilesystemTools(server: McpServer): void {
             });
             await fs.rename(tempDest, dest);
             try {
-              await fs.rm(src, { recursive: stat.isDirectory(), force: false });
+              await safeDelete(source, src);
             } catch (deleteErr) {
               try {
                 await fs.rm(dest, { recursive: stat.isDirectory(), force: true });

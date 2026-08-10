@@ -55,12 +55,22 @@ const fakeTunnel = http.createServer((_req, res) => {
   res.end("<html><title>not tunnel-client</title></html>");
 });
 const createConflict = http.createServer((_req, res) => res.end("occupied"));
+const fakeAdmin = http.createServer((req, res) => {
+  if (req.headers["x-admin-token"] !== adminSecret || req.headers.authorization) {
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: false, error: "bad manager proxy auth" }));
+    return;
+  }
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ ok: true, proxied: true }));
+});
 await listen(fakeServer, fakeServerPort);
 await listen(fakeTunnel, fakeTunnelPort);
 await listen(createConflict, createConflictPort);
 
 const tunnelSecret = "manager-safety-tunnel-secret-1234";
 const adminSecret = "manager-safety-admin-secret-5678";
+await listen(fakeAdmin, adminPort);
 await fs.writeFile(path.join(demo, ".env"), [
   `PORT=${fakeServerPort}`,
   `ADMIN_PORT=${adminPort}`,
@@ -78,7 +88,7 @@ await fs.writeFile(path.join(demo, ".env"), [
   "MCP_MAX_SESSIONS=64",
   "",
 ].join("\n"));
-await fs.writeFile(path.join(demo, "config.json"), JSON.stringify({ connectorName: "demo", healthPort: fakeTunnelPort, autoStart: false }));
+await fs.writeFile(path.join(demo, "config.json"), JSON.stringify({ connectorName: "legacy-must-be-removed", healthPort: fakeTunnelPort, autoStart: false }));
 const historicalLogSecret = "historical-manager-log-secret-123456";
 await fs.writeFile(
   path.join(demo, "server.log"),
@@ -101,7 +111,7 @@ await fs.writeFile(path.join(restartDemo, ".env"), [
   "MCP_MAX_SESSIONS=64",
   "",
 ].join("\n"));
-await fs.writeFile(path.join(restartDemo, "config.json"), JSON.stringify({ connectorName: "restart-demo", healthPort: restartHealthPort, autoStart: false }));
+await fs.writeFile(path.join(restartDemo, "config.json"), JSON.stringify({ healthPort: restartHealthPort, autoStart: false }));
 const restartHistoricalSecret = "restart-historical-secret-778899";
 await fs.writeFile(path.join(restartDemo, "server.log"), `x.api.key=${restartHistoricalSecret}\nplain=keep-before-start\n`, "utf8");
 
@@ -159,6 +169,14 @@ try {
   assert.deepEqual(envResponse.values.OPENAI_TUNNEL_API_KEY, { set: true, last4: "1234" });
   assert.equal(envResponse.values.ADMIN_TOKEN, "********");
 
+  const proxiedAdmin = await fetch(`http://127.0.0.1:${managerPort}/admin/health?instance=demo`, {
+    headers: { Authorization: "Bearer stale-browser-token" },
+  });
+  const proxiedAdminBody = await proxiedAdmin.json();
+  assert.equal(proxiedAdmin.status, 200, "Manager proxy must inject the instance ADMIN_TOKEN server-side");
+  assert.equal(proxiedAdminBody.proxied, true);
+  assert.equal(JSON.stringify(proxiedAdminBody).includes(adminSecret), false, "Manager proxy must not echo ADMIN_TOKEN to browser");
+
   await Promise.all(Array.from({ length: 20 }, (_, i) => put("/api/instances/demo/env", { values: { [`TEST_KEY_${i}`]: `v${i}` } })));
   const diskEnv = await fs.readFile(path.join(demo, ".env"), "utf8");
   for (let i = 0; i < 20; i++) assert.match(diskEnv, new RegExp(`TEST_KEY_${i}=v${i}`));
@@ -191,6 +209,24 @@ try {
   const adminUiSource = await fs.readFile(path.join(process.cwd(), "public", "ui", "app.js"), "utf8");
   const envExampleSource = await fs.readFile(path.join(process.cwd(), ".env.example"), "utf8");
   assert.match(managerHtml, /id="btn-server-restart"[^>]*>[^<]*Khởi động lại Gateway/);
+  assert.match(managerHtml, /id="f-admin-port"/);
+  assert.match(managerHtml, /id="add-admin-port"/);
+  assert.doesNotMatch(managerHtml, /f-connector|Tên Connector/);
+  assert.doesNotMatch(managerApp, /f-connector|MCP_CONNECTOR_NAME/);
+  assert.doesNotMatch(JSON.stringify(item.config), /connectorName/);
+  assert.doesNotMatch(await fs.readFile(path.join(demo, "config.json"), "utf8"), /connectorName/, "startup must scrub obsolete connectorName from existing instance config");
+  assert.match(managerApp, /"f-admin-port":\s*"ADMIN_PORT"/);
+  assert.match(managerApp, /adminPort:\s*parsedAdminPort/);
+  assert.match(managerServerSource, /ADMIN_PORT .*is occupied by another process/);
+  assert.match(managerServerSource, /dừng Server trước khi đổi PORT hoặc ADMIN_PORT/);
+  assert.match(managerServerSource, /instanceCreateChain = Promise\.resolve\(\)/, "instance creation must serialize port allocation and persistence");
+  assert.match(managerServerSource, /existingManager = await managerHealth\(port\)/, "EADDRINUSE must verify Local Coder Manager identity before treating the port as an existing Manager");
+  assert.match(managerServerSource, /if \(!srv\.ok\) \{[\s\S]{0,180}?continue;[\s\S]{0,180}?startTunnel\(name\)/, "autostart must not launch Tunnel after Server start fails");
+  assert.match(managerServerSource, /Refusing to stop an unowned .*tunnel/i, "Tunnel stop must fail closed for unowned processes");
+  assert.doesNotMatch(managerServerSource, /pidsWithCmdLine\(profileFile\)/, "Tunnel cleanup must include an executable identity and never call the process scanner with only a profile path");
+  assert.match(managerServerSource, /pidsWithCmdLine\("tunnel-client\.exe", profileFile\)/, "OpenAI tunnel cleanup must scope by executable plus the instance-unique profile");
+  assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.serverPid, null\)/, "failed Gateway startup must preserve PID metadata until the child is confirmed stopped");
+  assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.tunnelPid, null\)/, "failed cloudflared startup must preserve PID metadata until the child is confirmed stopped");
   assert.match(managerApp, /\/server\/restart/);
   assert.match(managerApp, /splitExtraWorkspacePaths/);
   assert.match(managerApp, /\.split\(";"\)/);
@@ -249,11 +285,32 @@ try {
   const restartListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
   assert.equal(restartListing.server.running, true);
   assert.equal(restartListing.server.pid, managedRestart.pid);
+
+  // Simulate an out-of-band .env edit while the managed Gateway is still live.
+  // Manager must keep tracking the owned PID on its actual old port, refuse a
+  // duplicate start, and still be able to stop that exact process safely.
+  const restartEnvPath = path.join(restartDemo, ".env");
+  const restartLiveEnv = await fs.readFile(restartEnvPath, "utf8");
+  const driftConfiguredPort = await freePort();
+  await fs.writeFile(restartEnvPath, restartLiveEnv.replace(/^PORT=.*$/m, `PORT=${driftConfiguredPort}`), "utf8");
+  const driftListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
+  assert.equal(driftListing.server.running, true, "PORT drift must not make an owned live Gateway disappear");
+  assert.equal(driftListing.server.port, restartServerPort, "status must report the actual live port during config drift");
+  assert.equal(driftListing.server.configuredPort, driftConfiguredPort);
+  assert.equal(driftListing.server.configDrift, true);
+  assert.equal(driftListing.server.pid, managedRestart.pid);
+  const driftDuplicateStart = (await post("/api/instances/restart-demo/server/start")).body;
+  assert.equal(driftDuplicateStart.ok, false, "PORT drift must fail closed instead of starting a duplicate Gateway");
+  assert.match(driftDuplicateStart.error, /still running|PORT|configuration/i);
+  const driftTunnelStart = (await post("/api/instances/restart-demo/tunnel/start")).body;
+  assert.equal(driftTunnelStart.ok, false, "Tunnel must not start against a Gateway with PORT drift");
+  assert.match(driftTunnelStart.error, /old PORT|running|configuration|drift/i);
   const managedStop = (await post("/api/instances/restart-demo/server/stop")).body;
   assert.equal(managedStop.ok, true, `managed server stop failed: ${JSON.stringify(managedStop)}`);
   assert.equal(managedStop.processExited, true, "stop must confirm the Gateway PID fully exited");
   assert.equal(pidAlive(managedRestart.pid), false, "stopped Gateway PID must no longer be alive");
   managedRestartPid = null;
+  await fs.writeFile(restartEnvPath, restartLiveEnv, "utf8");
 
   // Deleting a live instance must first stop its owned Gateway and only then
   // remove the instance metadata. This guards against orphaning a process when
@@ -273,6 +330,44 @@ try {
   const badPort = (await post("/api/instances", { name: "bad-port", port: `${createConflictPort}junk`, workspacePath: process.cwd() })).body;
   assert.equal(badPort.ok, false, "port parsing must reject numeric prefixes with junk suffixes");
 
+  const concurrentCreates = await Promise.all(Array.from({ length: 6 }, (_, i) =>
+    post("/api/instances", { name: `race-${i}`, workspacePath: process.cwd(), autoStart: false }).then((r) => r.body)
+  ));
+  for (const created of concurrentCreates) assert.equal(created.ok, true, `concurrent create failed: ${JSON.stringify(created)}`);
+  const allocatedPorts = concurrentCreates.flatMap((created) => [created.port, created.adminPort, created.healthPort]);
+  assert.equal(new Set(allocatedPorts).size, allocatedPorts.length, "concurrent instance creates must allocate unique server/admin/health ports");
+
+  // An unrelated process on MANAGER_PORT must not be mistaken for an already
+  // running Local Coder Manager merely because bind() returned EADDRINUSE.
+  const unrelatedPort = await freePort();
+  const unrelatedServer = http.createServer((_req, res) => res.end("not-a-manager"));
+  await listen(unrelatedServer, unrelatedPort);
+  const collisionManager = spawn(process.execPath, ["manager/server.mjs", "--no-open"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      MANAGER_PORT: String(unrelatedPort),
+      MANAGER_INSTANCES_DIR: path.join(root, "collision-instances"),
+      MANAGER_STATE_DIR: path.join(root, "collision-state"),
+      MCP_ENV_FILE: path.join(root, "collision-legacy.env"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let collisionOutput = "";
+  collisionManager.stdout.on("data", (d) => (collisionOutput += d));
+  collisionManager.stderr.on("data", (d) => (collisionOutput += d));
+  const collisionExit = await Promise.race([
+    new Promise((resolve, reject) => {
+      collisionManager.once("error", reject);
+      collisionManager.once("exit", (code) => resolve(code));
+    }),
+    sleep(6000).then(() => "timeout"),
+  ]);
+  if (collisionExit === "timeout" && pidAlive(collisionManager.pid)) collisionManager.kill("SIGTERM");
+  await new Promise((resolve) => unrelatedServer.close(resolve));
+  assert.equal(collisionExit, 1, `unrelated MANAGER_PORT occupant must produce exit 1, got ${collisionExit}: ${collisionOutput}`);
+  assert.match(collisionOutput, /process khác|not.*Local Coder Manager/i);
+
   const auditLocalCreate = (await post("/api/instances", { name: "audit-local", workspacePath: process.cwd(), autoStart: false })).body;
   assert.equal(auditLocalCreate.ok, true, `audit-local create failed: ${JSON.stringify(auditLocalCreate)}`);
   const auditLocalEnv = await fs.readFile(path.join(instances, "audit-local", ".env"), "utf8");
@@ -289,7 +384,7 @@ try {
   assert.equal(log2.unchanged, true);
   assert.equal(log2.log, "");
 
-  console.log("manager-safety: ok (identity, env 20/20, profiles 30/30, secret-safe, restart PID swap, conditional log)");
+  console.log("manager-safety: ok (identity, env 20/20, profiles 30/30, port-drift ownership, create serialization, manager-port identity, secret-safe, restart PID swap, conditional log)");
 } finally {
   if (managedRestartPid) {
     if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(managedRestartPid), "/T", "/F"], { windowsHide: true });
@@ -300,6 +395,6 @@ try {
   manager.kill("SIGTERM");
   await sleep(300);
   if (manager.exitCode == null && process.platform === "win32") spawnSync("taskkill", ["/PID", String(manager.pid), "/T", "/F"], { windowsHide: true });
-  for (const server of [fakeServer, fakeTunnel, createConflict]) await new Promise((resolve) => server.close(resolve));
+  for (const server of [fakeServer, fakeTunnel, createConflict, fakeAdmin]) await new Promise((resolve) => server.close(resolve));
   await fs.rm(root, { recursive: true, force: true });
 }

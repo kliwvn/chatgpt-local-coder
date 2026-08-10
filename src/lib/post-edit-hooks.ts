@@ -4,6 +4,7 @@ import { fileURLToPath } from "url";
 import { readUtf8FileBounded } from "./bounded-file.js";
 import { appendBoundedTail } from "./output-budget.js";
 import { globToRegExp, matchesCompiledGlob } from "./glob-match.js";
+import { clampSyncTimeoutMs, getSyncResponseBudgetMs } from "./sync-response-budget.js";
 
 export interface PostEditHook {
   glob: string;
@@ -57,7 +58,7 @@ async function loadHooksConfig(): Promise<HooksConfig> {
             ...hook,
             timeout_ms:
               Number.isSafeInteger(hook.timeout_ms) && hook.timeout_ms! >= MIN_HOOK_TIMEOUT_MS
-                ? Math.min(hook.timeout_ms!, MAX_HOOK_TIMEOUT_MS)
+                ? clampSyncTimeoutMs(Math.min(hook.timeout_ms!, MAX_HOOK_TIMEOUT_MS))
                 : 15_000,
           }))
       : [];
@@ -168,9 +169,12 @@ export async function runPostEditHooks(filePaths: string[]): Promise<Record<stri
   const config = await loadHooksConfig();
   if (config.enabled === false || !config.hooks?.length) return undefined;
 
+  const syncBudgetMs = getSyncResponseBudgetMs();
+  const deadline = Date.now() + syncBudgetMs;
   const results: Array<Record<string, unknown>> = [];
   let executions = 0;
   let truncated = false;
+  let budgetExhausted = false;
   const hooks = config.hooks.map((hook) => ({ hook, matcher: globToRegExp(hook.glob) }));
 
   for (const filePath of filePaths) {
@@ -178,12 +182,18 @@ export async function runPostEditHooks(filePaths: string[]): Promise<Record<stri
     const rel = filePath.replace(/\\/g, "/");
     for (const { hook, matcher } of hooks) {
       if (!matchesCompiledGlob(matcher, rel, base)) continue;
+      const remainingMs = deadline - Date.now();
+      if (remainingMs < MIN_HOOK_TIMEOUT_MS) {
+        truncated = true;
+        budgetExhausted = true;
+        break;
+      }
       if (executions >= MAX_HOOK_EXECUTIONS) {
         truncated = true;
         break;
       }
       executions++;
-      const out = await runHook(hook.command, filePath, hook.timeout_ms ?? 15000);
+      const out = await runHook(hook.command, filePath, Math.min(hook.timeout_ms ?? 15000, remainingMs));
       results.push({
         file: filePath,
         glob: hook.glob,
@@ -199,5 +209,10 @@ export async function runPostEditHooks(filePaths: string[]): Promise<Record<stri
   }
 
   if (!results.length) return undefined;
-  return { post_edit_hooks: results, ...(truncated ? { truncated: true, max_executions: MAX_HOOK_EXECUTIONS } : {}) };
+  return {
+    post_edit_hooks: results,
+    sync_response_budget_ms: syncBudgetMs,
+    ...(truncated ? { truncated: true, max_executions: MAX_HOOK_EXECUTIONS } : {}),
+    ...(budgetExhausted ? { budget_exhausted: true } : {}),
+  };
 }

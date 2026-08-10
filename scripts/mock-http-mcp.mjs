@@ -23,6 +23,21 @@ function buildServer() {
       structuredContent: { sum: a + b },
     })
   );
+  mcpServer.registerTool(
+    "sleep",
+    {
+      title: "Sleep",
+      description: "Wait for a bounded duration before returning",
+      inputSchema: { ms: z.number().int().min(1).max(2000) },
+    },
+    async ({ ms }) => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return {
+        content: [{ type: "text", text: `slept:${ms}` }],
+        structuredContent: { slept_ms: ms },
+      };
+    }
+  );
   return mcpServer;
 }
 

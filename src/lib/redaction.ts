@@ -8,12 +8,64 @@ export function isSecretKeyName(key: string): boolean {
   return SECRET_KEY_PATTERN.test(normalized);
 }
 
+function maskedComponent(value: string): boolean {
+  if (!value) return false;
+  try {
+    return decodeURIComponent(value) === REDACTED_MASK;
+  } catch {
+    return value === REDACTED_MASK;
+  }
+}
+
+/** Mask credentials carried inside an HTTP(S) URL without changing non-secret query config. */
+export function redactSensitiveUrl(input: string): string {
+  const raw = String(input || "");
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return redactSensitiveText(raw);
+    if (url.username) url.username = REDACTED_MASK;
+    if (url.password) url.password = REDACTED_MASK;
+    for (const key of [...url.searchParams.keys()]) {
+      if (isSecretKeyName(key) && url.searchParams.get(key)) url.searchParams.set(key, REDACTED_MASK);
+    }
+    return url.toString();
+  } catch {
+    return redactSensitiveText(raw);
+  }
+}
+
+/** Restore only sentinel URL components from the previously stored URL. */
+export function restoreSensitiveUrl(candidate: string, previous: string | undefined): string {
+  if (!previous) return candidate;
+  try {
+    const next = new URL(candidate);
+    const old = new URL(previous);
+    if (next.protocol !== old.protocol || next.hostname !== old.hostname || next.port !== old.port) return candidate;
+    if (maskedComponent(next.username)) next.username = old.username;
+    if (maskedComponent(next.password)) next.password = old.password;
+    for (const key of [...next.searchParams.keys()]) {
+      const value = next.searchParams.get(key) || "";
+      if (isSecretKeyName(key) && maskedComponent(value) && old.searchParams.has(key)) {
+        next.searchParams.set(key, old.searchParams.get(key) || "");
+      }
+    }
+    return next.toString();
+  } catch {
+    return candidate;
+  }
+}
+
 function redactAssignment(match: string, prefix: string, key: string, _value: string): string {
   return isSecretKeyName(key) ? `${prefix}${key}=${REDACTED_MASK}` : match;
 }
 
 function redactColonAssignment(match: string, quote: string, key: string, value: string): string {
   if (!isSecretKeyName(key)) return match;
+  const unquotedValue = value.replace(/^["']|["']$/g, "");
+  // Earlier redaction passes may already have replaced this value. Preserve the
+  // original surrounding syntax instead of re-processing the sentinel and
+  // accidentally consuming a trailing quote from shell/serialized text.
+  if (unquotedValue === REDACTED_MASK) return match;
   // Preserve the source value's quote style. JSON string fields stay valid,
   // while shell/log object-like text keeps its original unquoted shape.
   const valueQuote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : "";
@@ -26,6 +78,9 @@ function redactColonAssignment(match: string, quote: string, key: string, value:
  */
 export function redactSensitiveText(input: string): string {
   let text = String(input);
+
+  // URL userinfo is a credential even when it has no secret-ish key name.
+  text = text.replace(/\b(https?:\/\/)([^\s\/@:]+):([^\s\/@]+)@/gi, `$1${REDACTED_MASK}:${REDACTED_MASK}@`);
 
   // Authorization must be handled before generic key:value masking. Mask the
   // complete quoted header when possible, then conservatively mask the remainder

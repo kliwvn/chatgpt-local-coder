@@ -3,6 +3,7 @@ import path from "path";
 import { readBufferFileBounded, readUtf8FileBounded } from "./bounded-file.js";
 import { EDIT_TEXT_MAX_BYTES } from "./output-budget.js";
 import { atomicWriteFile } from "./atomic-write.js";
+import { safeDelete } from "./safe-delete.js";
 
 /**
  * Apply unified diff / Codex-style patches to text.
@@ -162,6 +163,7 @@ export function applyUnifiedPatchToText(original: string, patchText: string): st
 
 export interface MultiPatchFileOp {
   path: string;
+  requestedPath?: string;
   operation: "create" | "update" | "delete";
   patch?: string;
   content?: string;
@@ -280,9 +282,15 @@ export async function applyMultiFilePatch(
     if (options.resolved_paths.length !== ops.length) {
       throw new Error("resolved_paths length does not match patch operation count");
     }
-    for (let i = 0; i < ops.length; i++) ops[i].path = options.resolved_paths[i];
+    for (let i = 0; i < ops.length; i++) {
+      ops[i].requestedPath = ops[i].path;
+      ops[i].path = options.resolved_paths[i];
+    }
   } else if (options?.resolve_path) {
-    for (const op of ops) op.path = await options.resolve_path(op.path);
+    for (const op of ops) {
+      op.requestedPath = op.path;
+      op.path = await options.resolve_path(op.path);
+    }
   }
 
   const normalizedTargets = ops.map((op) => {
@@ -401,7 +409,9 @@ export async function applyMultiFilePatch(
   const committed: PreparedOperation[] = [];
   try {
     for (const item of prepared) {
-      if (item.op.operation === "delete") await fs.unlink(item.op.path);
+      if (item.op.operation === "delete") {
+        await safeDelete(item.op.requestedPath ?? item.op.path, item.op.path);
+      }
       else await atomicWriteFile(item.op.path, item.next ?? "", "utf-8");
       committed.push(item);
     }

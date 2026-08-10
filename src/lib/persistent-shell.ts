@@ -198,7 +198,17 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     // Usually the child emits close promptly after tree-kill. Bound the rare OS
     // edge where it never does so a timed-out run_command cannot hang forever.
     forceSettleTimer = setTimeout(() => {
-      settle(() => reject(new Error(`Command timed out after ${timeoutMs / 1000}s`)));
+      settle(() => resolve({
+        command,
+        cwd,
+        stdout: stdout.trim(),
+        stderr: stderr.trim(),
+        exit_code: null,
+        timed_out: true,
+        stdout_truncated: stdoutTruncated,
+        stderr_truncated: stderrTruncated,
+        output_max_chars: SHELL_OUTPUT_MAX_CHARS,
+      }));
     }, 1500);
     forceSettleTimer.unref?.();
   }, timeoutMs);
@@ -217,7 +227,17 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
   child.on("close", (code) => {
     settle(() => {
       if (timedOut) {
-        reject(new Error(`Command timed out after ${timeoutMs / 1000}s`));
+        resolve({
+          command,
+          cwd,
+          stdout: stdout.trim(),
+          stderr: stderr.trim(),
+          exit_code: null,
+          timed_out: true,
+          stdout_truncated: stdoutTruncated,
+          stderr_truncated: stderrTruncated,
+          output_max_chars: SHELL_OUTPUT_MAX_CHARS,
+        });
         return;
       }
       resolve({
