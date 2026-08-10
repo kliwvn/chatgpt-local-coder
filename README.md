@@ -266,7 +266,6 @@ MANAGER_PORT=3300
 WORKSPACE_PATH=C:\Users\You\projects\my-app
 CHATGPT_AUTO_APPROVE=true
 SHELL_TIMEOUT=120
-MCP_SESSION_RECOVERY=true
 MCP_SESSION_TTL_MS=120000
 MCP_SESSION_CLEANUP_MS=15000
 MCP_SESSION_DELETE_GRACE_MS=45000
@@ -301,7 +300,6 @@ OPENAI_TUNNEL_API_KEY=
 | `WORKSPACE_PATHS` / `ALLOWED_WORKSPACE_PATHS` | — | Aliases của `EXTRA_WORKSPACE_PATHS` (đọc thêm nếu có) |
 | `FULL_DISK_ACCESS` | `false` | Scope cho **path-aware filesystem/git/config tools**. `false` = chỉ path canonical trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`); `true` = cho phép path toàn máy. Không phải OS sandbox cho native shell |
 | `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
-| `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
 | `MCP_SESSION_TTL_MS` | `120000` | Xóa session **idle** sau 2 phút. Session đang SSE-connected hoặc đang chạy tool không bị evict; stale POST được auto-recover |
 | `MCP_SESSION_CLEANUP_MS` | `15000` | Chu kỳ cleanup session idle (15 giây) |
 | `MCP_SESSION_DELETE_GRACE_MS` | `45000` | **Fallback grace** cho transport close ngoài explicit DELETE. Explicit DELETE đã serialize sau các POST/tool call trước đó nên được dispose ngay khi op chain drain xong, tránh giữ session churn thêm 45s không cần thiết |

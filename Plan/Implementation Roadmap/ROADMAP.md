@@ -3,14 +3,14 @@
 ## Current production invariants
 - MCP transport sessions are isolated; never coalesce them by IP/User-Agent/client name.
 - Idle retention defaults to **2 minutes**, cleanup **15 seconds**, hard cap **64**; connected SSE and in-flight operations are never evicted, and later stale POSTs are recoverable.
-- Stale session IDs remain recoverable when `MCP_SESSION_RECOVERY=true`.
+- Stale session IDs are recoverable by invariant. The obsolete `MCP_SESSION_RECOVERY` switch is ignored by runtime and scrubbed from managed/Admin configuration to prevent hidden drift.
 - Initialize sends exactly one complete server-instruction document; do not double-wrap project memory/instructions.
 - Proxy tools must be registered before a newly initialized session becomes usable (`createMcpServer` awaits proxy refresh).
 - One global `McpUpstreamManager` owns upstream connections/cache across transport sessions.
 - Full session IDs stay internal; admin session/activity APIs, SSE and server logs expose only short IDs.
 - Successful `/health` polling must not spam `server.log`.
 - Session dashboard auto-refresh is visible-only, 5s, single-flight and displays retention policy.
-- Manager `:3300` and direct admin settings both expose recovery/TTL/cleanup/delete-grace/max-session policy; these are not hidden code-only knobs.
+- Manager `:3300` and direct admin settings expose TTL/cleanup/delete-grace/max-session policy. Recovery itself is automatic and no longer exposed as a configuration knob.
 - Existing TX-01 op-chain invariant remains: SSE GET bypasses the chain; POST/DELETE serialize; second concurrent GET fails fast 409.
 - Managed instances write audit logs to their own instance dir: relative `AUDIT_LOG_PATH` resolves against the `MCP_ENV_FILE` directory (`manager/instances/<name>/.mcp-audit.log`), never the shared repo root.
 - Manager and admin APIs never ship plaintext secrets to the browser: env endpoints mask via `SECRET_KEY_RE` + sentinel; upstream config masks header/env secrets; write paths restore sentinels from stored config. Audit file stays raw (local disk).

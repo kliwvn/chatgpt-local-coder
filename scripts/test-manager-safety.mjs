@@ -168,6 +168,7 @@ try {
   assert.equal(serializedEnv.includes(adminSecret), false);
   assert.deepEqual(envResponse.values.OPENAI_TUNNEL_API_KEY, { set: true, last4: "1234" });
   assert.equal(envResponse.values.ADMIN_TOKEN, "********");
+  assert.equal(Object.prototype.hasOwnProperty.call(envResponse.values, "MCP_SESSION_RECOVERY"), false, "obsolete recovery switch must not be exposed by Manager env API");
 
   const proxiedAdmin = await fetch(`http://127.0.0.1:${managerPort}/admin/health?instance=demo`, {
     headers: { Authorization: "Bearer stale-browser-token" },
@@ -182,14 +183,16 @@ try {
   for (let i = 0; i < 20; i++) assert.match(diskEnv, new RegExp(`TEST_KEY_${i}=v${i}`));
   assert.match(diskEnv, new RegExp(`OPENAI_TUNNEL_API_KEY=${tunnelSecret}`));
   assert.match(diskEnv, new RegExp(`ADMIN_TOKEN=${adminSecret}`));
+  assert.doesNotMatch(diskEnv, /^MCP_SESSION_RECOVERY=/m, "saving any managed env must scrub the obsolete recovery switch");
 
   const profileSecret = "profile-secret-must-not-persist";
-  await Promise.all(Array.from({ length: 30 }, (_, i) => post("/api/profiles", { name: `p${i}`, values: { WORKSPACE_PATH: `D:/p${i}`, OPENAI_TUNNEL_API_KEY: profileSecret, ADMIN_TOKEN: profileSecret, AUTHORIZATION: profileSecret, "api-key": profileSecret } })));
+  await Promise.all(Array.from({ length: 30 }, (_, i) => post("/api/profiles", { name: `p${i}`, values: { WORKSPACE_PATH: `D:/p${i}`, MCP_SESSION_RECOVERY: "false", OPENAI_TUNNEL_API_KEY: profileSecret, ADMIN_TOKEN: profileSecret, AUTHORIZATION: profileSecret, "api-key": profileSecret } })));
   const profiles = (await api("/api/profiles")).body.profiles;
   assert.equal(Object.keys(profiles).length, 30);
   assert.equal(JSON.stringify(profiles).includes(profileSecret), false);
   const profileDisk = await fs.readFile(path.join(stateDir, "profiles.json"), "utf8");
   assert.equal(profileDisk.includes(profileSecret), false);
+  assert.doesNotMatch(profileDisk, /MCP_SESSION_RECOVERY/, "profiles must not persist the obsolete recovery switch");
 
   const serverStart = (await post("/api/instances/demo/server/start")).body;
   assert.equal(serverStart.ok, false);
@@ -208,11 +211,17 @@ try {
   const managerServerSource = await fs.readFile(path.join(process.cwd(), "manager", "server.mjs"), "utf8");
   const adminUiSource = await fs.readFile(path.join(process.cwd(), "public", "ui", "app.js"), "utf8");
   const envExampleSource = await fs.readFile(path.join(process.cwd(), ".env.example"), "utf8");
+  const runtimeEntrySource = await fs.readFile(path.join(process.cwd(), "src", "index.ts"), "utf8");
   assert.match(managerHtml, /id="btn-server-restart"[^>]*>[^<]*Khởi động lại Gateway/);
   assert.match(managerHtml, /id="f-admin-port"/);
   assert.match(managerHtml, /id="add-admin-port"/);
   assert.doesNotMatch(managerHtml, /f-connector|Tên Connector/);
   assert.doesNotMatch(managerApp, /f-connector|MCP_CONNECTOR_NAME/);
+  assert.doesNotMatch(managerHtml, /f-recovery|MCP_SESSION_RECOVERY/);
+  assert.doesNotMatch(managerApp, /f-recovery|MCP_SESSION_RECOVERY/);
+  assert.doesNotMatch(adminUiSource.match(/const ENV_KEYS = \[([\s\S]*?)\];/)?.[1] || "", /MCP_SESSION_RECOVERY/);
+  assert.doesNotMatch(envExampleSource, /^MCP_SESSION_RECOVERY=/m);
+  assert.doesNotMatch(runtimeEntrySource, /MCP_SESSION_RECOVERY|SESSION_RECOVERY/, "runtime recovery must be invariant, not controlled by a hidden env switch");
   assert.doesNotMatch(JSON.stringify(item.config), /connectorName/);
   assert.doesNotMatch(await fs.readFile(path.join(demo, "config.json"), "utf8"), /connectorName/, "startup must scrub obsolete connectorName from existing instance config");
   assert.match(managerApp, /"f-admin-port":\s*"ADMIN_PORT"/);
@@ -242,6 +251,8 @@ try {
   assert.match(managerServerSource, /CHECKPOINT_PATH:[^\n]+path\.join\(inst\.dir, "checkpoints"\)/, "managed checkpoint state must live under the instance, not repo root");
   assert.match(managerServerSource, /MCP_SHELL_STATE_DIR:[^\n]+path\.join\(inst\.dir, "shell-state"\)/, "managed shell state must live under the instance, not repo root");
   assert.match(managerServerSource, /migrateLegacyRuntimeState/, "default instance must migrate legacy repo-root runtime state before startup");
+  assert.match(managerServerSource, /recycleManagedDirectory\(item\.target, inst\.dir\)/, "cross-volume runtime-state rollback must be recoverable");
+  assert.doesNotMatch(managerServerSource, /fsp\.rm\(item\.target, \{ recursive: true, force: true \}\)/, "runtime-state rollback must never permanently recurse-delete its copy");
   assert.match(managerServerSource, /isLegacyRuntimeStateValue/, "legacy relative runtime-state settings must be recognized instead of treated as custom paths");
   assert.match(managerServerSource, /serializeDotEnv\(\{ \[item\.envKey\]: null \}, rawEnv\)/, "legacy runtime-state settings must be removed after migration to avoid UI/runtime drift");
   assert.match(managerServerSource, /managedRuntimeStatePath\(env\.CHECKPOINT_PATH/, "legacy CHECKPOINT_PATH values must resolve to the managed instance store at spawn time");
@@ -271,6 +282,7 @@ try {
   assert.match(startLogOnDisk, /plain=keep-before-start/, "managed server scrub must preserve non-secret history");
   const restartEnvAfterStart = await fs.readFile(path.join(restartDemo, ".env"), "utf8");
   assert.match(restartEnvAfterStart, /^AUDIT_LOG_PATH=\.mcp-audit\.log$/m, "existing managed instance must backfill an instance-local audit path before start");
+  assert.doesNotMatch(restartEnvAfterStart, /^MCP_SESSION_RECOVERY=/m, "managed start must scrub obsolete recovery config from legacy instances");
   const managedRestart = (await post("/api/instances/restart-demo/server/restart")).body;
   assert.equal(managedRestart.ok, true, `managed restart failed: ${JSON.stringify(managedRestart)}`);
   assert.equal(managedRestart.restarted, true);

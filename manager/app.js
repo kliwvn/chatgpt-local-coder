@@ -65,7 +65,6 @@ const FIELD_ENV = {
   "f-auto-approve": "CHATGPT_AUTO_APPROVE",
   "f-timeout": "SHELL_TIMEOUT",
   "f-sync-budget": "MCP_SYNC_RESPONSE_BUDGET_MS",
-  "f-recovery": "MCP_SESSION_RECOVERY",
   "f-session-ttl": "MCP_SESSION_TTL_MS",
   "f-session-cleanup": "MCP_SESSION_CLEANUP_MS",
   "f-session-grace": "MCP_SESSION_DELETE_GRACE_MS",

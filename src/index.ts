@@ -37,8 +37,6 @@ const PORT = envIntegerOrThrow("PORT", 3000, 1, 65_535);
 const ADMIN_PORT = envIntegerOrThrow("ADMIN_PORT", 3001, 1, 65_535);
 const SHELL_TIMEOUT = envIntegerOrThrow("SHELL_TIMEOUT", 120, 1, 86_400);
 if (PORT === ADMIN_PORT) throw new Error("PORT and ADMIN_PORT must differ");
-const SESSION_RECOVERY =
-  (process.env.MCP_SESSION_RECOVERY || "true").toLowerCase() !== "false";
 
 function splitWorkspaceEnv(value: string | undefined): string[] {
   if (!value) return [];
@@ -217,7 +215,7 @@ app.get("/health", (_req, res) => {
       idleTtlMs: counts.idleTtlMs,
       cleanupIntervalMs: counts.cleanupIntervalMs,
     },
-    sessionRecovery: SESSION_RECOVERY,
+    sessionRecovery: true,
     managedProcesses: getManagedProcessStats(),
     mcpEndpoints: MCP_PATHS,
     instructions: summarizeInstructionContext(instructionContext),
@@ -282,15 +280,13 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
     }
 
     if (sessionId) {
-      if (SESSION_RECOVERY) {
-        const recovered = await sessionManager.tryRecoverStale(
-          sessionId,
-          req,
-          res,
-          req.body
-        );
-        if (recovered) return;
-      }
+      const recovered = await sessionManager.tryRecoverStale(
+        sessionId,
+        req,
+        res,
+        req.body
+      );
+      if (recovered) return;
       sessionManager.sendSessionNotFound(res, requestId);
       return;
     }
@@ -464,7 +460,7 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`  ${ts} Default cwd: ${workspaceRoot}`);
   console.log(`  ${ts} Path-aware access: ${getFullDiskAccess() ? "FULL DISK" : "WORKSPACE ROOTS"}`);
   console.log(`  ${ts} Shell OS sandbox: OFF (native commands)`);
-  console.log(`  ${ts} Session recovery: ${SESSION_RECOVERY ? "ON" : "OFF"}`);
+  console.log(`  ${ts} Session recovery: ON (automatic)`);
   console.log(`  ${ts} PID:       ${process.pid}`);
   console.log("========================================");
   console.log("  Dang chay... (Ctrl+C de dung)");

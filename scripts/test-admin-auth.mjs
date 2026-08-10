@@ -76,13 +76,36 @@ try {
   assert.equal(oversizedEnv.status, 413, "oversized Admin .env should fail bounded instead of being read into memory");
   assert.match(await oversizedEnv.text(), /Admin \.env exceeds 2097152 bytes/);
 
+  await fs.writeFile(oversizedEnvPath, [
+    "MCP_SESSION_RECOVERY=false",
+    "MCP_SESSION_TTL_MS=120000",
+    "MCP_SESSION_CLEANUP_MS=15000",
+    "TEST_KEEP=one",
+    "",
+  ].join("\n"), "utf8");
+  const legacyEnvResponse = await fetch(`http://127.0.0.1:${adminPort}/api/config/env`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(legacyEnvResponse.status, 200);
+  const legacyEnvBody = await legacyEnvResponse.json();
+  assert.equal(Object.prototype.hasOwnProperty.call(legacyEnvBody.values, "MCP_SESSION_RECOVERY"), false, "Admin API must hide obsolete recovery config");
+  const saveEnvResponse = await fetch(`http://127.0.0.1:${adminPort}/api/config/env`, {
+    method: "PUT",
+    headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ values: { TEST_KEEP: "two", MCP_SESSION_RECOVERY: "false" } }),
+  });
+  assert.equal(saveEnvResponse.status, 200);
+  const savedEnv = await fs.readFile(oversizedEnvPath, "utf8");
+  assert.match(savedEnv, /^TEST_KEEP=two$/m);
+  assert.doesNotMatch(savedEnv, /^MCP_SESSION_RECOVERY=/m, "Admin save must scrub obsolete recovery config even if a client sends it");
+
   const uiJs = await (await fetch(`http://127.0.0.1:${adminPort}/ui/app.js`)).text();
   assert.match(uiJs, /sessionStorage\.setItem\(ADMIN_TOKEN_SESSION_KEY/);
   assert.match(uiJs, /ADMIN_TOKEN_SESSION_KEY_BASE.*API_INSTANCE/s, "proxied multi-instance UI must scope session token by instance");
   assert.match(uiJs, /headers\.Authorization = `Bearer \$\{token\}`/);
   assert.doesNotMatch(uiJs, /ADMIN_TOKEN.*localStorage|localStorage.*ADMIN_TOKEN/i);
 
-  console.log("admin-auth: ok (static UI loadable, API 401/200 boundary preserved, token session-scoped)");
+  console.log("admin-auth: ok (static UI loadable, API 401/200 boundary preserved, obsolete recovery config scrubbed, token session-scoped)");
 } catch (err) {
   throw new Error(`${err.message}\nserver output:\n${output.slice(-3000)}`);
 } finally {

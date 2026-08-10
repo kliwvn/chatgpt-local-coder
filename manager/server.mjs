@@ -114,6 +114,7 @@ function scrubProfiles(profiles) {
     if (profile && typeof profile === "object" && profile.values && typeof profile.values === "object") {
       profile.values = withoutSecrets(profile.values);
       delete profile.values.MCP_CONNECTOR_NAME;
+      delete profile.values.MCP_SESSION_RECOVERY;
     }
   }
   return profiles;
@@ -435,9 +436,17 @@ async function migrateLegacyRuntimeState(name, env, inst) {
         try {
           await recycleManagedDirectory(item.legacy, ROOT);
         } catch (recycleErr) {
-          // item.target was created by this transaction, so permanent rollback of
-          // that new copy is safe; never delete the durable legacy source on error.
-          await fsp.rm(item.target, { recursive: true, force: true }).catch(() => undefined);
+          // The source is still durable. Roll back the transaction-created copy
+          // recoverably as well; if rollback itself fails, preserve both copies
+          // rather than escalating to recursive permanent deletion.
+          try {
+            await recycleManagedDirectory(item.target, inst.dir);
+          } catch (rollbackErr) {
+            throw new Error(
+              `Legacy runtime state source recycle failed and rollback copy was preserved: ${item.target}; ` +
+              `source error=${String(recycleErr?.message || recycleErr)}; rollback error=${String(rollbackErr?.message || rollbackErr)}`
+            );
+          }
           throw recycleErr;
         }
       }
@@ -1529,6 +1538,11 @@ async function ensureManagedRuntimeDefaults(name) {
         const current = String(env[key] ?? "").trim();
         if (current === "") updates[key] = String(fallback);
       }
+      // Recovery is a runtime invariant now; remove the obsolete hidden switch
+      // from pre-existing managed instances instead of preserving invisible drift.
+      if (Object.prototype.hasOwnProperty.call(env, "MCP_SESSION_RECOVERY")) {
+        updates.MCP_SESSION_RECOVERY = null;
+      }
       if (Object.keys(updates).length === 0) return { changed: false };
       const next = serializeDotEnv({ ...env, ...updates }, raw);
       await atomicWriteFile(file, next, "utf8");
@@ -1730,7 +1744,6 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
       CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
       SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
       MCP_SYNC_RESPONSE_BUDGET_MS: env.MCP_SYNC_RESPONSE_BUDGET_MS || String(SYNC_RESPONSE_BUDGET_DEFAULT_MS),
-      MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
       MCP_SESSION_TTL_MS: env.MCP_SESSION_TTL_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS),
       MCP_SESSION_CLEANUP_MS: env.MCP_SESSION_CLEANUP_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS),
       MCP_SESSION_DELETE_GRACE_MS: env.MCP_SESSION_DELETE_GRACE_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS),
@@ -1818,7 +1831,6 @@ async function createInstanceUnlocked(body) {
     "CHATGPT_AUTO_APPROVE=true",
     "SHELL_TIMEOUT=120",
     `MCP_SYNC_RESPONSE_BUDGET_MS=${SYNC_RESPONSE_BUDGET_DEFAULT_MS}`,
-    "MCP_SESSION_RECOVERY=true",
     `MCP_SESSION_TTL_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS}`,
     `MCP_SESSION_CLEANUP_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS}`,
     `MCP_SESSION_DELETE_GRACE_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS}`,
@@ -1936,8 +1948,10 @@ async function saveInstanceEnvUnlocked(name, body) {
         return orig !== undefined ? `${m[1]}=${orig}` : line;
       })
       .join("\n");
+    next = serializeDotEnv({ MCP_SESSION_RECOVERY: null }, next);
   } else {
     const values = { ...(body.values || {}) };
+    delete values.MCP_SESSION_RECOVERY;
     if (!(body.values && Object.prototype.hasOwnProperty.call(body.values, "ADMIN_PORT"))) {
       if (originalValues.ADMIN_PORT) values.ADMIN_PORT = originalValues.ADMIN_PORT;
     }
@@ -1945,7 +1959,7 @@ async function saveInstanceEnvUnlocked(name, body) {
       if (value === undefined) values[key] = null;
       else if (value === MASK_SENTINEL) values[key] = originalValues[key] !== undefined ? originalValues[key] : null;
     }
-    next = serializeDotEnv(values, original);
+    next = serializeDotEnv({ ...values, MCP_SESSION_RECOVERY: null }, original);
   }
 
   const parsed = parseDotEnv(next);
@@ -2182,6 +2196,7 @@ async function handleApi(req, res, url, body) {
       const values = parseDotEnv(raw);
       const masked = {};
       for (const [k, v] of Object.entries(values)) {
+        if (k === "MCP_SESSION_RECOVERY") continue;
         // Never ship the plaintext .env to the browser. Secret keys are replaced
         // with a sentinel; saveInstanceEnv restores the original value when the
         // UI round-trips the sentinel unchanged. OPENAI_TUNNEL_API_KEY keeps its
@@ -2277,7 +2292,6 @@ async function handleApi(req, res, url, body) {
         CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
         SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
         MCP_SYNC_RESPONSE_BUDGET_MS: env.MCP_SYNC_RESPONSE_BUDGET_MS || String(SYNC_RESPONSE_BUDGET_DEFAULT_MS),
-        MCP_SESSION_RECOVERY: env.MCP_SESSION_RECOVERY ?? "true",
         MCP_SESSION_TTL_MS: env.MCP_SESSION_TTL_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS),
         MCP_SESSION_CLEANUP_MS: env.MCP_SESSION_CLEANUP_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS),
         MCP_SESSION_DELETE_GRACE_MS: env.MCP_SESSION_DELETE_GRACE_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS),
@@ -2295,6 +2309,7 @@ async function handleApi(req, res, url, body) {
     const values = parseDotEnv(raw);
     const masked = {};
     for (const [k, v] of Object.entries(values)) {
+      if (k === "MCP_SESSION_RECOVERY") continue;
       if (k === "OPENAI_TUNNEL_API_KEY" && v) masked[k] = { set: true, last4: v.slice(-4) };
       else if (isSecretKey(k) && v) masked[k] = MASK_SENTINEL;
       else masked[k] = v;
@@ -2333,6 +2348,7 @@ async function handleApi(req, res, url, body) {
       scrubProfiles(profiles);
       const values = withoutSecrets(body.values || {});
       delete values.MCP_CONNECTOR_NAME;
+      delete values.MCP_SESSION_RECOVERY;
       profiles[profileName] = { savedAt: new Date().toISOString(), values };
       return profiles;
     });

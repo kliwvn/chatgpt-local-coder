@@ -73,7 +73,7 @@ function parseDotEnv(text: string): Record<string, string> {
   return out;
 }
 
-function serializeDotEnv(values: Record<string, string>, original: string): string {
+function serializeDotEnv(values: Record<string, string | null>, original: string): string {
   const lines = original.split("\n");
   const seen = new Set<string>();
   const result: string[] = [];
@@ -86,7 +86,7 @@ function serializeDotEnv(values: Record<string, string>, original: string): stri
     }
     const key = trimmed.split("=")[0].trim();
     if (key in values) {
-      result.push(`${key}=${values[key]}`);
+      if (values[key] !== null) result.push(`${key}=${values[key]}`);
       seen.add(key);
     } else {
       result.push(line);
@@ -94,7 +94,7 @@ function serializeDotEnv(values: Record<string, string>, original: string): stri
   }
 
   for (const [key, value] of Object.entries(values)) {
-    if (!seen.has(key)) result.push(`${key}=${value}`);
+    if (!seen.has(key) && value !== null) result.push(`${key}=${value}`);
   }
 
   return result.join("\n");
@@ -310,6 +310,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       const values = parseDotEnv(text);
       const masked: Record<string, string> = {};
       for (const [key, value] of Object.entries(values)) {
+        if (key === "MCP_SESSION_RECOVERY") continue;
         masked[key] = isSecretKey(key) && value ? REDACTED_MASK : value;
       }
       res.json({ ok: true, path: envPath, values: masked });
@@ -340,6 +341,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       const result = await enqueueEnvMutation(async () => {
         const filtered: Record<string, string> = {};
         for (const [key, value] of Object.entries(values)) {
+          if (key === "MCP_SESSION_RECOVERY") continue;
           if (value !== REDACTED_MASK) filtered[key] = value;
         }
         let original = "";
@@ -348,7 +350,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
-        const next = serializeDotEnv(filtered, original);
+        const next = serializeDotEnv({ ...filtered, MCP_SESSION_RECOVERY: null }, original);
         const validationError = validateAdminEnv(next);
         if (validationError) return { ok: false as const, error: validationError };
         await atomicWriteFile(envPath, next, "utf8");

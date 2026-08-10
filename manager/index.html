@@ -155,13 +155,6 @@
             <p class="hint">Hard budget cho MCP synchronous call; mặc định 100 giây để trả trước deadline tunnel. Job dài dùng start_process.</p>
           </div>
           <div class="field">
-            <label for="f-recovery">MCP_SESSION_RECOVERY</label>
-            <select id="f-recovery" class="input">
-              <option value="true">true (tự phục hồi session)</option>
-              <option value="false">false</option>
-            </select>
-          </div>
-          <div class="field">
             <label for="f-session-ttl">MCP_SESSION_TTL_MS</label>
             <input id="f-session-ttl" class="input mono" inputmode="numeric" placeholder="120000" />
             <p class="hint">Idle TTL; mặc định 2 phút. Session đang SSE/in-flight không bị evict; stale POST tự recover.</p>
