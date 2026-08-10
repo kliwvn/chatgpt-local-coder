@@ -1,8 +1,11 @@
 ﻿import fs from "node:fs/promises";
-import { atomicWriteFile } from "./fs-utils.mjs";
+import { atomicWriteFile, enqueueKeyedMutation } from "./fs-utils.mjs";
 
 export const DEFAULT_MANAGED_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const REDACTED_MASK = "********";
+const DEFAULT_LIVE_BACKUP_MAX_BYTES = 1024 * 1024;
+const liveRotationChains = new Map();
+let liveRotationSeq = 0;
 const SECRET_KEY_RE =
   /(^|_)(KEY|TOKEN|SECRET|PASSWORD|PASS|AUTH|AUTHORIZATION|CREDENTIAL|PRIVATE|ACCESS_TOKEN|REFRESH_TOKEN|CLIENT_SECRET)(_|$)|API_KEY|MCP_API_KEY/i;
 
@@ -108,4 +111,77 @@ export async function rotateLogFile(file, maxBytes = DEFAULT_MANAGED_LOG_MAX_BYT
     if (err?.code === "ENOENT") return false;
     return false;
   }
+}
+
+/**
+ * Bound a log while a detached child still owns its append-mode stdout/stderr
+ * descriptor. A rename rotation is unsafe in that state on Windows, but a
+ * copy-truncate keeps the existing descriptor attached to the active path.
+ *
+ * The backup is redacted before the active file is truncated, so a failed
+ * backup write never destroys the only copy of the log and no plaintext temp
+ * backup is persisted. As with standard copytruncate, console lines appended
+ * between the snapshot read and truncate can be lost; server/tunnel logs are
+ * operational diagnostics, while the canonical MCP audit has its own bounded
+ * serialized writer.
+ */
+export function copyTruncateLogFile(file, maxBytes = DEFAULT_MANAGED_LOG_MAX_BYTES, backups = 2, backupMaxBytes = DEFAULT_LIVE_BACKUP_MAX_BYTES) {
+  const key = String(file);
+  const threshold = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_MANAGED_LOG_MAX_BYTES;
+  const requestedBackup = Number.isSafeInteger(backupMaxBytes) && backupMaxBytes > 0 ? backupMaxBytes : DEFAULT_LIVE_BACKUP_MAX_BYTES;
+  const backupLimit = Math.min(threshold, requestedBackup);
+  return enqueueKeyedMutation(liveRotationChains, key, async () => {
+    let st;
+    try {
+      st = await fs.stat(file);
+    } catch (err) {
+      if (err?.code === "ENOENT") return false;
+      throw err;
+    }
+    if (st.size <= threshold) return false;
+
+    // Retain only the diagnostic tail the Manager can actually surface. This
+    // bounds both memory and synchronous redaction CPU even if a process log
+    // grows far beyond its truncate threshold between maintenance sweeps.
+    let raw = await tailFile(file, backupLimit);
+    if (st.size > backupLimit) {
+      // tailFile can begin in the middle of a text line. Drop that partial line
+      // so a secret value whose key was outside the window cannot be persisted
+      // into the redacted backup without its identifying key.
+      const firstNewline = raw.indexOf("\n");
+      raw = firstNewline >= 0 ? raw.slice(firstNewline + 1) : "";
+    }
+    const sanitized = redactSensitiveLogText(raw);
+    const keep = Math.max(1, Math.floor(backups));
+    const temp = `${file}.rotate-${process.pid}-${Date.now()}-${++liveRotationSeq}`;
+
+    try {
+      // Materialize a redacted backup first. If anything fails before truncate,
+      // the active log remains untouched and the next maintenance sweep retries.
+      await atomicWriteFile(temp, sanitized, "utf8");
+      await fs.rm(`${file}.${keep}`, { force: true });
+      for (let i = keep - 1; i >= 1; i--) {
+        const prior = `${file}.${i}`;
+        const priorStat = await fs.stat(prior).catch((err) => {
+          if (err?.code === "ENOENT") return null;
+          throw err;
+        });
+        if (!priorStat) continue;
+        if (priorStat.size > backupLimit) {
+          // Bound migration cost for legacy backups that predate at-rest
+          // redaction. Dropping an oversized diagnostic generation is safer
+          // than retaining plaintext or blocking the Manager for many seconds.
+          await fs.rm(prior, { force: true });
+          continue;
+        }
+        await scrubLogFile(prior);
+        await fs.rename(prior, `${file}.${i + 1}`);
+      }
+      await fs.rename(temp, `${file}.1`);
+      await fs.truncate(file, 0);
+      return true;
+    } finally {
+      await fs.rm(temp, { force: true }).catch(() => undefined);
+    }
+  });
 }

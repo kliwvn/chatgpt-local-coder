@@ -26,7 +26,7 @@ import path from "node:path";
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
+import { copyTruncateLogFile, isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
 import {
   atomicWriteFile,
   enqueueKeyedMutation,
@@ -65,6 +65,7 @@ const INSTALL_TIMEOUT_MS = 15 * 60 * 1000;
 const DOWNLOAD_MAX_BYTES = 128 * 1024 * 1024;
 const HELPER_OUTPUT_MAX_CHARS = 16 * 1024;
 const MAX_MANAGED_INSTANCES = 256;
+const MANAGED_LOG_SWEEP_MS = 60 * 1000;
 const IS_WIN = process.platform === "win32";
 const REPO_ROOT = ROOT; // thư mục repo (manager.bat nằm ở đây)
 const MANAGER_BAT = path.join(ROOT, "manager.bat");
@@ -453,6 +454,46 @@ async function listInstances() {
     if (err?.code !== "ENOENT") throw err;
     return [];
   }
+}
+
+let managedLogSweepPromise = null;
+
+function sweepManagedLogs() {
+  if (managedLogSweepPromise) return managedLogSweepPromise;
+  const run = (async () => {
+    for (const name of await listInstances()) {
+      const inst = instPaths(name);
+      const targets = [
+        ["server", inst.serverLog, enqueueServerLifecycle],
+        ["tunnel", inst.tunnelLog, enqueueTunnelLifecycle],
+      ];
+      for (const [kind, file, enqueueLifecycle] of targets) {
+        try {
+          // Serialize maintenance with start/stop/restart so backup shifting and
+          // pre-start rotation never race the lifecycle operation for this instance.
+          if (await enqueueLifecycle(name, () => copyTruncateLogFile(file))) {
+            console.log(`[manager] ${name}: rotated live ${kind} log`);
+          }
+        } catch (err) {
+          console.warn(`[manager] ${name}: ${kind} log maintenance failed: ${String((err && err.message) || err).slice(0, 200)}`);
+        }
+      }
+    }
+  })();
+  const settled = run.finally(() => {
+    if (managedLogSweepPromise === settled) managedLogSweepPromise = null;
+  });
+  managedLogSweepPromise = settled;
+  return settled;
+}
+
+function startManagedLogMaintenance() {
+  const sweep = () => void sweepManagedLogs().catch((err) => {
+    console.warn(`[manager] managed log sweep failed: ${String((err && err.message) || err).slice(0, 200)}`);
+  });
+  sweep();
+  const timer = setInterval(sweep, MANAGED_LOG_SWEEP_MS);
+  timer.unref?.();
 }
 
 async function readInstanceEnvRaw(name) {
@@ -2231,6 +2272,7 @@ async function main() {
     console.log(`Repo root:   ${ROOT}`);
     console.log(`Instances:   ${INSTANCES_DIR}`);
     console.log("");
+    startManagedLogMaintenance();
     if (!noOpen) openExternal(`http://127.0.0.1:${port}`);
 
     // Tự động bật Focus Server + Focus Tunnel cho từng instance có autoStart
