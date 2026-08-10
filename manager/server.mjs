@@ -43,6 +43,13 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
+const MANAGER_LOADED_AT_MS = Date.now();
+const MANAGER_RUNTIME_FILES = [
+  fileURLToPath(import.meta.url),
+  path.join(__dirname, "fs-utils.mjs"),
+  path.join(__dirname, "log-utils.mjs"),
+  path.join(__dirname, "safe-delete.mjs"),
+];
 const ENV_PATH = path.join(ROOT, ".env");
 const STATE_DIR = path.resolve(process.env.MANAGER_STATE_DIR || path.join(__dirname, "state"));
 const LOG_DIR = path.join(STATE_DIR, "logs");
@@ -103,6 +110,18 @@ const ENV_LINE_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
 const MASK_SENTINEL = "********";
 
 function isSecretKey(key) { return isSecretKeyName(key); }
+
+async function managerRuntimeStatus() {
+  const stats = await Promise.all(MANAGER_RUNTIME_FILES.map((file) => fsp.stat(file).catch(() => null)));
+  const newestMtimeMs = stats.reduce((max, stat) => Math.max(max, Number(stat?.mtimeMs) || 0), 0);
+  const loadedAt = new Date(MANAGER_LOADED_AT_MS).toISOString();
+  return {
+    pid: process.pid,
+    loadedAt,
+    artifactDrift: isRuntimeArtifactStale(loadedAt, newestMtimeMs || Number.NaN),
+  };
+}
+
 function withoutSecrets(values) {
   const out = {};
   if (!values || typeof values !== "object") return out;
@@ -775,8 +794,16 @@ async function serverStatus(name) {
   let portPid = null;
   if (configuredPortValid) {
     portOpen = await isPortOpen(configuredPort);
-    health = portOpen ? await serverHealth(configuredPort) : null;
     portPid = portOpen ? pidOnPort(configuredPort) : null;
+    health = portOpen ? await serverHealth(configuredPort) : null;
+    if (!health && savedPid && portPid === savedPid && isPidAlive(savedPid)) {
+      // A freshly restarted Gateway can accept TCP a fraction before /health is
+      // consistently ready under Windows load. Retry only when the listener PID
+      // exactly matches our managed PID; never spend extra retries on an unknown
+      // port occupant and never relax the health/workspace identity requirement.
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      health = await serverHealth(configuredPort);
+    }
     if (portOpen && isLocalCoderHealth(health, env)) {
       const artifactDrift = isRuntimeArtifactStale(
         health?.instructions?.loaded_at,
@@ -2146,7 +2173,8 @@ async function handleApi(req, res, url, body) {
   const p = url.pathname;
   if (req.method === "GET" && p === "/api/instances") {
     const names = await listInstances();
-    const instances = await Promise.all(names.map(async (n) => {
+    const [instances, manager] = await Promise.all([
+      Promise.all(names.map(async (n) => {
       try {
         return await instanceBundle(n, { includeCheck: false });
       } catch (err) {
@@ -2163,8 +2191,10 @@ async function handleApi(req, res, url, body) {
           installed: { dist: fs.existsSync(SERVER_ENTRY), nodeModules: fs.existsSync(path.join(ROOT, "node_modules")) },
         };
       }
-    }));
-    return json(res, 200, { ok: true, instances });
+      })),
+      managerRuntimeStatus(),
+    ]);
+    return json(res, 200, { ok: true, node: process.version, manager, instances });
   }
   if (!(await listInstances()).length) {
     const noInst = {
@@ -2475,7 +2505,13 @@ async function handleApi(req, res, url, body) {
   }
 
   if (req.method === "GET" && p === "/api/health") {
-    return json(res, 200, { ok: true, name: "chatgpt-local-coder-manager", version: "2.0.0", multiInstance: true });
+    return json(res, 200, {
+      ok: true,
+      name: "chatgpt-local-coder-manager",
+      version: "2.0.0",
+      multiInstance: true,
+      ...(await managerRuntimeStatus()),
+    });
   }
 
   return json(res, 404, { ok: false, error: "Not found" });

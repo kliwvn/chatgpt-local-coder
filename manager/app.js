@@ -38,7 +38,7 @@ const setBusy = (b) => {
 };
 
 /* ---------------- state ---------------- */
-const state = { instances: [], current: null, lastBundle: null, node: null };
+const state = { instances: [], current: null, lastBundle: null, node: null, manager: null };
 
 function syncActionDisabledState() {
   const bundle = state.lastBundle;
@@ -171,7 +171,8 @@ function renderServerTunnel(s) {
 
   $("btn-tunnel-dl").classList.toggle("hidden", tun.cloudflaredExists !== false || tun.running);
 
-  $("mgr-version").textContent = `Manager 127.0.0.1:${location.port} • Node ${s.node}`;
+  const managerDrift = Boolean(state.manager?.artifactDrift);
+  $("mgr-version").textContent = `Manager 127.0.0.1:${location.port} • Node ${s.node}${managerDrift ? " • Manager source mới hơn process — cần restart Manager" : ""}`;
 }
 
 
@@ -291,6 +292,7 @@ async function loadInstances(initial) {
   try {
     const r = await api("/api/instances");
     state.node = r.node || null;
+    state.manager = r.manager || null;
     state.instances = r.instances || [];
     const list = $("inst-list");
     list.innerHTML = state.instances

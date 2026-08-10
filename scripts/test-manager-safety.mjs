@@ -156,6 +156,10 @@ try {
     await sleep(30);
   }
   if (!listing) throw new Error(`manager did not start: ${managerOutput}`);
+  const managerHealth = (await api("/api/health")).body;
+  assert.equal(managerHealth.ok, true);
+  assert.equal(managerHealth.artifactDrift, false, "fresh Manager process must not report its own runtime as stale");
+  assert.ok(Number.isInteger(managerHealth.pid) && managerHealth.pid > 0);
   assert.ok(item);
   assert.equal(item.server.running, false);
   assert.equal(item.server.portOccupied, true, "fake MCP-like health must not be trusted as this workspace");
@@ -231,9 +235,12 @@ try {
   assert.match(managerServerSource, /instanceCreateChain = Promise\.resolve\(\)/, "instance creation must serialize port allocation and persistence");
   assert.match(managerServerSource, /existingManager = await managerHealth\(port\)/, "EADDRINUSE must verify Local Coder Manager identity before treating the port as an existing Manager");
   assert.match(managerServerSource, /isRuntimeArtifactStale\([\s\S]{0,160}?instructions\?\.loaded_at[\s\S]{0,160}?mtimeMs/, "Manager status must compare running Gateway startup time against the current runtime artifact");
+  assert.match(managerServerSource, /MANAGER_RUNTIME_FILES/, "Manager must track the source modules that require self-restart after modification");
+  assert.match(managerServerSource, /managerRuntimeStatus\(\)/, "Manager must expose self artifact drift status");
   assert.match(managerServerSource, /!st\.portOccupied && !st\.invalidConfig && !st\.artifactDrift/, "configuration check must not report a stale runtime artifact as healthy");
   assert.match(managerApp, /artifactDrift/, "Manager UI must surface stale runtime artifacts");
   assert.match(managerApp, /build mới hơn process/, "Manager UI must tell the user a stale Gateway needs restart");
+  assert.match(managerApp, /Manager source mới hơn process/, "Manager UI must surface Manager self-drift instead of silently serving stale control logic");
   assert.match(managerServerSource, /if \(!srv\.ok\) \{[\s\S]{0,180}?continue;[\s\S]{0,180}?startTunnel\(name\)/, "autostart must not launch Tunnel after Server start fails");
   assert.match(managerServerSource, /Refusing to stop an unowned .*tunnel/i, "Tunnel stop must fail closed for unowned processes");
   assert.doesNotMatch(managerServerSource, /pidsWithCmdLine\(profileFile\)/, "Tunnel cleanup must include an executable identity and never call the process scanner with only a profile path");
@@ -298,8 +305,13 @@ try {
   await sleep(300);
   const restartLog = await fs.readFile(path.join(restartDemo, "server.log"), "utf8");
   assert.doesNotMatch(restartLog, /Graceful shutdown timeout/, "isolated restart must not hit the Gateway hard-exit timeout");
-  const restartListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
-  assert.equal(restartListing.server.running, true);
+  let restartListing;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    restartListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
+    if (restartListing?.server?.running) break;
+    await sleep(100);
+  }
+  assert.equal(restartListing.server.running, true, `restarted Gateway was not reflected as running: ${JSON.stringify(restartListing.server)}`);
   assert.equal(restartListing.server.pid, managedRestart.pid);
 
   // Simulate an out-of-band .env edit while the managed Gateway is still live.
