@@ -8,6 +8,7 @@ import {
   appendBoundedTail,
   enqueueKeyedMutation,
   extractSingleZipEntryBoundedWindows,
+  isRuntimeArtifactStale,
   pruneExpiredCache,
   readResponseTextBounded,
   readUtf8FileBounded,
@@ -16,6 +17,15 @@ import {
 } from "../manager/fs-utils.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A rebuild after Gateway startup must be surfaced as runtime artifact drift.
+{
+  const loadedAt = "2026-08-11T00:00:00.000Z";
+  assert.equal(isRuntimeArtifactStale(loadedAt, Date.parse("2026-08-11T00:00:00.500Z")), false);
+  assert.equal(isRuntimeArtifactStale(loadedAt, Date.parse("2026-08-11T00:00:02.001Z")), true);
+  assert.equal(isRuntimeArtifactStale("", Date.now()), true, "unknown live runtime age must fail closed as stale");
+  assert.equal(isRuntimeArtifactStale(loadedAt, Number.NaN), false);
+}
 
 // Same-key work must serialize, and the queue must not retain settled keys.
 {
@@ -175,4 +185,4 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   assert.equal(attempts, 2);
 }
 
-console.log("manager-fs-utils: ok (mutation keys/cache/retries plus bounded state reads/output)");
+console.log("manager-fs-utils: ok (artifact drift, mutation keys/cache/retries plus bounded state reads/output)");

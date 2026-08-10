@@ -230,6 +230,10 @@ try {
   assert.match(managerServerSource, /dừng Server trước khi đổi PORT hoặc ADMIN_PORT/);
   assert.match(managerServerSource, /instanceCreateChain = Promise\.resolve\(\)/, "instance creation must serialize port allocation and persistence");
   assert.match(managerServerSource, /existingManager = await managerHealth\(port\)/, "EADDRINUSE must verify Local Coder Manager identity before treating the port as an existing Manager");
+  assert.match(managerServerSource, /isRuntimeArtifactStale\([\s\S]{0,160}?instructions\?\.loaded_at[\s\S]{0,160}?mtimeMs/, "Manager status must compare running Gateway startup time against the current runtime artifact");
+  assert.match(managerServerSource, /!st\.portOccupied && !st\.invalidConfig && !st\.artifactDrift/, "configuration check must not report a stale runtime artifact as healthy");
+  assert.match(managerApp, /artifactDrift/, "Manager UI must surface stale runtime artifacts");
+  assert.match(managerApp, /build mới hơn process/, "Manager UI must tell the user a stale Gateway needs restart");
   assert.match(managerServerSource, /if \(!srv\.ok\) \{[\s\S]{0,180}?continue;[\s\S]{0,180}?startTunnel\(name\)/, "autostart must not launch Tunnel after Server start fails");
   assert.match(managerServerSource, /Refusing to stop an unowned .*tunnel/i, "Tunnel stop must fail closed for unowned processes");
   assert.doesNotMatch(managerServerSource, /pidsWithCmdLine\(profileFile\)/, "Tunnel cleanup must include an executable identity and never call the process scanner with only a profile path");

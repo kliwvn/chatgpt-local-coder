@@ -37,6 +37,7 @@ import {
   retryTransientFsMutation,
   appendBoundedTail,
   extractSingleZipEntryBoundedWindows,
+  isRuntimeArtifactStale,
   streamResponseToFileBounded,
 } from "./fs-utils.mjs";
 
@@ -764,6 +765,7 @@ async function runInstall() {
 async function serverStatus(name) {
   const env = await readInstanceEnv(name);
   const inst = instPaths(name);
+  const serverEntryStat = await fsp.stat(SERVER_ENTRY).catch(() => null);
   const configuredPort = Number(env.PORT || 0);
   const configuredPortValid = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort < 65536;
   const savedPid = await readPidFile(inst.serverPid);
@@ -776,6 +778,10 @@ async function serverStatus(name) {
     health = portOpen ? await serverHealth(configuredPort) : null;
     portPid = portOpen ? pidOnPort(configuredPort) : null;
     if (portOpen && isLocalCoderHealth(health, env)) {
+      const artifactDrift = isRuntimeArtifactStale(
+        health?.instructions?.loaded_at,
+        serverEntryStat?.mtimeMs
+      );
       return {
         running: true,
         port: configuredPort,
@@ -785,6 +791,7 @@ async function serverStatus(name) {
         portOccupied: false,
         invalidConfig: false,
         configDrift: false,
+        artifactDrift,
         owned: Boolean(savedPid && (!portPid || savedPid === portPid)),
       };
     }
@@ -800,6 +807,10 @@ async function serverStatus(name) {
       if (actualPort === configuredPort) continue;
       const actualHealth = await serverHealth(actualPort);
       if (!isLocalCoderHealth(actualHealth, env)) continue;
+      const artifactDrift = isRuntimeArtifactStale(
+        actualHealth?.instructions?.loaded_at,
+        serverEntryStat?.mtimeMs
+      );
       return {
         running: true,
         port: actualPort,
@@ -809,6 +820,7 @@ async function serverStatus(name) {
         portOccupied: configuredPortValid && portOpen && !isLocalCoderHealth(health, env),
         invalidConfig: !configuredPortValid,
         configDrift: true,
+        artifactDrift,
         owned: true,
       };
     }
@@ -823,6 +835,7 @@ async function serverStatus(name) {
     portOccupied: configuredPortValid && portOpen,
     invalidConfig: !configuredPortValid,
     configDrift: false,
+    artifactDrift: false,
     owned: false,
   };
 }
@@ -1703,10 +1716,12 @@ async function checkConfig(name, overrides) {
 
   const st = await serverStatus(name);
   push(
-    !st.portOccupied && !st.invalidConfig,
+    !st.portOccupied && !st.invalidConfig && !st.artifactDrift,
     "Server",
     st.running
-      ? `Đang chạy trên cổng ${st.port}`
+      ? st.artifactDrift
+        ? `Đang chạy trên cổng ${st.port}, nhưng dist/index.js mới hơn process — cần Khởi động lại Gateway`
+        : `Đang chạy trên cổng ${st.port}`
       : st.invalidConfig
         ? "PORT không hợp lệ"
         : st.portOccupied

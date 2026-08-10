@@ -25,6 +25,19 @@ export function pruneExpiredCache(cache, ttlMs, now = Date.now()) {
   return cache.size;
 }
 
+/** Detect a rebuilt runtime artifact that is newer than the running Gateway startup. */
+export function isRuntimeArtifactStale(runtimeLoadedAt, artifactMtimeMs, toleranceMs = 1000) {
+  const loadedAtMs = Date.parse(String(runtimeLoadedAt || ""));
+  const artifactMs = Number(artifactMtimeMs);
+  const tolerance = Number.isFinite(Number(toleranceMs)) ? Math.max(0, Number(toleranceMs)) : 1000;
+  if (!Number.isFinite(artifactMs)) return false;
+  // A live Gateway that cannot prove when its runtime was loaded must not be
+  // presented as current. This also makes upgrades from builds without loaded_at
+  // self-identify as needing one restart.
+  if (!Number.isFinite(loadedAtMs)) return true;
+  return artifactMs > loadedAtMs + tolerance;
+}
+
 /** Retry transient Windows filesystem sharing/permission failures, then surface the failure. */
 export async function retryTransientFsMutation(operation, { attempts = 3, baseDelayMs = 150 } = {}) {
   const retryable = new Set(["EBUSY", "EPERM", "EACCES"]);
