@@ -6,6 +6,10 @@ import path from "node:path";
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-output-budget-"));
 
 // Set tight test budgets before importing modules that capture env at load time.
+// Filesystem handlers are sandboxed unless FULL_DISK_ACCESS=true; the budget guards
+// under test write to os.tmpdir(), so grant full access here. Path sandboxing itself
+// is covered by scripts/test-filesystem-safety.mjs.
+process.env.FULL_DISK_ACCESS = "true";
 process.env.MCP_TOOL_RESULT_MAX_BYTES = "262144";
 process.env.MCP_TOOL_RESULT_TEXT_DUPLICATE_MAX_BYTES = "16384";
 process.env.SHELL_OUTPUT_MAX_CHARS = "4096";
