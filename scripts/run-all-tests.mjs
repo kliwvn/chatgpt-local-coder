@@ -216,6 +216,42 @@ try {
   }
   console.log("OK  openai-mcp initialize logging sampled 1/25");
 
+  // Explicit DELETE closes the SDK transport, but that is disposal rather than
+  // a transient disconnect. Do not log the misleading "kept for recovery" line.
+  const deleteLogStart = serverLog.length;
+  const deleteInit = await fetch(`http://127.0.0.1:${mcpPort}/mcp`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "delete-log-check",
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-03-26",
+        capabilities: {},
+        clientInfo: { name: "delete-log-check", version: "1.0.0" },
+      },
+    }),
+  });
+  const deleteSid = deleteInit.headers.get("mcp-session-id");
+  await deleteInit.text();
+  if (deleteInit.status !== 200 || !deleteSid) throw new Error(`delete-log initialize failed: HTTP ${deleteInit.status}`);
+  const deleteRes = await fetch(`http://127.0.0.1:${mcpPort}/mcp`, {
+    method: "DELETE",
+    headers: { "mcp-session-id": deleteSid, "mcp-protocol-version": "2025-03-26" },
+  });
+  await deleteRes.text();
+  if (!deleteRes.ok) throw new Error(`delete-log DELETE failed: HTTP ${deleteRes.status}`);
+  await new Promise((r) => setTimeout(r, 50));
+  const deleteLogSlice = serverLog.slice(deleteLogStart);
+  const misleadingDeleteLine = deleteLogSlice
+    .split(/\r?\n/)
+    .find((line) => line.includes(`Transport closed for ${deleteSid.slice(0, 8)}`) && line.includes("session kept for recovery"));
+  if (misleadingDeleteLine) {
+    throw new Error("explicit DELETE emitted misleading recovery-retention log");
+  }
+  console.log("OK  explicit DELETE suppresses misleading recovery log");
+
   // /api/sessions: redacted shortIds, count >= 1 after initialize
   const sessions = await (await fetch(`http://127.0.0.1:${adminPort}/api/sessions`)).json();
   if (!sessions.ok || sessions.total < 1 || sessions.sessions.length !== sessions.total) {

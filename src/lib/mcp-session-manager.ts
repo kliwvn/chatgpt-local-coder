@@ -214,6 +214,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   const deleteGraceTimers: Record<string, ReturnType<typeof setTimeout>> = {};
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
   const recoveryInFlight = new Map<string, Promise<McpSession | null>>();
+  // Explicit DELETE closes the transport as part of the serialized request.
+  // Track that narrow window so transport.onclose does not emit the misleading
+  // "kept for recovery" diagnostic for a session that is about to be disposed.
+  const explicitDeleteInFlight = new Set<string>();
   // Số SSE GET stream đang mở trên mỗi session — "thực tế đang kết nối".
   // Dùng đếm (không phải Set) vì 1 session có thể có nhiều GET request cùng lúc
   // (request bị SDK từ chối 409 cũng chạy qua đây) — mỗi stream tăng 1, mỗi close giảm 1.
@@ -471,6 +475,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       transport.onclose = () => {
         const sid = transport.sessionId;
         if (!sid || !sessions[sid]) return;
+        if (explicitDeleteInFlight.has(sid)) return;
         console.log(`${formatLogTime()} [MCP] Transport closed for ${sessionLogId(sid)} (session kept for recovery)`);
       };
 
@@ -711,8 +716,14 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       const sid =
         session.transport.sessionId || (req.headers["mcp-session-id"] as string | undefined);
       if (sid) touch(sid);
+      const isExplicitDelete = Boolean(sid && req.method === "DELETE");
       const run = async () => {
-        await session.transport.handleRequest(req, res, body);
+        if (isExplicitDelete) explicitDeleteInFlight.add(sid!);
+        try {
+          await session.transport.handleRequest(req, res, body);
+        } finally {
+          if (isExplicitDelete) explicitDeleteInFlight.delete(sid!);
+        }
       };
       // GET (SSE) là stream sống lâu — KHÔNG được nằm trong hàng đợi op của session:
       // nếu nó chặn hàng đợi thì DELETE (cần gọi transport.close() để đóng stream)
