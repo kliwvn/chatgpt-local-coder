@@ -8,7 +8,9 @@ import path from "node:path";
 import { recycleManagedDirectory } from "../manager/safe-delete.mjs";
 import { checkpointBefore } from "../dist/lib/checkpoint.js";
 import { requireCommandAllowed, shouldBlockCommand } from "../dist/lib/permissions.js";
+import { execInShellSession } from "../dist/lib/persistent-shell.js";
 import { safeDelete } from "../dist/lib/safe-delete.js";
+import { toolAnnotations } from "../dist/lib/tool-annotations.js";
 import {
   getDefaultCwd,
   getWorkspaceRoots,
@@ -21,6 +23,10 @@ const blockedCommands = [
   "rm -r test",
   "rmdir /s /q test",
   "rd /s /q test",
+  "unlink test.txt",
+  "mv source target",
+  "move source target",
+  "ren source target",
   "del /s test\\*",
   "erase /s test\\*",
   "Remove-Item test -Recurse -Force",
@@ -29,8 +35,13 @@ const blockedCommands = [
   'powershell -Command "Write-Output safe; Remove-Item test -Recurse -Force"',
   "powershell -EncodedCommand ZABlAGwA",
   "cmd /c rmdir /s /q test",
+  String.raw`cmd.exe /d /c "rmdir /s /q \"$d\""`,
   'cmd /c "echo safe && rmdir /s /q test"',
+  "cmd /c if exist test rmdir /s /q test",
+  "cmd /c for /d %i in (*) do rmdir /s /q %i",
   "bash -c 'echo safe; rm -rf test'",
+  `powershell -Command "Invoke-Expression 'Remove-Item test -Recurse -Force'"`,
+  `powershell -Command "Start-Process cmd -ArgumentList '/c rmdir /s /q test'"`,
   "git clean -f",
   "git clean -fd",
   "git clean -fdx",
@@ -41,10 +52,44 @@ const blockedCommands = [
   "git restore -- src/file.ts",
   "git checkout HEAD -- src/file.ts",
   "git switch -f main",
+  "git rm -r src",
+  "git stash clear",
+  "git reflog expire --expire=now --all",
+  "git gc --prune=now",
+  "git branch -D old-branch",
+  "git push --force origin main",
+  "git push --force-with-lease origin main",
+  "git push --delete origin main",
+  "git push origin :main",
+  "git push origin +main:main",
+  "git tag -d old-tag",
+  "git remote remove origin",
+  "git worktree remove ../old-worktree",
+  "git notes remove HEAD",
+  "git submodule deinit -f --all",
+  "diskpart /s wipe.txt",
+  "format E: /q",
+  "mkfs.ext4 /dev/sdb1",
+  "wipefs -a /dev/sdb",
+  "shred -u secret.txt",
+  "dd if=/dev/zero of=/dev/sdb",
+  "Clear-Content important.txt",
+  "Set-Content important.txt replacement",
+  "Out-File important.txt",
+  "Move-Item source target",
+  "Rename-Item source target",
+  "Clear-Disk -Number 1 -RemoveData",
+  "robocopy source target /MIR",
+  "rsync -a --delete source/ target/",
+  "find . -delete",
+  "xargs rm -rf",
+  "echo replacement > important.txt",
   `python -c "import shutil; shutil.rmtree('test')"`,
+  `python -c "__import__('shutil').rmtree('test')"`,
   `py -c "import os; os.unlink('test.txt')"`,
   `python -c "from pathlib import Path; Path('test.txt').unlink()"`,
   `node -e "require('fs').rmSync('test',{recursive:true,force:true})"`,
+  `node -e "require('fs')['rmSync']('test',{recursive:true,force:true})"`,
   `node -e "require('node:fs').rmdirSync('test')"`,
   `[System.IO.File]::Delete('test.txt')`,
   `[System.IO.Directory]::Delete('test', $true)`,
@@ -65,6 +110,12 @@ for (const command of blockedCommands) {
   );
 }
 
+const oldAutoApprove = process.env.CHATGPT_AUTO_APPROVE;
+process.env.CHATGPT_AUTO_APPROVE = "true";
+assert.equal(toolAnnotations("destructive").destructiveHint, true, "auto-approve hid destructive tool metadata");
+if (oldAutoApprove === undefined) delete process.env.CHATGPT_AUTO_APPROVE;
+else process.env.CHATGPT_AUTO_APPROVE = oldAutoApprove;
+
 for (const command of [
   "npm test",
   "git status --short",
@@ -73,6 +124,7 @@ for (const command of [
   "git reset --mixed HEAD",
   "git reset --soft HEAD~1",
   "echo safe",
+  "echo append >> safe.log",
   'echo "rm -rf test"',
   "cmd /c echo rm -rf test",
   'powershell -Command "Write-Output rm -rf test"',
@@ -149,6 +201,29 @@ try {
     /SAFE_DELETE_PROTECTED_TARGET.*workspace root/i,
     "configured workspace root was deletable",
   );
+
+  // A broader parent of a workspace is equally dangerous: recursive deletion of
+  // the parent would encompass the workspace. Keep the ancestor itself disposable.
+  const nestedWorkspace = path.join(root, "nested-workspace");
+  await fs.mkdir(nestedWorkspace);
+  setWorkspaceRoots([nestedWorkspace]);
+  await assert.rejects(
+    safeDelete(root, root),
+    /SAFE_DELETE_PROTECTED_TARGET.*workspace root or ancestor/i,
+    "workspace ancestor was deletable",
+  );
+  setWorkspaceRoots([root]);
+
+  const incidentTarget = path.join(root, "incident-target");
+  await fs.mkdir(incidentTarget);
+  await fs.writeFile(path.join(incidentTarget, "must-survive.txt"), "survive\n");
+  const incidentCommand = String.raw`cmd.exe /d /c "rmdir /s /q \"${incidentTarget}\""`;
+  await assert.rejects(
+    execInShellSession(incidentCommand, root, 1000, root),
+    /BLOCKED_DESTRUCTIVE_COMMAND/,
+    "persistent-shell choke point allowed the historical malformed rmdir chain",
+  );
+  assert.equal((await fs.stat(incidentTarget)).isDirectory(), true, "blocked incident command mutated its target");
   await assert.rejects(
     safeDelete(path.parse(root).root),
     /SAFE_DELETE_PROTECTED_TARGET.*root/i,
@@ -156,7 +231,7 @@ try {
   );
   await assert.rejects(
     safeDelete(os.homedir()),
-    /SAFE_DELETE_PROTECTED_TARGET.*home/i,
+    /SAFE_DELETE_PROTECTED_TARGET.*(?:home|workspace root or ancestor)/i,
     "user home root was deletable",
   );
 

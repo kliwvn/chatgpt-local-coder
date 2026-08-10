@@ -421,7 +421,7 @@ export async function applyMultiFilePatch(
     for (const item of [...committed].reverse()) {
       try {
         if (item.originalExists && item.original) await atomicWriteFile(item.op.path, item.original);
-        else await fs.rm(item.op.path, { force: true });
+        else await safeDelete(item.op.path, item.op.path);
       } catch (rollbackError) {
         rollbackErrors.push(
           `${item.op.path}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`

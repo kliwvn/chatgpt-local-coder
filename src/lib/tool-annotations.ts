@@ -17,8 +17,18 @@ export function toolAnnotations(risk: ToolRisk): ToolAnnotations {
     return { readOnlyHint: true, openWorldHint: false };
   }
 
+  // A recoverable delete is still a destructive-effect request from the client's
+  // perspective. Never hide that signal just because routine edits are auto-approved.
+  if (risk === "destructive") {
+    return {
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: false,
+      idempotentHint: false,
+    };
+  }
+
   if (isChatGptAutoApproveEnabled()) {
-    // Tất cả write/command/delete đều đánh dấu routine edit — không destructive.
     return {
       readOnlyHint: false,
       destructiveHint: false,
@@ -29,7 +39,7 @@ export function toolAnnotations(risk: ToolRisk): ToolAnnotations {
 
   return {
     readOnlyHint: false,
-    destructiveHint: risk === "destructive",
+    destructiveHint: false,
     openWorldHint: false,
     idempotentHint: risk === "edit",
   };

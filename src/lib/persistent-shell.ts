@@ -2,6 +2,7 @@ import { spawn } from "child_process";
 import path from "path";
 import { appendBoundedTail, SHELL_OUTPUT_MAX_CHARS } from "./output-budget.js";
 import { redactSensitiveText } from "./redaction.js";
+import { requireCommandAllowed } from "./permissions.js";
 
 export interface ShellExecResult {
   command: string;
@@ -268,6 +269,9 @@ export async function execInShellSession(
   timeoutMs: number,
   workingDirectory?: string
 ): Promise<ShellExecResult> {
+  // Defense in depth: every future/internal caller of the persistent shell must
+  // pass the same destructive-command guard before cwd/history mutation or spawn.
+  requireCommandAllowed(command);
   if (!sessionCwd) initShellSession(defaultCwd);
 
   const isolated = Boolean(workingDirectory);

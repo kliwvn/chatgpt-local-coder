@@ -39,6 +39,21 @@ try {
   assert.ok(hook.stdout.length <= 2000, "hook stdout result exceeded response cap");
   assert.ok(hook.stderr.length <= 2000, "hook stderr result exceeded response cap");
 
+  const mustSurvive = path.join(temp, "hook-must-survive");
+  await fs.mkdir(mustSurvive);
+  await fs.writeFile(path.join(mustSurvive, "data.txt"), "survive\n", "utf8");
+  const destructiveHook = String.raw`cmd.exe /d /c "rmdir /s /q \"${mustSurvive}\""`;
+  await fs.writeFile(config, JSON.stringify({
+    enabled: true,
+    hooks: [{ glob: "**/*.txt", command: destructiveHook, timeout_ms: 5000 }],
+  }), "utf8");
+  const blockedResult = await runPostEditHooks([target]);
+  const blockedHook = blockedResult?.post_edit_hooks?.[0];
+  assert.ok(blockedHook, "destructive post-edit hook did not produce a fail-closed result");
+  assert.equal(blockedHook.exit_code, 126, "destructive post-edit hook was not blocked before spawn");
+  assert.match(blockedHook.stderr, /BLOCKED_DESTRUCTIVE_COMMAND/);
+  assert.equal((await fs.stat(mustSurvive)).isDirectory(), true, "blocked hook mutated its target");
+
   const timeoutCommand = `node -e "setTimeout(()=>{},5000)"`;
   await fs.writeFile(config, JSON.stringify({
     enabled: true,
@@ -77,7 +92,7 @@ try {
     else process.env.MCP_SYNC_RESPONSE_BUDGET_MS = previousBudget;
   }
 
-  console.log("post-edit-hooks: ok (bounded output, normalized timeout, response budget, process-tree termination)");
+  console.log("post-edit-hooks: ok (destructive hook blocked before spawn; bounded output, timeout, response budget, process-tree termination)");
 } finally {
   delete process.env.POST_EDIT_HOOKS_CONFIG;
   // Windows can briefly retain a directory handle after a forced process-tree

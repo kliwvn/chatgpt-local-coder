@@ -5,6 +5,7 @@ import { readUtf8FileBounded } from "./bounded-file.js";
 import { appendBoundedTail } from "./output-budget.js";
 import { globToRegExp, matchesCompiledGlob } from "./glob-match.js";
 import { clampSyncTimeoutMs, getSyncResponseBudgetMs } from "./sync-response-budget.js";
+import { requireCommandAllowed } from "./permissions.js";
 
 export interface PostEditHook {
   glob: string;
@@ -70,6 +71,19 @@ async function loadHooksConfig(): Promise<HooksConfig> {
 
 function runHook(command: string, filePath: string, timeoutMs: number): Promise<HookRunResult> {
   const expanded = command.replace(/\{path\}/g, filePath).replace(/\{file\}/g, filePath);
+  try {
+    // Hook config is project-controlled input. Apply the exact same shell guard
+    // before spawn so an edit cannot trigger a destructive command indirectly.
+    requireCommandAllowed(expanded);
+  } catch (err) {
+    return Promise.resolve({
+      stdout: "",
+      stderr: err instanceof Error ? err.message : String(err),
+      exit_code: 126,
+      stdout_truncated: false,
+      stderr_truncated: false,
+    });
+  }
   const shell = process.platform === "win32" ? "powershell.exe" : "bash";
   const args = process.platform === "win32" ? ["-NoProfile", "-Command", expanded] : ["-lc", expanded];
 

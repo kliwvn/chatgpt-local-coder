@@ -96,6 +96,47 @@ async function gitOrThrow(args: string[], cwd: string): Promise<GitRunResult> {
   return result;
 }
 
+function safeGitAtom(value: string, label: string): string {
+  const normalized = value.trim();
+  if (!normalized || normalized.startsWith("-") || /[\0\r\n]/.test(normalized)) {
+    throw new Error(`GIT_${label}_INVALID: refusing option-like/ambiguous value: ${JSON.stringify(value)}`);
+  }
+  return normalized;
+}
+
+async function safeBranchName(value: string, cwd: string): Promise<string> {
+  const branch = safeGitAtom(value, "BRANCH");
+  // Branch arguments must be names, never force/delete refspecs such as +main or :main.
+  if (branch.startsWith("+") || branch.includes(":")) {
+    throw new Error(`GIT_BRANCH_INVALID: refusing refspec-like branch: ${JSON.stringify(value)}`);
+  }
+  const checked = await runGit(["check-ref-format", "--branch", branch], cwd);
+  if (checked.exit_code !== 0) {
+    throw new Error(`GIT_BRANCH_INVALID: ${checked.stderr || checked.stdout || branch}`);
+  }
+  return branch;
+}
+
+async function configuredRemote(value: string, cwd: string): Promise<string> {
+  const remote = safeGitAtom(value, "REMOTE");
+  const listed = await gitOrThrow(["remote"], cwd);
+  const remotes = listed.stdout.split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
+  if (!remotes.includes(remote)) {
+    throw new Error(`GIT_REMOTE_INVALID: remote must be one configured remote name: ${JSON.stringify(value)}`);
+  }
+  return remote;
+}
+
+async function resolveCommitRef(value: string, cwd: string): Promise<string> {
+  const ref = safeGitAtom(value, "REF");
+  const resolved = await gitOrThrow(["rev-parse", "--verify", `${ref}^{commit}`], cwd);
+  const commit = resolved.stdout.trim().split(/\r?\n/, 1)[0];
+  if (!/^[0-9a-f]{40,64}$/i.test(commit)) {
+    throw new Error(`GIT_REF_INVALID: could not bind immutable commit: ${JSON.stringify(value)}`);
+  }
+  return commit;
+}
+
 export function registerGitTools(server: McpServer, defaultCwd: string): void {
   const repo = async (p?: string) => (p ? validatePath(p) : defaultCwd);
 
@@ -185,7 +226,8 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
     else {
       requireWriteAllowed();
       if (!name) throw new Error("name is required");
-      args = action === "create" ? ["branch", name] : action === "switch" ? ["switch", name] : ["switch", "-c", name];
+      const safeName = await safeBranchName(name, cwd);
+      args = action === "create" ? ["branch", safeName] : action === "switch" ? ["switch", safeName] : ["switch", "-c", safeName];
     }
     const r = await gitOrThrow(args, cwd);
     return toolResult("git_branch", { path: cwd, action, name, output: r.stdout });
@@ -204,7 +246,8 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, branch }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath);
-    const r = await gitOrThrow(["switch", branch], cwd);
+    const safeBranch = await safeBranchName(branch, cwd);
+    const r = await gitOrThrow(["switch", safeBranch], cwd);
     return toolResult("git_checkout", {
       path: cwd,
       branch,
@@ -322,18 +365,20 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, remote, branch, set_upstream }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath);
+    const safeBranch = branch ? await safeBranchName(branch, cwd) : undefined;
+    const safeRemote = await configuredRemote(remote, cwd);
     const args = ["push"];
     if (set_upstream) args.push("-u");
-    args.push(remote);
-    if (branch) args.push(branch);
+    args.push(safeRemote);
+    if (safeBranch) args.push(safeBranch);
     const r = await gitOrThrow(args, cwd);
-    const cmd = ["git push", set_upstream ? "-u" : "", remote, branch ?? ""]
+    const cmd = ["git push", set_upstream ? "-u" : "", safeRemote, safeBranch ?? ""]
       .filter(Boolean)
       .join(" ");
     return toolResult("git_push", {
       path: cwd,
-      remote,
-      branch,
+      remote: safeRemote,
+      branch: safeBranch,
       output: r.stdout || r.stderr,
       run_command_fallback: cmd,
     });
@@ -349,10 +394,12 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, remote, branch }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath);
-    const args = ["pull", remote];
-    if (branch) args.push(branch);
+    const safeBranch = branch ? await safeBranchName(branch, cwd) : undefined;
+    const safeRemote = await configuredRemote(remote, cwd);
+    const args = ["pull", safeRemote];
+    if (safeBranch) args.push(safeBranch);
     const r = await gitOrThrow(args, cwd);
-    return toolResult("git_pull", { path: cwd, remote, branch, output: r.stdout || r.stderr });
+    return toolResult("git_pull", { path: cwd, remote: safeRemote, branch: safeBranch, output: r.stdout || r.stderr });
   });
 
   server.registerTool("git_stash", {
@@ -393,7 +440,8 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   }, async ({ path: repoPath, mode, ref }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath);
-    const r = await gitOrThrow(["reset", `--${mode}`, ref], cwd);
-    return toolResult("git_reset", { path: cwd, mode, ref, output: r.stdout || r.stderr });
+    const resolvedRef = await resolveCommitRef(ref, cwd);
+    const r = await gitOrThrow(["reset", `--${mode}`, resolvedRef], cwd);
+    return toolResult("git_reset", { path: cwd, mode, ref, resolved_ref: resolvedRef, output: r.stdout || r.stderr });
   });
 }

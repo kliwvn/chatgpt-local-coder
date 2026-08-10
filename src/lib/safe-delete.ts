@@ -125,8 +125,12 @@ async function assertSafeDeleteTarget(requestedPath: string, canonicalTarget?: s
     throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing filesystem/drive root: ${canonical}`);
   }
   for (const workspaceRoot of getWorkspaceRoots()) {
-    if (samePath(canonical, workspaceRoot)) {
-      throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing configured workspace root: ${canonical}`);
+    const protectedRoot = await canonicalExisting(workspaceRoot).catch(() => path.resolve(workspaceRoot));
+    // Protect both the configured workspace itself and every ancestor that would
+    // recursively encompass it. This prevents a malformed/broadened target such
+    // as F:\\AI_Home from deleting F:\\AI_Home\\chatgpt-local-coder.
+    if (samePath(canonical, protectedRoot) || sameOrDescendant(protectedRoot, canonical)) {
+      throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing workspace root or ancestor: ${canonical}`);
     }
   }
 

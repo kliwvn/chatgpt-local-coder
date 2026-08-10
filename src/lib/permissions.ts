@@ -1,9 +1,10 @@
 import { getFullDiskAccess } from "./path-security.js";
 
 /**
- * Native commands remain broadly available, but obvious destructive filesystem/Git
- * commands are blocked at the MCP boundary. This is a best-effort application guard,
- * not an OS sandbox: a trusted script executed by the shell can still mutate files.
+ * Agent-supplied shell text is classified before any shell spawn. Known destructive
+ * filesystem/disk/Git primitives and nested-shell equivalents fail closed here.
+ * This is still an application guard rather than an OS sandbox: once a permitted
+ * arbitrary binary/script starts, the OS does not confine that child filesystem-wise.
  */
 
 export type PermissionProfile = "open";
@@ -28,7 +29,52 @@ export function canUseAnyAbsolutePath(): boolean {
   return getFullDiskAccess();
 }
 
-const DELETE_COMMANDS = new Set(["rm", "remove-item", "ri", "del", "erase", "rd", "rmdir"]);
+const DELETE_COMMANDS = new Set([
+  "rm",
+  "srm",
+  "remove-item",
+  "ri",
+  "del",
+  "erase",
+  "rd",
+  "rmdir",
+  "unlink",
+  "truncate",
+  "mv",
+  "move",
+  "ren",
+  "rename",
+]);
+const CRITICAL_DISK_COMMANDS = new Set([
+  "diskpart",
+  "format",
+  "mkfs",
+  "fdisk",
+  "sfdisk",
+  "parted",
+  "wipefs",
+  "shred",
+  "dd",
+]);
+const POWERSHELL_DESTRUCTIVE_COMMANDS = new Set([
+  "clear-content",
+  "clear-disk",
+  "initialize-disk",
+  "remove-partition",
+  "format-volume",
+  "set-content",
+  "out-file",
+  "move-item",
+  "rename-item",
+]);
+const DYNAMIC_EXECUTION_COMMANDS = new Set([
+  "invoke-expression",
+  "iex",
+  "start-process",
+  "invoke-command",
+  "start",
+]);
+const CMD_CONTROL_COMMANDS = new Set(["if", "for", "forfiles", "xargs", "parallel"]);
 const COMMAND_PREFIXES = new Set(["sudo", "command", "call", "do", "then", "else"]);
 const PYTHON_BINARIES = /^(?:python(?:3(?:\.\d+)*)?|py)$/i;
 const NODE_BINARIES = /^node$/i;
@@ -43,7 +89,7 @@ function executableName(token: string): string {
   // destructive-command guard. Strip the Windows executable suffix as well.
   const normalized = token.replace(/\\/g, "/");
   const base = normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
-  return base.endsWith(".exe") ? base.slice(0, -4) : base;
+  return base.replace(/\.(?:exe|com|cmd|bat)$/i, "");
 }
 
 function splitShellSegments(input: string): string[] {
@@ -175,6 +221,28 @@ function destructiveGit(tokens: string[], gitIndex: number): boolean {
   if (sub === "clean") return !args.some((arg) => arg === "-n" || arg === "--dry-run");
   if (sub === "reset") return args.some((arg) => arg === "--hard" || /^-[^-]*h[^-]*$/.test(arg));
   if (sub === "restore") return true;
+  if (sub === "rm" || sub === "prune") return true;
+  if (sub === "stash") return args.some((arg) => arg === "drop" || arg === "clear");
+  if (sub === "reflog") return args.some((arg) => arg === "expire" || arg === "delete");
+  if (sub === "gc") return args.some((arg) => /^--prune(?:=|$)/.test(arg));
+  if (sub === "branch") return args.some((arg) => arg === "-d" || arg === "-D" || arg === "--delete");
+  if (sub === "push") {
+    return args.some((arg) =>
+      arg === "-f" ||
+      arg === "--force" ||
+      arg.startsWith("--force-with-lease") ||
+      arg === "--mirror" ||
+      arg === "--delete" ||
+      arg === "--prune" ||
+      arg.startsWith(":") ||
+      (arg.startsWith("+") && arg.includes(":"))
+    );
+  }
+  if (sub === "tag") return args.some((arg) => arg === "-d" || arg === "--delete");
+  if (sub === "remote") return args.some((arg) => arg === "remove" || arg === "rm" || arg === "prune");
+  if (sub === "worktree") return args.some((arg) => arg === "remove" || arg === "prune");
+  if (sub === "notes") return args.some((arg) => arg === "remove" || arg === "prune");
+  if (sub === "submodule") return args.some((arg) => arg === "deinit");
   if (sub === "checkout") return args.includes("--") || args.some((arg) => arg === "-f" || arg === "--force" || arg === "." || arg === "..");
   if (sub === "switch") return args.some((arg) => arg === "-f" || arg === "--force" || arg === "--discard-changes");
   return false;
@@ -183,10 +251,16 @@ function destructiveGit(tokens: string[], gitIndex: number): boolean {
 function destructiveInlineCode(executable: string, code: string): boolean {
   const visible = stripQuotedLiterals(code);
   if (PYTHON_BINARIES.test(executable)) {
-    return /\bshutil\s*\.\s*rmtree\s*\(|\bos\s*\.\s*(?:remove|unlink|rmdir|removedirs)\s*\(|\.\s*(?:unlink|rmdir)\s*\(/i.test(visible);
+    return (
+      /\bshutil\s*\.\s*rmtree\s*\(|\bos\s*\.\s*(?:remove|unlink|rmdir|removedirs)\s*\(|\.\s*(?:unlink|rmdir)\s*\(/i.test(visible) ||
+      /__import__\s*\(\s*['"](?:shutil|os)['"]\s*\)\s*\.\s*(?:rmtree|remove|unlink|rmdir|removedirs)\s*\(/i.test(code)
+    );
   }
   if (NODE_BINARIES.test(executable)) {
-    return /\.\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\s*\(/i.test(visible);
+    return (
+      /\.\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\s*\(/i.test(visible) ||
+      /(?:require\s*\([^)]*\)|\bfs)\s*\[\s*['"](?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)['"]\s*\]\s*\(/i.test(code)
+    );
   }
   return false;
 }
@@ -199,6 +273,20 @@ function classifySegment(segment: string, depth: number): boolean {
   const executable = executableName(tokens[commandIndex]);
 
   if (DELETE_COMMANDS.has(executable)) return true;
+  if (CRITICAL_DISK_COMMANDS.has(executable) || executable.startsWith("mkfs.")) return true;
+  if (POWERSHELL_DESTRUCTIVE_COMMANDS.has(executable)) return true;
+  if (DYNAMIC_EXECUTION_COMMANDS.has(executable)) return true;
+  if (CMD_CONTROL_COMMANDS.has(executable)) {
+    // cmd.exe IF/FOR/FORFILES place the command later in the same segment.
+    // Scan every suffix so a nested rmdir/del/git clean cannot hide behind control syntax.
+    for (let index = commandIndex + 1; index < tokens.length; index++) {
+      if (classifyCommand(tokens.slice(index).join(" "), depth + 1)) return true;
+    }
+  }
+  if (executable === "find" && tokens.slice(commandIndex + 1).some((token) => token === "-delete")) return true;
+  if (executable === "cipher" && tokens.slice(commandIndex + 1).some((token) => /^\/w(?::|$)/i.test(token))) return true;
+  if (executable === "robocopy" && tokens.slice(commandIndex + 1).some((token) => /^\/(?:mir|purge)$/i.test(token))) return true;
+  if (executable === "rsync" && tokens.slice(commandIndex + 1).some((token) => /^--delete(?:-|=|$)/i.test(token))) return true;
   if (executable === "git") return destructiveGit(tokens, commandIndex);
 
   if (CMD_BINARIES.test(executable)) {
@@ -230,7 +318,13 @@ function classifySegment(segment: string, depth: number): boolean {
   }
 
   const visible = stripQuotedLiterals(segment);
-  return /\[(?:system\.)?io\.(?:file|directory)\]::delete\s*\(/i.test(visible);
+  return (
+    /\[(?:system\.)?io\.(?:file|directory)\]::delete\s*\(/i.test(visible) ||
+    /\.\s*delete\s*\(/i.test(visible) ||
+    // Single redirection overwrites/truncates a file. Append redirection (>>)
+    // remains allowed for ordinary logs/output capture.
+    /(?:^|[^>])(?:\d*)>(?!>)/.test(visible)
+  );
 }
 
 function classifyCommand(command: string, depth = 0): boolean {
@@ -245,7 +339,7 @@ export function describePermissionProfile(): string {
   const diskScope = getFullDiskAccess()
     ? "path-aware tools have full-disk access"
     : "path-aware tools are limited to workspace roots";
-  return `open commands with a best-effort destructive-command guard; ${diskScope}; native shell commands are not OS-sandboxed`;
+  return `open commands with a fail-closed known-destructive-command guard; ${diskScope}; permitted child processes are not OS-sandboxed`;
 }
 
 export function requireWriteAllowed(): void {}

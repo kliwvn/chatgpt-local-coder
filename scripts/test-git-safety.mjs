@@ -57,7 +57,15 @@ try {
     repo,
   );
   const restore = handlers.get("git_restore");
+  const branchTool = handlers.get("git_branch");
+  const checkout = handlers.get("git_checkout");
+  const push = handlers.get("git_push");
+  const pull = handlers.get("git_pull");
+  const reset = handlers.get("git_reset");
   assert.equal(typeof restore, "function", "git_restore handler not registered");
+  for (const [name, handler] of [["git_branch", branchTool], ["git_checkout", checkout], ["git_push", push], ["git_pull", pull], ["git_reset", reset]]) {
+    assert.equal(typeof handler, "function", `${name} handler not registered`);
+  }
 
   const tracked = path.join(repo, "a.txt");
   await fs.writeFile(tracked, "dirty-a\n");
@@ -99,6 +107,45 @@ try {
     "git_restore accepted an option-like source revision",
   );
 
+  const headBeforeInjectionChecks = git(repo, "rev-parse", "HEAD");
+  const dirtyBeforeInjectionChecks = await fs.readFile(tracked, "utf8");
+  await assert.rejects(
+    branchTool({ path: repo, action: "create", name: "--help" }),
+    /GIT_BRANCH_INVALID/,
+    "git_branch accepted an option-like branch",
+  );
+  await assert.rejects(
+    checkout({ path: repo, branch: "--detach" }),
+    /GIT_BRANCH_INVALID/,
+    "git_checkout accepted an option-like branch",
+  );
+  await assert.rejects(
+    push({ path: repo, remote: "--mirror", branch: undefined, set_upstream: false }),
+    /GIT_REMOTE_INVALID/,
+    "git_push accepted an option-like remote",
+  );
+  await assert.rejects(
+    push({ path: repo, remote: "origin", branch: ":main", set_upstream: false }),
+    /GIT_BRANCH_INVALID/,
+    "git_push accepted a delete refspec as branch",
+  );
+  await assert.rejects(
+    pull({ path: repo, remote: "origin", branch: "--force" }),
+    /GIT_BRANCH_INVALID/,
+    "git_pull accepted an option-like branch",
+  );
+  await assert.rejects(
+    reset({ path: repo, mode: "mixed", ref: "--hard" }),
+    /GIT_REF_INVALID/,
+    "git_reset accepted a destructive option through ref",
+  );
+  assert.equal(git(repo, "rev-parse", "HEAD"), headBeforeInjectionChecks, "typed Git injection checks moved HEAD");
+  assert.equal(await fs.readFile(tracked, "utf8"), dirtyBeforeInjectionChecks, "typed Git injection checks changed dirty content");
+
+  const safeReset = await reset({ path: repo, mode: "mixed", ref: "HEAD" });
+  assert.match(safeReset.structuredContent.data.resolved_ref || "", /^[0-9a-f]{40,64}$/i, "git_reset did not bind an immutable commit");
+  assert.equal(await fs.readFile(tracked, "utf8"), dirtyBeforeInjectionChecks, "safe mixed reset changed working file content");
+
   process.env.CHECKPOINT_ENABLED = "false";
   await fs.writeFile(tracked, "dirty-checkpoint-disabled\n");
   await assert.rejects(
@@ -122,7 +169,7 @@ try {
   );
   assert.equal((await fs.stat(tracked)).size, 2048, "incomplete-checkpoint rejection mutated the working file");
 
-  console.log("git-safety: ok (exact tracked file only, immutable source, complete checkpoint required, rewind recovers dirty content)");
+  console.log("git-safety: ok (exact restore, typed Git option/refspec injection blocked, immutable refs, complete checkpoint, rewind recovery)");
 } finally {
   setDefaultCwd(oldCwd);
   setWorkspaceRoots(oldRoots);

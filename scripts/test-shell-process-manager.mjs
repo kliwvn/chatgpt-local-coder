@@ -45,6 +45,24 @@ function nodeCommand(js) {
 }
 
 try {
+  const guardTarget = path.join(root, "guard-must-survive");
+  await fs.mkdir(guardTarget);
+  await fs.writeFile(path.join(guardTarget, "data.txt"), "survive\n");
+  const historicalIncidentCommand = String.raw`cmd.exe /d /c "rmdir /s /q \"${guardTarget}\""`;
+  const beforeGuardStats = getManagedProcessStats();
+  await assert.rejects(
+    () => call("run_command", { command: historicalIncidentCommand, working_directory: root }),
+    /BLOCKED_DESTRUCTIVE_COMMAND/,
+    "run_command spawned the historical malformed recursive-delete chain",
+  );
+  await assert.rejects(
+    () => call("start_process", { command: historicalIncidentCommand, working_directory: root }),
+    /BLOCKED_DESTRUCTIVE_COMMAND/,
+    "start_process spawned the historical malformed recursive-delete chain",
+  );
+  assert.equal((await fs.stat(guardTarget)).isDirectory(), true, "blocked MCP shell command mutated its fixture");
+  assert.deepEqual(getManagedProcessStats(), beforeGuardStats, "blocked start_process allocated a managed process");
+
   const syncStarted = Date.now();
   const syncTimed = data(await call("run_command", { command: nodeCommand("setTimeout(() => {}, 1500)") }));
   const syncElapsed = Date.now() - syncStarted;
@@ -96,7 +114,7 @@ try {
     assert.equal(alive, false, `child pid ${pid} survived managed shutdown`);
   }
 
-  console.log(`shell-process-manager: ok (sync-budget=${syncElapsed}ms, log<=4096, history<=2, cap=2, shutdown=${shutdownMs}ms)`);
+  console.log(`shell-process-manager: ok (destructive run/start blocked before spawn; sync-budget=${syncElapsed}ms, log<=4096, history<=2, cap=2, shutdown=${shutdownMs}ms)`);
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }
