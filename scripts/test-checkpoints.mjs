@@ -160,6 +160,23 @@ await run("directory checkpoint enforces node budget without false restore", asy
   if (!/checkpoint node limit 100 reached/i.test(top.reason || "")) throw new Error(`missing node cap reason: ${top.reason}`);
 });
 
+await run("checkpoint snapshot read is bounded against file-growth TOCTOU", async () => {
+  const source = await fs.readFile(new URL("../src/lib/checkpoint.ts", import.meta.url), "utf8");
+  const start = source.indexOf("async function snapshotFile(");
+  const end = source.indexOf("async function snapshotDirectory(", start);
+  if (start < 0 || end <= start) throw new Error("snapshotFile source block not found");
+  const block = source.slice(start, end);
+  if (!/readBufferFileBounded\(resolved,\s*readLimit,\s*"checkpoint file"\)/.test(block)) {
+    throw new Error("snapshotFile is not wired to the bounded streaming reader");
+  }
+  if (/fs\.readFile\(resolved\)/.test(block)) {
+    throw new Error("snapshotFile regressed to unbounded fs.readFile after stat guard");
+  }
+  if (!/grew beyond read budget/.test(block)) {
+    throw new Error("snapshotFile does not fail closed when the source grows during read");
+  }
+});
+
 await fs.rm(tmpDir, { recursive: true, force: true });
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -4,7 +4,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { atomicWriteFile } from "./atomic-write.js";
 import { withFileMutations } from "./file-mutation.js";
 import { envBoundedInteger } from "./env-utils.js";
-import { readUtf8FileBounded } from "./bounded-file.js";
+import { readBufferFileBounded, readUtf8FileBounded } from "./bounded-file.js";
 
 export interface CheckpointFileSnapshot {
   path: string;
@@ -198,12 +198,20 @@ async function snapshotFile(filePath: string, budget: SnapshotBudget): Promise<C
         `checkpoint aggregate bytes would exceed CHECKPOINT_MAX_TOTAL_BYTES=${budget.maxTotalBytes} (${budget.totalBytes + stat.size} bytes)`
       );
     }
-    const buffer = await fs.readFile(resolved);
-    if (budget.totalBytes + buffer.length > budget.maxTotalBytes) {
-      return skippedSnapshot(
-        resolved,
-        `checkpoint aggregate bytes exceeded CHECKPOINT_MAX_TOTAL_BYTES=${budget.maxTotalBytes} while reading`
-      );
+    const remainingBudget = budget.maxTotalBytes - budget.totalBytes;
+    const readLimit = Math.min(getMaxFileBytes(), remainingBudget);
+    let buffer: Buffer;
+    try {
+      // Use the streaming bounded reader rather than fs.readFile(). The file may
+      // grow after the stat() guards above; bounding the read itself prevents a
+      // TOCTOU race from allocating beyond the checkpoint memory budget.
+      buffer = await readBufferFileBounded(resolved, readLimit, "checkpoint file");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/checkpoint file exceeds \d+ bytes/i.test(message)) {
+        return skippedSnapshot(resolved, `checkpoint file grew beyond read budget (${readLimit} bytes)`);
+      }
+      throw err;
     }
     budget.totalBytes += buffer.length;
     if (isUtf8(buffer)) {
