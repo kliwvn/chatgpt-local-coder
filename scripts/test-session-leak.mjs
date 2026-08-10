@@ -14,7 +14,11 @@
 // the server's close() was attempted.
 
 import http from "node:http";
-import { createSessionManager, loopbackMcpPost } from "../dist/lib/mcp-session-manager.js";
+import {
+  createSessionManager,
+  loopbackMcpPost,
+  shouldLogSessionInitializeForClient,
+} from "../dist/lib/mcp-session-manager.js";
 import { getUpstreamManager } from "../dist/lib/mcp-upstream-manager.js";
 
 let passed = 0;
@@ -58,6 +62,25 @@ function fakeReqRes() {
 }
 
 async function main() {
+  const samplingCases = [
+    ["openai-mcp", 1, false],
+    ["openai-mcp", 2, false],
+    ["openai-mcp", 24, false],
+    ["openai-mcp", 25, true],
+    ["openai-mcp", 26, false],
+    ["openai-mcp", 50, true],
+    ["manager-warmup", 0, true],
+    ["codex-mcp-session-recovery", 0, true],
+  ];
+  const samplingMismatch = samplingCases.find(
+    ([name, count, expected]) => shouldLogSessionInitializeForClient(name, count) !== expected
+  );
+  if (samplingMismatch) {
+    fail("session initialize sampling is client-local", JSON.stringify(samplingMismatch));
+  } else {
+    ok("session initialize sampling is client-local");
+  }
+
   const hangingServer = http.createServer((_req, _res) => {
     // Intentionally never respond: recovery loopback must abort itself rather
     // than pinning recoveryInFlight/caller forever.

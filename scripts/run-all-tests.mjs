@@ -211,6 +211,9 @@ try {
   if (sampledInitLines.length !== 1) {
     throw new Error(`expected 1 sampled openai-mcp initialize line for 25 sessions, got ${sampledInitLines.length}`);
   }
+  if (!/\bclientInitialized=25\b/.test(sampledInitLines[0])) {
+    throw new Error(`openai-mcp sampling counter is not client-local: ${sampledInitLines[0]}`);
+  }
   console.log("OK  openai-mcp initialize logging sampled 1/25");
 
   // /api/sessions: redacted shortIds, count >= 1 after initialize

@@ -33,6 +33,8 @@ const auditMaxBytes = envBoundedInteger("AUDIT_LOG_MAX_BYTES", 10 * 1024 * 1024,
 const auditHistoryScrubMaxBytes = Math.min(auditMaxBytes, 10 * 1024 * 1024);
 let auditWriteChain: Promise<void> = Promise.resolve();
 let auditHistoryPrepared = false;
+let auditWriterPrepared = false;
+let auditCurrentBytes = 0;
 
 async function scrubHistoricalAuditFile(file: string): Promise<void> {
   const tail = await readUtf8FileTail(file, auditHistoryScrubMaxBytes).catch((err: NodeJS.ErrnoException) => {
@@ -73,17 +75,53 @@ async function prepareHistoricalAuditLogs(): Promise<void> {
   auditHistoryPrepared = true;
 }
 
-async function appendAuditRecord(record: Record<string, unknown>): Promise<void> {
+async function rotateAuditFile(): Promise<void> {
+  await fs.rm(`${auditPath}.1`, { force: true }).catch(() => undefined);
+  await fs.rename(auditPath, `${auditPath}.1`).catch(() => undefined);
+  // Preserve the previous best-effort rotation contract: a transient Windows
+  // rename failure must not make auditing block the actual tool call. Resync to
+  // whichever active file remains, then the append below can still proceed.
+  auditCurrentBytes = (await fs.stat(auditPath).catch(() => null))?.size ?? 0;
+}
+
+async function prepareAuditWriter(): Promise<void> {
+  if (auditWriterPrepared) return;
   await fs.mkdir(path.dirname(auditPath), { recursive: true });
   const stat = await fs.stat(auditPath).catch(() => null);
   if (stat && stat.size > auditMaxBytes) {
-    await fs.rm(`${auditPath}.1`, { force: true }).catch(() => undefined);
-    await fs.rename(auditPath, `${auditPath}.1`).catch(() => undefined);
+    auditCurrentBytes = stat.size;
+    await rotateAuditFile();
   }
   // Rotate first so an oversized historical generation is scrubbed in its final
   // `.1` location before this process performs its first append.
   await prepareHistoricalAuditLogs();
-  await fs.appendFile(auditPath, JSON.stringify(record) + "\n", "utf-8");
+  auditCurrentBytes = (await fs.stat(auditPath).catch(() => null))?.size ?? 0;
+  auditWriterPrepared = true;
+}
+
+async function appendAuditRecord(record: Record<string, unknown>): Promise<void> {
+  const line = JSON.stringify(record) + "\n";
+  const lineBytes = Buffer.byteLength(line, "utf8");
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await prepareAuditWriter();
+    if (auditCurrentBytes > auditMaxBytes) await rotateAuditFile();
+    try {
+      await fs.appendFile(auditPath, line, "utf-8");
+      auditCurrentBytes += lineBytes;
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (attempt === 0 && (code === "ENOENT" || code === "ENOTDIR")) {
+        // Preserve the old self-healing behavior if the instance/log directory is
+        // removed while the process is running. Recreate and resync exactly once.
+        auditWriterPrepared = false;
+        auditCurrentBytes = 0;
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 export async function audit(event: AuditEvent): Promise<void> {

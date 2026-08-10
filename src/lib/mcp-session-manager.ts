@@ -121,6 +121,12 @@ export interface SessionManager {
   shutdown(): Promise<void>;
 }
 
+const OPENAI_MCP_SESSION_LOG_SAMPLE_EVERY = 25;
+
+export function shouldLogSessionInitializeForClient(name: string, clientInitializedTotal: number): boolean {
+  return name !== "openai-mcp" || clientInitializedTotal % OPENAI_MCP_SESSION_LOG_SAMPLE_EVERY === 0;
+}
+
 function extractRequestId(body: unknown): string | number | null {
   if (typeof body !== "object" || body === null) return null;
   if (!("id" in body)) return null;
@@ -225,6 +231,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   // recovery, nên key theo object là cách duy nhất hoạt động cho cả 2 path.
   const transportReservationReleases = new WeakMap<StreamableHTTPServerTransport, () => void>();
   let initializedTotal = 0;
+  let openAiMcpInitializedTotal = 0;
   let shuttingDown = false;
   function touch(sessionId: string): void {
     const session = sessions[sessionId];
@@ -670,14 +677,18 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
           // session per tool call. Logging each initialize dominated server.log.
           // Tool-call lines still carry the short session ID and the dashboard
           // exposes retained sessions, so sample the repetitive client churn.
-          const logThisInitialize =
-            name !== "openai-mcp" || initializedTotal === 1 || initializedTotal % 25 === 0;
+          // Use an openai-mcp-local counter so manager warm-up/tunnel/recovery
+          // initializes cannot shift which ChatGPT session becomes the 25th sample.
+          const clientInitializedTotal = name === "openai-mcp" ? ++openAiMcpInitializedTotal : 0;
+          const logThisInitialize = shouldLogSessionInitializeForClient(name, clientInitializedTotal);
           if (logThisInitialize) {
             const retained = Object.keys(sessions).length;
             console.log(
               `${formatLogTime()} [MCP] Session initialized: ${sessionLogId(activeSid)} client=${name}${
                 version ? ` (${version})` : ""
-              } initialized=${initializedTotal} retained=${retained}/${MAX_SESSION_COUNT}`
+              } initialized=${initializedTotal}${
+                name === "openai-mcp" ? ` clientInitialized=${clientInitializedTotal}` : ""
+              } retained=${retained}/${MAX_SESSION_COUNT}`
             );
           }
         }
