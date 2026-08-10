@@ -17,12 +17,12 @@ try {
   if (SLIM_CHATGPT_TOOLS.size < 18) throw new Error(`slim set too small: ${SLIM_CHATGPT_TOOLS.size}`);
   ok(`slim profile has ${SLIM_CHATGPT_TOOLS.size} tools`);
 
-  for (const t of ["apply_patch", "glob", "remember", "load_path_rules", "mcp_servers", "mcp_tools", "mcp_call"]) {
+  for (const t of ["apply_patch", "glob", "delete_file", "delete_directory", "remember", "load_path_rules", "mcp_servers", "mcp_tools", "mcp_call"]) {
     if (!shouldExposeTool(t, "slim")) throw new Error(`${t} missing from slim`);
   }
   ok("core tools exposed in slim");
 
-  if (shouldExposeTool("delete_directory", "slim")) throw new Error("delete_directory hidden");
+  if (shouldExposeTool("read_file_base64", "slim")) throw new Error("read_file_base64 should stay hidden");
   ok("heavy tools hidden in slim");
 
   if (!shouldExposeTool("mcp_call", "full")) throw new Error("full should expose all");

@@ -10,6 +10,8 @@ export const SLIM_CHATGPT_TOOLS = new Set([
   "glob",
   "grep",
   "list_directory",
+  "delete_file",
+  "delete_directory",
   "run_command",
   "shell_status",
   "start_process",
