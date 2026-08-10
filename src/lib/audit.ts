@@ -4,6 +4,7 @@ import { appendActivity, summarizeToolArgs } from "./activity-log.js";
 import { redactSensitiveText, redactSensitiveValue } from "./redaction.js";
 import { envBoundedInteger } from "./env-utils.js";
 import { atomicWriteFile } from "./atomic-write.js";
+import { readUtf8FileTail } from "./bounded-file.js";
 
 export type AuditStatus = "ok" | "error" | "blocked" | "dry-run";
 
@@ -29,16 +30,25 @@ function resolveAuditPath(): string {
 
 const auditPath = resolveAuditPath();
 const auditMaxBytes = envBoundedInteger("AUDIT_LOG_MAX_BYTES", 10 * 1024 * 1024, 1_024, 1_073_741_824);
+const auditHistoryScrubMaxBytes = Math.min(auditMaxBytes, 10 * 1024 * 1024);
 let auditWriteChain: Promise<void> = Promise.resolve();
 let auditHistoryPrepared = false;
 
 async function scrubHistoricalAuditFile(file: string): Promise<void> {
-  const raw = await fs.readFile(file, "utf8").catch((err: NodeJS.ErrnoException) => {
+  const tail = await readUtf8FileTail(file, auditHistoryScrubMaxBytes).catch((err: NodeJS.ErrnoException) => {
     if (err?.code === "ENOENT") return null;
     throw err;
   });
-  if (raw === null || raw.length === 0) return;
+  if (tail === null || tail.sizeBytes === 0) return;
 
+  let raw = tail.text;
+  if (tail.truncated) {
+    // A bounded tail can begin inside a JSONL record or secret value. Drop the
+    // partial first record so content whose identifying key is outside the read
+    // window is never persisted as an orphan plaintext fragment.
+    const firstNewline = raw.indexOf("\n");
+    raw = firstNewline >= 0 ? raw.slice(firstNewline + 1) : "";
+  }
   const hadFinalNewline = raw.endsWith("\n");
   const lines = raw.split(/\r?\n/);
   if (hadFinalNewline && lines.at(-1) === "") lines.pop();
@@ -50,7 +60,7 @@ async function scrubHistoricalAuditFile(file: string): Promise<void> {
       return redactSensitiveText(line);
     }
   }).join("\n") + (hadFinalNewline ? "\n" : "");
-  if (sanitized === raw) return;
+  if (!tail.truncated && sanitized === raw) return;
 
   await atomicWriteFile(file, sanitized, "utf8");
 }

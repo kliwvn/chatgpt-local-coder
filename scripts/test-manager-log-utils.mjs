@@ -64,6 +64,28 @@ try {
   assert.equal(historicalDisk.includes(bearer), false);
   assert.match(historicalDisk, /plain=keep-me/);
   assert.equal(await scrubLogFile(historical), false, "already-scrubbed log should be a no-op");
+
+  // A huge legacy diagnostic file must be reduced to a bounded recent tail
+  // instead of being loaded/re-written in full during pre-start scrubbing.
+  const hugeHistorical = path.join(dir, "huge-historical.log");
+  const hugeHistoricalSecret = "huge-historical-secret-998877";
+  const hugeLogicalBytes = 64 * 1024 * 1024;
+  const hugeTail = Buffer.from(`\nplain=keep-large\nx.api.key=${hugeHistoricalSecret}\n`, "utf8");
+  const hugeHandle = await fs.open(hugeHistorical, "w");
+  try {
+    await hugeHandle.truncate(hugeLogicalBytes);
+    await hugeHandle.write(hugeTail, 0, hugeTail.length, hugeLogicalBytes - hugeTail.length);
+  } finally {
+    await hugeHandle.close();
+  }
+  assert.equal((await fs.stat(hugeHistorical)).size, hugeLogicalBytes);
+  assert.equal(await scrubLogFile(hugeHistorical), true);
+  const hugeHistoricalDisk = await fs.readFile(hugeHistorical, "utf8");
+  assert.ok((await fs.stat(hugeHistorical)).size <= 1024 * 1024, "historical manager scrub must have a hard retention bound");
+  assert.equal(hugeHistoricalDisk.includes(hugeHistoricalSecret), false);
+  assert.match(hugeHistoricalDisk, /plain=keep-large/);
+  assert.equal(hugeHistoricalDisk.includes("\u0000"), false, "partial sparse prefix must be discarded");
+
   const unsrubbable = path.join(dir, "unsrubbable.log");
   await fs.mkdir(unsrubbable);
   await assert.rejects(scrubLogFile(unsrubbable), "non-ENOENT scrub failures must fail closed instead of pretending the log is clean");

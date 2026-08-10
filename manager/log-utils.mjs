@@ -4,6 +4,7 @@ import { atomicWriteFile, enqueueKeyedMutation } from "./fs-utils.mjs";
 export const DEFAULT_MANAGED_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const REDACTED_MASK = "********";
 const DEFAULT_LIVE_BACKUP_MAX_BYTES = 1024 * 1024;
+const DEFAULT_HISTORICAL_SCRUB_MAX_BYTES = 1024 * 1024;
 const liveRotationChains = new Map();
 let liveRotationSeq = 0;
 const SECRET_KEY_RE =
@@ -55,12 +56,42 @@ export function redactSensitiveLogText(input) {
   return text;
 }
 
-/** Rewrite a stopped managed process log with secrets redacted at rest. */
-export async function scrubLogFile(file) {
+async function readTailStrict(file, maxBytes, knownStat = null) {
+  const st = knownStat || await fs.stat(file);
+  if (!st.isFile()) throw new Error("Path is not a regular file");
+  const size = Math.min(st.size, Math.max(0, maxBytes));
+  if (size <= 0) return "";
+  const fh = await fs.open(file, "r");
   try {
-    const raw = await fs.readFile(file, "utf8");
+    const buf = Buffer.alloc(size);
+    const { bytesRead } = await fh.read(buf, 0, size, st.size - size);
+    let start = 0;
+    while (start < bytesRead && (buf[start] & 0xc0) === 0x80) start++;
+    return buf.subarray(start, bytesRead).toString("utf8");
+  } finally {
+    await fh.close();
+  }
+}
+
+/**
+ * Rewrite a stopped managed process log with secrets redacted at rest.
+ * Historical process logs are diagnostic-only and Manager can surface at most
+ * 1 MiB, so cap migration to the newest tail instead of loading an arbitrarily
+ * large legacy file into memory. A partial first line is discarded when capped.
+ */
+export async function scrubLogFile(file, maxBytes = DEFAULT_HISTORICAL_SCRUB_MAX_BYTES) {
+  try {
+    const st = await fs.stat(file);
+    if (!st.isFile()) throw new Error("Path is not a regular file");
+    const limit = Number.isSafeInteger(maxBytes) && maxBytes > 0 ? maxBytes : DEFAULT_HISTORICAL_SCRUB_MAX_BYTES;
+    const truncated = st.size > limit;
+    let raw = truncated ? await readTailStrict(file, limit, st) : await fs.readFile(file, "utf8");
+    if (truncated) {
+      const firstNewline = raw.indexOf("\n");
+      raw = firstNewline >= 0 ? raw.slice(firstNewline + 1) : "";
+    }
     const sanitized = redactSensitiveLogText(raw);
-    if (sanitized === raw) return false;
+    if (!truncated && sanitized === raw) return false;
     await atomicWriteFile(file, sanitized, "utf8");
     return true;
   } catch (err) {
@@ -71,21 +102,10 @@ export async function scrubLogFile(file) {
 
 /** Read the tail without emitting U+FFFD when the byte window starts mid-codepoint. */
 export async function tailFile(file, maxBytes = 8000) {
-  let fh = null;
   try {
-    const st = await fs.stat(file);
-    const size = Math.min(st.size, Math.max(0, maxBytes));
-    if (size <= 0) return "";
-    fh = await fs.open(file, "r");
-    const buf = Buffer.alloc(size);
-    const { bytesRead } = await fh.read(buf, 0, size, st.size - size);
-    let start = 0;
-    while (start < bytesRead && (buf[start] & 0xc0) === 0x80) start++;
-    return buf.subarray(start, bytesRead).toString("utf8");
+    return await readTailStrict(file, maxBytes);
   } catch {
     return "";
-  } finally {
-    await fh?.close().catch(() => undefined);
   }
 }
 

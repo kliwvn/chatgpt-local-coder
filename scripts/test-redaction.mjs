@@ -70,17 +70,29 @@ try {
 
   const legacyAuditSecret = "legacy-audit-secret-112233";
   const legacyAuditBackupSecret = "legacy-audit-backup-secret-445566";
-  await fs.writeFile(
-    process.env.AUDIT_LOG_PATH,
-    JSON.stringify({ time: new Date().toISOString(), details: { API_KEY: legacyAuditSecret } }) +
+  // Sparse oversized legacy history reproduces the OOM/CPU risk without writing
+  // tens of MiB of physical data. Bounded migration should keep only the tail.
+  const legacyLogicalBytes = 64 * 1024 * 1024;
+  const legacyTail = Buffer.from(
+    `\n${JSON.stringify({ time: new Date().toISOString(), details: { API_KEY: legacyAuditSecret } })}` +
       `\nAuthorization: Bearer ${legacyAuditSecret}\n`,
     "utf8"
   );
+  const legacyHandle = await fs.open(process.env.AUDIT_LOG_PATH, "w");
+  try {
+    await legacyHandle.truncate(legacyLogicalBytes);
+    await legacyHandle.write(legacyTail, 0, legacyTail.length, legacyLogicalBytes - legacyTail.length);
+  } finally {
+    await legacyHandle.close();
+  }
+  assert.equal((await fs.stat(process.env.AUDIT_LOG_PATH)).size, legacyLogicalBytes);
   await fs.mkdir(`${process.env.AUDIT_LOG_PATH}.1`);
 
   const audit = await import("../dist/lib/audit.js");
   await audit.audit({ tool: "run_command", action: "migration-first-attempt", status: "error", details: { command, API_KEY: secret } });
   const afterFailedMigration = await fs.readFile(process.env.AUDIT_LOG_PATH, "utf8");
+  assert.ok((await fs.stat(process.env.AUDIT_LOG_PATH)).size <= 1024 * 1024, "historical audit migration must have a hard retention bound");
+  assert.equal(afterFailedMigration.includes("\u0000"), false, "partial sparse audit prefix must be discarded");
   assert.equal(afterFailedMigration.includes(legacyAuditSecret), false, "active history should be scrubbed before a later generation failure");
   assert.equal(afterFailedMigration.includes("migration-first-attempt"), false, "audit append must fail closed when historical scrub cannot complete");
 
