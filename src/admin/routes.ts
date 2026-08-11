@@ -310,7 +310,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       const values = parseDotEnv(text);
       const masked: Record<string, string> = {};
       for (const [key, value] of Object.entries(values)) {
-        if (key === "MCP_SESSION_RECOVERY") continue;
+        if (key === "MCP_SESSION_RECOVERY" || key === "CHATGPT_AUTO_APPROVE") continue;
         masked[key] = isSecretKey(key) && value ? REDACTED_MASK : value;
       }
       res.json({ ok: true, path: envPath, values: masked });
@@ -341,7 +341,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       const result = await enqueueEnvMutation(async () => {
         const filtered: Record<string, string> = {};
         for (const [key, value] of Object.entries(values)) {
-          if (key === "MCP_SESSION_RECOVERY") continue;
+          if (key === "MCP_SESSION_RECOVERY" || key === "CHATGPT_AUTO_APPROVE") continue;
           if (value !== REDACTED_MASK) filtered[key] = value;
         }
         let original = "";
@@ -350,7 +350,10 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
-        const next = serializeDotEnv({ ...filtered, MCP_SESSION_RECOVERY: null }, original);
+        const next = serializeDotEnv(
+          { ...filtered, MCP_SESSION_RECOVERY: null, CHATGPT_AUTO_APPROVE: null },
+          original
+        );
         const validationError = validateAdminEnv(next);
         if (validationError) return { ok: false as const, error: validationError };
         await atomicWriteFile(envPath, next, "utf8");

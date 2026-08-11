@@ -366,7 +366,7 @@ export function registerFilesystemTools(server: McpServer): void {
     "write_file",
     {
       title: "Write File",
-      description: "Save text to a local file. Routine local file update.",
+      description: "Create or replace a local text file inside the configured path scope. A recovery checkpoint is created before overwrite.",
       inputSchema: { path: z.string(), content: z.string() },
 
       annotations: toolAnnotations("edit"),
@@ -413,7 +413,7 @@ export function registerFilesystemTools(server: McpServer): void {
     "edit_file",
     {
       title: "Edit File",
-      description: "Apply exact text replacement to a file. Returns diff.",
+      description: "Modify local text by exact replacement inside the configured path scope. Supports dry-run and creates a recovery checkpoint before changes.",
       inputSchema: {
         path: z.string(),
         old_text: z.string().min(1),
@@ -444,7 +444,7 @@ export function registerFilesystemTools(server: McpServer): void {
     "multi_edit",
     {
       title: "Multi Edit",
-      description: "Apply multiple exact replacements to one text file atomically.",
+      description: "Modify one local text file with multiple exact replacements atomically. Supports dry-run and creates a recovery checkpoint before changes.",
       inputSchema: {
         path: z.string(),
         edits: z.array(z.object({ old_text: z.string().min(1), new_text: z.string(), replace_all: z.boolean().optional().default(false) })).max(1000),
@@ -512,7 +512,7 @@ export function registerFilesystemTools(server: McpServer): void {
     {
       title: "Apply Patch",
       description:
-        "Preferred way to edit code. Codex @@ hunks or *** Begin Patch format. Read the file first. Use dry_run:true to preview.",
+        "Apply checkpointed local code edits with Codex @@ hunks or *** Begin Patch format. Supports dry-run. File removal is not allowed here; use the explicit removal tools.",
       inputSchema: {
         path: z.string().optional().describe("Target file (single-file) or base directory (multi-file)"),
         patch: z.string(),
@@ -531,7 +531,14 @@ export function registerFilesystemTools(server: McpServer): void {
           const stat = await fs.stat(validPath);
           baseDir = stat.isDirectory() ? validPath : path.dirname(validPath);
         }
-        const parsedPaths = parseMultiFilePatch(patch, baseDir).map((op) => op.path);
+        const parsedOps = parseMultiFilePatch(patch, baseDir);
+        if (parsedOps.some((op) => op.operation === "delete")) {
+          throw new Error(
+            "APPLY_PATCH_DELETE_UNSUPPORTED: apply_patch is a non-delete edit action. " +
+              "Use the explicit recoverable removal tools instead."
+          );
+        }
+        const parsedPaths = parsedOps.map((op) => op.path);
         const patchPaths = await Promise.all(parsedPaths.map((patchPath) => validatePath(patchPath)));
         return withFileMutations(patchPaths, async () => {
           const checkpointId = await checkpointBefore("apply_patch", patchPaths, { dry_run });

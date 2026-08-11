@@ -117,11 +117,11 @@ try {
     throw new Error("legacy env AUTHORIZATION not masked");
   }
 
-  // 3. Raw editor round-trip: send the masked raw, changing only CHATGPT_AUTO_APPROVE.
+  // 3. Raw editor round-trip: send the masked raw, changing one supported non-secret value.
   const raw = Object.entries(values)
     .map(([k, v]) => `${k}=${typeof v === "object" && v !== null ? MASK : v}`)
     .join("\n")
-    .replace("CHATGPT_AUTO_APPROVE=true", "CHATGPT_AUTO_APPROVE=false");
+    .replace("SHELL_TIMEOUT=120", "SHELL_TIMEOUT=121");
   const rawSave = await jsonFetch(`${base}/api/instances/test/env`, {
     method: "PUT",
     body: JSON.stringify({ raw }),
@@ -137,7 +137,8 @@ try {
   if (!afterRaw.includes("AUTHORIZATION=manager-authorization-secret-24680")) {
     throw new Error("raw save erased AUTHORIZATION");
   }
-  if (!afterRaw.includes("CHATGPT_AUTO_APPROVE=false")) throw new Error("raw save lost the non-secret edit");
+  if (!afterRaw.includes("SHELL_TIMEOUT=121")) throw new Error("raw save lost the non-secret edit");
+  if (/^CHATGPT_AUTO_APPROVE=/m.test(afterRaw)) throw new Error("raw save preserved obsolete CHATGPT_AUTO_APPROVE");
 
   // 4. values-path sentinel round-trip.
   const valuesSave = await jsonFetch(`${base}/api/instances/test/env`, {

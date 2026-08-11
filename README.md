@@ -106,7 +106,7 @@ npm start
 | **Cấu hình workspace** | `WORKSPACE_PATH` + folder picker (chọn thư mục bằng dialog Windows), đổi tên, xóa, profile |
 | **Focus Server / Tunnel** | Start/stop server; **Khởi động lại Gateway** thực hiện graceful restart, **đợi PID cũ thoát hoàn toàn** rồi mới start/xác nhận PID mới, trong khi giữ Tunnel đang chạy; lifecycle server/tunnel được serialize theo workspace để tránh overlap/double-spawn/race. Managed OpenAI Tunnel dùng log level `warn` để giữ lỗi/cảnh báo nhưng tránh INFO log tăng liên tục khi chạy dài ngày; Local Coder không quảng bá OAuth/PRMD khi không dùng OAuth. Với tunnel-client v0.0.10, no-auth discovery cần 404 có body JSON không phải PRMD để đi hết fallback candidates và giữ `/readyz` ở `200 ready`; binary hiện vẫn ghi đúng một WARN OAuth discovery lúc startup, WARN không lặp khi runtime ổn định |
 | **Log viewer** | Xem log server thời gian thực (2.5s poll), lọc **Tất cả / Chỉ MCP**, pause, clear. "Chỉ MCP" gồm MCP/TOOL cùng `COMMAND FAILED` / `COMMAND NO MATCH` theo taxonomy mới; command/tool failure được highlight riêng khỏi transport error. Chi tiết tool/audit đầy đủ nằm trong audit file `.mcp-audit.log` |
-| **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel, **WORKSPACE_PATH đầy đủ**, `EXTRA_WORKSPACE_PATHS` gộp trên **một dòng** và ngăn cách bằng `;` (ellipsis khi quá dài, hover xem đủ), `FULL_DISK_ACCESS`, port + PID |
+| **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel, **WORKSPACE_PATH đầy đủ**, `EXTRA_WORKSPACE_PATHS` gộp trên **một dòng** và ngăn cách bằng `;` (ellipsis khi quá dài, hover xem đủ), `FULL_DISK_ACCESS`, **MCP port + Admin port + PID** |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Focus Tunnel |
 | **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
 | **Autostart ẩn hoàn toàn** | Tự chạy khi đăng nhập Windows qua Startup LNK → `wscript manager-hidden.vbs` → node chạy nền, **không hiện cửa sổ terminal/popup** nào. Bật/tắt trong dashboard (API `/api/autostart`) hoặc `setup.bat` |
@@ -264,7 +264,6 @@ Copy `.env.example` → `.env`:
 PORT=3000
 MANAGER_PORT=3300
 WORKSPACE_PATH=C:\Users\You\projects\my-app
-CHATGPT_AUTO_APPROVE=true
 SHELL_TIMEOUT=120
 MCP_SESSION_TTL_MS=120000
 MCP_SESSION_CLEANUP_MS=15000
@@ -299,7 +298,6 @@ OPENAI_TUNNEL_API_KEY=
 | `EXTRA_WORKSPACE_PATHS` | — | Thêm workspace bổ sung (`;`-separated) — server được phép truy cập tất cả các root này |
 | `WORKSPACE_PATHS` / `ALLOWED_WORKSPACE_PATHS` | — | Aliases của `EXTRA_WORKSPACE_PATHS` (đọc thêm nếu có) |
 | `FULL_DISK_ACCESS` | `false` | Scope cho **path-aware filesystem/git/config tools**. `false` = chỉ path canonical trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`); `true` = cho phép path toàn máy. Không phải OS sandbox cho native shell |
-| `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
 | `MCP_SESSION_TTL_MS` | `120000` | Xóa session **idle** sau 2 phút. Session đang SSE-connected hoặc đang chạy tool không bị evict; stale POST được auto-recover |
 | `MCP_SESSION_CLEANUP_MS` | `15000` | Chu kỳ cleanup session idle (15 giây) |
 | `MCP_SESSION_DELETE_GRACE_MS` | `45000` | **Fallback grace** cho transport close ngoài explicit DELETE. Explicit DELETE đã serialize sau các POST/tool call trước đó nên được dispose ngay khi op chain drain xong, tránh giữ session churn thêm 45s không cần thiết |
@@ -406,6 +404,7 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 | **Connection failed** | Check `.\start.ps1` + tunnel are both running. URL must be HTTPS. |
 | **502 from tunnel during restart** | The tunnel can remain up while the local server is restarting; a brief 502 means `127.0.0.1:3000` was temporarily unavailable. Manager now drains MCP sessions with bounded graceful close before force fallback, reducing this window. |
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
+| **`MCP write action is temporarily disabled`** | Xem `/health` → `mcpDispatch` (hoặc `agent_status.mcp_dispatch`). Nếu `MCP_REACHED.write_total` không tăng khi lỗi xảy ra thì request bị chặn **trước Local Coder** (`HOST_NOT_INVOKED`): Refresh/re-approve connector và kiểm tra Action control phía ChatGPT. Nếu `MCP_REACHED` tăng nhưng `MCP_EXECUTED` không tăng thì mới debug transport/session phía Local Coder. |
 | **Tool blocked by client safety** | Chỉ dùng `run_command` fallback cho thao tác **không phá hủy** như `git push` / branch switch. Không bypass `delete_file`, `delete_directory` hoặc `git_restore` bằng shell; destructive executor guard sẽ từ chối. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
 | **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.bat`). |

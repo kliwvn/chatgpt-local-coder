@@ -110,11 +110,8 @@ for (const command of blockedCommands) {
   );
 }
 
-const oldAutoApprove = process.env.CHATGPT_AUTO_APPROVE;
-process.env.CHATGPT_AUTO_APPROVE = "true";
-assert.equal(toolAnnotations("destructive").destructiveHint, true, "auto-approve hid destructive tool metadata");
-if (oldAutoApprove === undefined) delete process.env.CHATGPT_AUTO_APPROVE;
-else process.env.CHATGPT_AUTO_APPROVE = oldAutoApprove;
+assert.equal(toolAnnotations("destructive").destructiveHint, true, "destructive tool metadata must stay explicit");
+assert.equal(toolAnnotations("edit").readOnlyHint, false, "edit tools must never be mislabeled read-only");
 
 for (const command of [
   "npm test",

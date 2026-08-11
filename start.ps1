@@ -45,14 +45,8 @@ if (-not $Workspace) {
     $Workspace = $ScriptDir
 }
 
-$ChatGptAutoApprove = Get-DotEnvValue "CHATGPT_AUTO_APPROVE"
-
 $env:WORKSPACE_PATH = $Workspace
 $env:PORT = $Port
-if ($ChatGptAutoApprove) {
-    $env:CHATGPT_AUTO_APPROVE = $ChatGptAutoApprove
-}
-
 Write-Host ""
 Write-Host "=== Codex MCP Server ===" -ForegroundColor Cyan
 Write-Host "Default cwd: $Workspace"

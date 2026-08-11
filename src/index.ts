@@ -32,6 +32,7 @@ import { getChatGptToolProfile } from "./lib/tool-profile.js";
 import { envIntegerOrThrow } from "./lib/env-utils.js";
 import { getManagedProcessStats, shutdownManagedProcesses } from "./tools/shell.js";
 import { ensureShellBootstrap, flushShellPersistence } from "./lib/persistent-shell.js";
+import { getMcpDispatchDiagnostics, recordMcpExecuted, recordMcpReached } from "./lib/mcp-dispatch-diagnostics.js";
 
 const PORT = envIntegerOrThrow("PORT", 3000, 1, 65_535);
 const ADMIN_PORT = envIntegerOrThrow("ADMIN_PORT", 3001, 1, 65_535);
@@ -216,6 +217,7 @@ app.get("/health", (_req, res) => {
       cleanupIntervalMs: counts.cleanupIntervalMs,
     },
     sessionRecovery: true,
+    mcpDispatch: getMcpDispatchDiagnostics(),
     managedProcesses: getManagedProcessStats(),
     mcpEndpoints: MCP_PATHS,
     instructions: summarizeInstructionContext(instructionContext),
@@ -247,6 +249,7 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
       });
       return;
     }
+    const dispatchTool = recordMcpReached(req.body);
     const sessionId = validatedSessionId(req, res);
     if (sessionId === null) return;
     const requestId = extractRequestId(req.body);
@@ -268,6 +271,7 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
         return;
       }
       await sessionManager.handleExisting(existing, req, res, req.body);
+      recordMcpExecuted(dispatchTool);
       return;
     }
 
@@ -286,7 +290,10 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
         res,
         req.body
       );
-      if (recovered) return;
+      if (recovered) {
+        recordMcpExecuted(dispatchTool);
+        return;
+      }
       sessionManager.sendSessionNotFound(res, requestId);
       return;
     }

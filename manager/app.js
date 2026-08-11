@@ -62,7 +62,6 @@ const FIELD_ENV = {
   "f-port": "PORT",
   "f-admin-port": "ADMIN_PORT",
   "f-profile": "CHATGPT_TOOL_PROFILE",
-  "f-auto-approve": "CHATGPT_AUTO_APPROVE",
   "f-timeout": "SHELL_TIMEOUT",
   "f-sync-budget": "MCP_SYNC_RESPONSE_BUDGET_MS",
   "f-session-ttl": "MCP_SESSION_TTL_MS",
@@ -120,12 +119,13 @@ function renderServerTunnel(s) {
   const srv = s.server;
   const serverConflict = Boolean(srv.portOccupied);
   const artifactDrift = Boolean(srv.artifactDrift);
-  const serverCurrent = srv.running && !artifactDrift;
-  setDot("server-dot", serverCurrent, srv.running ? (artifactDrift ? "Đang chạy • cần restart" : "Đang chạy") : serverConflict ? "Xung đột cổng" : "Dừng");
-  setDot("inst-server-dot", serverCurrent, srv.running ? (artifactDrift ? "Server: build cũ" : "Server: chạy") : serverConflict ? "Server: xung đột cổng" : "Server: dừng");
+  const buildDrift = Boolean(srv.buildDrift);
+  const serverCurrent = srv.running && !artifactDrift && !buildDrift;
+  setDot("server-dot", serverCurrent, srv.running ? (buildDrift ? "Đang chạy • source chưa build" : artifactDrift ? "Đang chạy • cần restart" : "Đang chạy") : serverConflict ? "Xung đột cổng" : "Dừng");
+  setDot("inst-server-dot", serverCurrent, srv.running ? (buildDrift ? "Server: source chưa build" : artifactDrift ? "Server: cần restart" : "Server: chạy") : serverConflict ? "Server: xung đột cổng" : "Server: dừng");
   $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
   $("btn-server").disabled = busy || serverConflict;
-  $("btn-server-restart").disabled = busy || !srv.running || serverConflict;
+  $("btn-server-restart").disabled = busy || !srv.running || serverConflict || buildDrift;
   const roots =
     (srv.health && srv.health.instructions && srv.health.instructions.workspace_roots) ||
     (s.env.WORKSPACE_PATH ? [s.env.WORKSPACE_PATH] : []);
@@ -134,7 +134,7 @@ function renderServerTunnel(s) {
       ? `${roots[0]} (+${roots.length - 1} path mở rộng)`
       : roots[0] || (srv.health && srv.health.defaultCwd) || "—";
   $("server-detail").textContent = srv.running
-    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}${artifactDrift ? " • build mới hơn process — cần Khởi động lại Gateway" : ""}`
+    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}${buildDrift ? " • source mới hơn dist — cần Build rồi restart Gateway" : artifactDrift ? " • build mới hơn process — cần Khởi động lại Gateway" : ""}`
     : serverConflict
       ? `Cổng ${srv.port} đang bị process khác chiếm${srv.pid ? ` (PID ${srv.pid})` : ""}. Đổi PORT hoặc dừng process đó trước khi bật Local Coder.`
       : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
@@ -145,7 +145,7 @@ function renderServerTunnel(s) {
   setDot("tunnel-dot", tun.running, tun.running ? "Đang chạy" : tunnelConflict ? "Xung đột cổng" : "Dừng");
   setDot("inst-tunnel-dot", tun.running, tun.running ? "Tunnel: chạy" : tunnelConflict ? "Tunnel: xung đột cổng" : "Tunnel: dừng");
   $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
-  $("btn-tunnel").disabled = busy || tunnelConflict;
+  $("btn-tunnel").disabled = busy || tunnelConflict || (!tun.running && (artifactDrift || buildDrift));
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
   if (tun.running && tun.url) {
     $("tunnel-detail").innerHTML = `${esc(mode)} • URL: <b class="mono">${esc(tun.url)}</b>`;
@@ -308,10 +308,12 @@ async function loadInstances(initial) {
           : "";
         const access = i.env.FULL_DISK_ACCESS === "true" ? "full path" : "workspace paths";
         const port = i.server.port || i.env.PORT || "—";
+        const adminPort = i.env.ADMIN_PORT || "—";
         const active = state.current === i.name ? " active" : "";
         const artifactDrift = Boolean(i.server.artifactDrift);
+        const buildDrift = Boolean(i.server.buildDrift);
         const stateTxt = srv
-          ? `<span class="status-dot ${artifactDrift ? "bad" : "ok"}"></span>${artifactDrift ? "Server build cũ" : "Server chạy"} <span class="status-dot ok"></span>Tunnel ${tun ? "chạy" : "dừng"}`
+          ? `<span class="status-dot ${artifactDrift || buildDrift ? "bad" : "ok"}"></span>${buildDrift ? "Source chưa build" : artifactDrift ? "Server cần restart" : "Server chạy"} <span class="status-dot ok"></span>Tunnel ${tun ? "chạy" : "dừng"}`
           : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`;
         return (
           `<li class="inst-item${active}" data-name="${esc(i.name)}">` +
@@ -320,7 +322,7 @@ async function loadInstances(initial) {
           `<span class="inst-ws" title="${esc(ws)}">${esc(ws)}</span>` +
           extraHtml +
           `<span class="inst-access">FULL_DISK_ACCESS: ${access}</span>` +
-          `<span class="inst-meta">:${esc(String(port))} · pid ${esc(String(i.server.pid || "—"))}${srv && i.server.health ? ` · ${i.server.health.activeSessions ?? 0} đăng ký${i.server.health.connectedSessions != null ? ` · ${i.server.health.connectedSessions} kết nối` : ""}` : ""}</span>` +
+          `<span class="inst-meta">MCP ${esc(String(port))} · Admin ${esc(String(adminPort))} · pid ${esc(String(i.server.pid || "—"))}${srv && i.server.health ? ` · ${i.server.health.activeSessions ?? 0} đăng ký${i.server.health.connectedSessions != null ? ` · ${i.server.health.connectedSessions} kết nối` : ""}` : ""}</span>` +
           `</div>` +
           `</li>`
         );

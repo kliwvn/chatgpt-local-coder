@@ -12,7 +12,6 @@ MCP server local giống Codex: đọc/ghi file, chạy lệnh, git. Dùng với
 - `FULL_DISK_ACCESS` chỉ điều khiển scope của **path-aware tools**: `false` = workspace roots; `true` = path toàn máy.
 - **Destructive-command guard luôn bật**, không phụ thuộc `FULL_DISK_ACCESS`: shell không được dùng để permanent-delete, `git clean -f*`, `git reset --hard`, hoặc bypass restore/delete safety.
 - `WORKSPACE_PATH` chỉ là thư mục mặc định cho path tương đối và shell/git
-- `CHATGPT_AUTO_APPROVE=true` — giảm popup xác nhận trên ChatGPT
 
 ## ChatGPT: tránh popup + lỗi "Luôn cho phép phải kết nối lại"
 
@@ -147,5 +146,5 @@ Health check: `http://localhost:3000/health` | Tunnel UI: `http://127.0.0.1:8080
 |---|---|
 | Access denied | Kiểm tra path; bật `FULL_DISK_ACCESS=true` |
 | Patch context not found | Đọc file trước; thêm context lines (dòng bắt đầu bằng space) |
-| ChatGPT hỏi quyền mỗi lần | Refresh connector; Always allow; kiểm tra `CHATGPT_AUTO_APPROVE=true` |
+| ChatGPT hỏi quyền / write action bị disable | Kiểm tra MCP dispatch diagnostics rồi Refresh/re-approve connector. Local MCP annotations không thể auto-approve thay ChatGPT. |
 | Connection failed | Chạy `.\start.ps1` + tunnel; URL phải HTTPS |

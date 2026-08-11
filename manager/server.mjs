@@ -38,6 +38,7 @@ import {
   appendBoundedTail,
   extractSingleZipEntryBoundedWindows,
   isRuntimeArtifactStale,
+  inspectRuntimeBuildFreshness,
   streamResponseToFileBounded,
 } from "./fs-utils.mjs";
 
@@ -100,6 +101,27 @@ const CSC_PATH = [
   "C:/Windows/Microsoft.NET/Framework/v4.0.30319/csc.exe",
 ].find(fs.existsSync) || null;
 const SERVER_ENTRY = path.join(ROOT, "dist", "index.js");
+const RUNTIME_SOURCE_ROOT = path.join(ROOT, "src");
+const RUNTIME_ARTIFACT_ROOT = path.join(ROOT, "dist");
+const RUNTIME_BUILD_SOURCE_FILES = [
+  path.join(ROOT, "package.json"),
+  path.join(ROOT, "package-lock.json"),
+  path.join(ROOT, "tsconfig.json"),
+];
+const RUNTIME_BUILD_CACHE_MS = 1500;
+let runtimeBuildCache = { at: 0, value: null };
+async function runtimeBuildStatus(force = false) {
+  if (!force && runtimeBuildCache.value && Date.now() - runtimeBuildCache.at < RUNTIME_BUILD_CACHE_MS) {
+    return runtimeBuildCache.value;
+  }
+  const value = await inspectRuntimeBuildFreshness({
+    sourceRoot: RUNTIME_SOURCE_ROOT,
+    artifactRoot: RUNTIME_ARTIFACT_ROOT,
+    sourceFiles: RUNTIME_BUILD_SOURCE_FILES,
+  });
+  runtimeBuildCache = { at: Date.now(), value };
+  return value;
+}
 const CLOUDFLARED_DOWNLOAD_URL =
   "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe";
 
@@ -135,6 +157,7 @@ function scrubProfiles(profiles) {
       profile.values = withoutSecrets(profile.values);
       delete profile.values.MCP_CONNECTOR_NAME;
       delete profile.values.MCP_SESSION_RECOVERY;
+      delete profile.values.CHATGPT_AUTO_APPROVE;
     }
   }
   return profiles;
@@ -777,6 +800,7 @@ async function runInstall() {
     if (res.code !== 0) break;
   }
   await fsp.writeFile(INSTALL_LOG, log.map((l) => l.output).join("\n"), "utf-8");
+  runtimeBuildCache = { at: 0, value: null };
   const ok = log.every((l) => l.code === 0);
   return { ok, steps: log.map((l) => ({ step: l.step, code: l.code })), output: log.map((l) => l.output).join("\n").slice(-6000) };
 }
@@ -784,7 +808,7 @@ async function runInstall() {
 async function serverStatus(name) {
   const env = await readInstanceEnv(name);
   const inst = instPaths(name);
-  const serverEntryStat = await fsp.stat(SERVER_ENTRY).catch(() => null);
+  const buildState = await runtimeBuildStatus();
   const configuredPort = Number(env.PORT || 0);
   const configuredPortValid = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort < 65536;
   const savedPid = await readPidFile(inst.serverPid);
@@ -807,7 +831,7 @@ async function serverStatus(name) {
     if (portOpen && isLocalCoderHealth(health, env)) {
       const artifactDrift = isRuntimeArtifactStale(
         health?.instructions?.loaded_at,
-        serverEntryStat?.mtimeMs
+        buildState.newestArtifactMtimeMs
       );
       return {
         running: true,
@@ -819,6 +843,9 @@ async function serverStatus(name) {
         invalidConfig: false,
         configDrift: false,
         artifactDrift,
+        buildDrift: buildState.sourceNewerThanBuild,
+        buildSourceMtimeMs: buildState.newestSourceMtimeMs,
+        buildArtifactMtimeMs: buildState.newestArtifactMtimeMs,
         owned: Boolean(savedPid && (!portPid || savedPid === portPid)),
       };
     }
@@ -836,7 +863,7 @@ async function serverStatus(name) {
       if (!isLocalCoderHealth(actualHealth, env)) continue;
       const artifactDrift = isRuntimeArtifactStale(
         actualHealth?.instructions?.loaded_at,
-        serverEntryStat?.mtimeMs
+        buildState.newestArtifactMtimeMs
       );
       return {
         running: true,
@@ -848,6 +875,9 @@ async function serverStatus(name) {
         invalidConfig: !configuredPortValid,
         configDrift: true,
         artifactDrift,
+        buildDrift: buildState.sourceNewerThanBuild,
+        buildSourceMtimeMs: buildState.newestSourceMtimeMs,
+        buildArtifactMtimeMs: buildState.newestArtifactMtimeMs,
         owned: true,
       };
     }
@@ -863,6 +893,9 @@ async function serverStatus(name) {
     invalidConfig: !configuredPortValid,
     configDrift: false,
     artifactDrift: false,
+    buildDrift: buildState.sourceNewerThanBuild,
+    buildSourceMtimeMs: buildState.newestSourceMtimeMs,
+    buildArtifactMtimeMs: buildState.newestArtifactMtimeMs,
     owned: false,
   };
 }
@@ -943,6 +976,14 @@ async function startServerUnlocked(name) {
   if (st.portOccupied) return { ok: false, error: `PORT ${st.port} is occupied by another process${st.pid ? ` (PID ${st.pid})` : ""}; refusing to start Local Coder.` };
   if (!fs.existsSync(SERVER_ENTRY)) {
     return { ok: false, error: "dist/index.js chưa tồn tại — bấm 'Cài Đặt' trước." };
+  }
+  const buildState = await runtimeBuildStatus(true);
+  if (buildState.sourceNewerThanBuild) {
+    return {
+      ok: false,
+      error: "Runtime source is newer than dist. Run Install/Build before starting or restarting the Gateway.",
+      buildDrift: true,
+    };
   }
   const inst = instPaths(name);
   // Persist managed-runtime defaults for instances created before these keys
@@ -1092,6 +1133,15 @@ async function stopServer(name) {
 
 async function restartServer(name) {
   return enqueueServerLifecycle(name, async () => {
+    const buildState = await runtimeBuildStatus(true);
+    if (buildState.sourceNewerThanBuild) {
+      return {
+        ok: false,
+        restarted: false,
+        buildDrift: true,
+        error: "Runtime source is newer than dist. Run Install/Build before restarting the Gateway.",
+      };
+    }
     const before = await serverStatus(name);
     const stopped = await stopServerUnlocked(name);
     if (!stopped.ok) return { ...stopped, restarted: false, previousPid: before.pid || null };
@@ -1300,6 +1350,14 @@ async function startTunnelUnlocked(name) {
   if (!serverState.running || serverState.configDrift) {
     const reason = serverState.portOccupied ? "the server port is occupied by another process" : "Local Coder server is not running";
     return { ok: false, error: serverState.configDrift ? `Cannot start Tunnel: managed Local Coder is still running on old PORT ${serverState.port} while .env configures PORT ${port}.` : `Cannot start Tunnel: ${reason} on port ${port}.` };
+  }
+  if (serverState.buildDrift || serverState.artifactDrift) {
+    return {
+      ok: false,
+      error: serverState.buildDrift
+        ? "Cannot start Tunnel: runtime source is newer than dist. Run Install/Build, restart Gateway, then start Tunnel."
+        : "Cannot start Tunnel: Gateway is running an older compiled runtime. Restart Gateway before exposing it through the Tunnel.",
+    };
   }
 
   if (st.mode === "openai") {
@@ -1583,6 +1641,9 @@ async function ensureManagedRuntimeDefaults(name) {
       if (Object.prototype.hasOwnProperty.call(env, "MCP_SESSION_RECOVERY")) {
         updates.MCP_SESSION_RECOVERY = null;
       }
+      if (Object.prototype.hasOwnProperty.call(env, "CHATGPT_AUTO_APPROVE")) {
+        updates.CHATGPT_AUTO_APPROVE = null;
+      }
       if (Object.keys(updates).length === 0) return { changed: false };
       const next = serializeDotEnv({ ...env, ...updates }, raw);
       await atomicWriteFile(file, next, "utf8");
@@ -1739,14 +1800,25 @@ async function checkConfig(name, overrides) {
     push(fs.existsSync(CLOUDFLARED), "Tunnel Cloudflare", fs.existsSync(CLOUDFLARED) ? "cloudflared.exe sẵn sàng" : "Chưa có cloudflared.exe — sẽ tải khi bật Tunnel");
   }
 
-  push(fs.existsSync(SERVER_ENTRY), "Build", fs.existsSync(SERVER_ENTRY) ? "dist/index.js tồn tại" : "Chưa build — bấm 'Cài Đặt'");
+  const buildState = await runtimeBuildStatus();
+  push(
+    fs.existsSync(SERVER_ENTRY) && !buildState.sourceNewerThanBuild,
+    "Build",
+    !fs.existsSync(SERVER_ENTRY)
+      ? "dist/index.js is missing — run Install/Build"
+      : buildState.sourceNewerThanBuild
+        ? "Runtime source is newer than dist — run Install/Build"
+        : "Compiled runtime is current with source"
+  );
 
   const st = await serverStatus(name);
   push(
-    !st.portOccupied && !st.invalidConfig && !st.artifactDrift,
+    !st.portOccupied && !st.invalidConfig && !st.artifactDrift && !st.buildDrift,
     "Server",
     st.running
-      ? st.artifactDrift
+      ? st.buildDrift
+        ? `Running on port ${st.port}, but runtime source is newer than dist — run Install/Build, then restart Gateway`
+        : st.artifactDrift
         ? `Đang chạy trên cổng ${st.port}, nhưng dist/index.js mới hơn process — cần Khởi động lại Gateway`
         : `Đang chạy trên cổng ${st.port}`
       : st.invalidConfig
@@ -1783,7 +1855,6 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
       ADMIN_PORT: env.ADMIN_PORT || "3001",
       WORKSPACE_PATH: env.WORKSPACE_PATH || "",
       CHATGPT_TOOL_PROFILE: env.CHATGPT_TOOL_PROFILE || "slim",
-      CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
       SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
       MCP_SYNC_RESPONSE_BUDGET_MS: env.MCP_SYNC_RESPONSE_BUDGET_MS || String(SYNC_RESPONSE_BUDGET_DEFAULT_MS),
       MCP_SESSION_TTL_MS: env.MCP_SESSION_TTL_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS),
@@ -1870,7 +1941,6 @@ async function createInstanceUnlocked(body) {
     "OPENAI_TUNNEL_API_KEY=",
     `OPENAI_TUNNEL_HEALTH_PORT=${healthPort}`,
     "CHATGPT_TOOL_PROFILE=slim",
-    "CHATGPT_AUTO_APPROVE=true",
     "SHELL_TIMEOUT=120",
     `MCP_SYNC_RESPONSE_BUDGET_MS=${SYNC_RESPONSE_BUDGET_DEFAULT_MS}`,
     `MCP_SESSION_TTL_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS}`,
@@ -1990,10 +2060,11 @@ async function saveInstanceEnvUnlocked(name, body) {
         return orig !== undefined ? `${m[1]}=${orig}` : line;
       })
       .join("\n");
-    next = serializeDotEnv({ MCP_SESSION_RECOVERY: null }, next);
+    next = serializeDotEnv({ MCP_SESSION_RECOVERY: null, CHATGPT_AUTO_APPROVE: null }, next);
   } else {
     const values = { ...(body.values || {}) };
     delete values.MCP_SESSION_RECOVERY;
+    delete values.CHATGPT_AUTO_APPROVE;
     if (!(body.values && Object.prototype.hasOwnProperty.call(body.values, "ADMIN_PORT"))) {
       if (originalValues.ADMIN_PORT) values.ADMIN_PORT = originalValues.ADMIN_PORT;
     }
@@ -2001,7 +2072,7 @@ async function saveInstanceEnvUnlocked(name, body) {
       if (value === undefined) values[key] = null;
       else if (value === MASK_SENTINEL) values[key] = originalValues[key] !== undefined ? originalValues[key] : null;
     }
-    next = serializeDotEnv({ ...values, MCP_SESSION_RECOVERY: null }, original);
+    next = serializeDotEnv({ ...values, MCP_SESSION_RECOVERY: null, CHATGPT_AUTO_APPROVE: null }, original);
   }
 
   const parsed = parseDotEnv(next);
@@ -2241,7 +2312,7 @@ async function handleApi(req, res, url, body) {
       const values = parseDotEnv(raw);
       const masked = {};
       for (const [k, v] of Object.entries(values)) {
-        if (k === "MCP_SESSION_RECOVERY") continue;
+        if (k === "MCP_SESSION_RECOVERY" || k === "CHATGPT_AUTO_APPROVE") continue;
         // Never ship the plaintext .env to the browser. Secret keys are replaced
         // with a sentinel; saveInstanceEnv restores the original value when the
         // UI round-trips the sentinel unchanged. OPENAI_TUNNEL_API_KEY keeps its
@@ -2334,7 +2405,6 @@ async function handleApi(req, res, url, body) {
         ADMIN_PORT: env.ADMIN_PORT || "3001",
         WORKSPACE_PATH: env.WORKSPACE_PATH || "",
         CHATGPT_TOOL_PROFILE: env.CHATGPT_TOOL_PROFILE || "slim",
-        CHATGPT_AUTO_APPROVE: env.CHATGPT_AUTO_APPROVE ?? "true",
         SHELL_TIMEOUT: env.SHELL_TIMEOUT || "120",
         MCP_SYNC_RESPONSE_BUDGET_MS: env.MCP_SYNC_RESPONSE_BUDGET_MS || String(SYNC_RESPONSE_BUDGET_DEFAULT_MS),
         MCP_SESSION_TTL_MS: env.MCP_SESSION_TTL_MS || String(SESSION_POLICY_DEFAULTS.MCP_SESSION_TTL_MS),
@@ -2354,7 +2424,7 @@ async function handleApi(req, res, url, body) {
     const values = parseDotEnv(raw);
     const masked = {};
     for (const [k, v] of Object.entries(values)) {
-      if (k === "MCP_SESSION_RECOVERY") continue;
+      if (k === "MCP_SESSION_RECOVERY" || k === "CHATGPT_AUTO_APPROVE") continue;
       if (k === "OPENAI_TUNNEL_API_KEY" && v) masked[k] = { set: true, last4: v.slice(-4) };
       else if (isSecretKey(k) && v) masked[k] = MASK_SENTINEL;
       else masked[k] = v;
@@ -2394,6 +2464,7 @@ async function handleApi(req, res, url, body) {
       const values = withoutSecrets(body.values || {});
       delete values.MCP_CONNECTOR_NAME;
       delete values.MCP_SESSION_RECOVERY;
+      delete values.CHATGPT_AUTO_APPROVE;
       profiles[profileName] = { savedAt: new Date().toISOString(), values };
       return profiles;
     });

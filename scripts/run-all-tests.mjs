@@ -76,6 +76,7 @@ const unitScripts = [
   "scripts/test-session-leak.mjs",
   "scripts/test-project-memory.mjs",
   "scripts/test-tool-profile.mjs",
+  "scripts/test-chatgpt-action-contract.mjs",
   "scripts/test-shell-persist.mjs",
   "scripts/test-shell-process-manager.mjs",
 ];

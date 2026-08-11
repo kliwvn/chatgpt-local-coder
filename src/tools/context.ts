@@ -14,6 +14,7 @@ import { appendAutoMemory } from "../lib/auto-memory.js";
 import { loadPathRulesForFile } from "../lib/path-rules.js";
 import { toolResult } from "../lib/tool-result.js";
 import { readUtf8FilePrefix } from "../lib/bounded-file.js";
+import { getMcpDispatchDiagnostics } from "../lib/mcp-dispatch-diagnostics.js";
 
 
 
@@ -145,6 +146,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
         },
         admin_ui: `http://127.0.0.1:${process.env.ADMIN_PORT || "3001"}/ui`,
         tool_profile: process.env.CHATGPT_TOOL_PROFILE || "slim",
+        mcp_dispatch: getMcpDispatchDiagnostics(),
       });
     }
   );

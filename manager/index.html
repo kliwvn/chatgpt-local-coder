@@ -139,13 +139,6 @@
             </select>
           </div>
           <div class="field">
-            <label for="f-auto-approve">CHATGPT_AUTO_APPROVE</label>
-            <select id="f-auto-approve" class="input">
-              <option value="true">true (giảm popup xác nhận)</option>
-              <option value="false">false</option>
-            </select>
-          </div>
-          <div class="field">
             <label for="f-timeout">SHELL_TIMEOUT (giây)</label>
             <input id="f-timeout" class="input mono" inputmode="numeric" placeholder="120" />
           </div>
@@ -209,8 +202,8 @@
           <span class="spacer"></span>
           <span id="server-status" class="status-label">Đang kiểm tra…</span>
           <span id="server-dot" class="status-dot"></span>
-          <a id="foot-admin" class="btn btn-sm" href="#" target="_blank">🛠 Admin UI (nâng cao) ↗</a>
-          <button id="btn-server-restart" class="btn btn-ghost" disabled title="Graceful restart Local Coder gateway; giữ Tunnel đang chạy">↻ Khởi động lại Gateway</button>
+          <a id="foot-admin" class="btn btn-primary btn-sm" href="#" target="_blank">🛠 Admin UI (nâng cao) ↗</a>
+          <button id="btn-server-restart" class="btn btn-green" disabled title="Graceful restart Local Coder gateway; giữ Tunnel đang chạy">↻ Khởi động lại Gateway</button>
           <button id="btn-server" class="btn btn-primary" disabled>Bật</button>
         </div>
         <p class="hint" id="server-detail"></p>

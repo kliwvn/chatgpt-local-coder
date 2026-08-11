@@ -38,6 +38,68 @@ export function isRuntimeArtifactStale(runtimeLoadedAt, artifactMtimeMs, toleran
   return artifactMs > loadedAtMs + tolerance;
 }
 
+async function newestMatchingMtime(root, suffixes, maxNodes = 20_000) {
+  let newestMtimeMs = 0;
+  let files = 0;
+  let nodes = 0;
+  const wanted = suffixes.map((suffix) => String(suffix).toLowerCase());
+  async function walk(dir) {
+    const handle = await fs.opendir(dir);
+    try {
+      for await (const entry of handle) {
+        nodes++;
+        if (nodes > maxNodes) throw new Error(`Runtime freshness scan exceeded ${maxNodes} nodes under ${root}`);
+        if (entry.isSymbolicLink()) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { await walk(full); continue; }
+        if (!entry.isFile()) continue;
+        const lower = entry.name.toLowerCase();
+        if (!wanted.some((suffix) => lower.endsWith(suffix))) continue;
+        const stat = await fs.stat(full);
+        files++;
+        newestMtimeMs = Math.max(newestMtimeMs, Number(stat.mtimeMs) || 0);
+      }
+    } finally {
+      await handle.close().catch((err) => { if (err?.code !== "ERR_DIR_CLOSED") throw err; });
+    }
+  }
+  try { await walk(root); } catch (err) { if (err?.code !== "ENOENT") throw err; }
+  return { newestMtimeMs, files };
+}
+
+export async function inspectRuntimeBuildFreshness({
+  sourceRoot,
+  artifactRoot,
+  sourceFiles = [],
+  toleranceMs = 1000,
+}) {
+  const source = await newestMatchingMtime(sourceRoot, [".ts"]);
+  const artifact = await newestMatchingMtime(artifactRoot, [".js"]);
+  let newestSourceMtimeMs = source.newestMtimeMs;
+  let sourceFileCount = source.files;
+  for (const file of sourceFiles) {
+    try {
+      const stat = await fs.stat(file);
+      if (!stat.isFile()) continue;
+      sourceFileCount++;
+      newestSourceMtimeMs = Math.max(newestSourceMtimeMs, Number(stat.mtimeMs) || 0);
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+  }
+  const tolerance = Number.isFinite(Number(toleranceMs)) ? Math.max(0, Number(toleranceMs)) : 1000;
+  const sourceNewerThanBuild =
+    newestSourceMtimeMs > 0 &&
+    (artifact.newestMtimeMs <= 0 || newestSourceMtimeMs > artifact.newestMtimeMs + tolerance);
+  return {
+    newestSourceMtimeMs,
+    newestArtifactMtimeMs: artifact.newestMtimeMs,
+    sourceFileCount,
+    artifactFileCount: artifact.files,
+    sourceNewerThanBuild,
+  };
+}
+
 /** Retry transient Windows filesystem sharing/permission failures, then surface the failure. */
 export async function retryTransientFsMutation(operation, { attempts = 3, baseDelayMs = 150 } = {}) {
   const retryable = new Set(["EBUSY", "EPERM", "EACCES"]);

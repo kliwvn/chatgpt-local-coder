@@ -9,6 +9,7 @@ import {
   enqueueKeyedMutation,
   extractSingleZipEntryBoundedWindows,
   isRuntimeArtifactStale,
+  inspectRuntimeBuildFreshness,
   pruneExpiredCache,
   readResponseTextBounded,
   readUtf8FileBounded,
@@ -25,6 +26,46 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   assert.equal(isRuntimeArtifactStale(loadedAt, Date.parse("2026-08-11T00:00:02.001Z")), true);
   assert.equal(isRuntimeArtifactStale("", Date.now()), true, "unknown live runtime age must fail closed as stale");
   assert.equal(isRuntimeArtifactStale(loadedAt, Number.NaN), false);
+}
+
+// Source-to-dist freshness must inspect the complete runtime tree, not only dist/index.js.
+{
+  const freshRoot = await fs.mkdtemp(path.join(os.tmpdir(), "clc-build-freshness-"));
+  const src = path.join(freshRoot, "src");
+  const dist = path.join(freshRoot, "dist");
+  try {
+    await fs.mkdir(path.join(src, "tools"), { recursive: true });
+    await fs.mkdir(path.join(dist, "tools"), { recursive: true });
+    const sourceFile = path.join(src, "tools", "writer.ts");
+    const entryFile = path.join(dist, "index.js");
+    const moduleFile = path.join(dist, "tools", "writer.js");
+    await fs.writeFile(sourceFile, "export const x = 1;\n");
+    await fs.writeFile(entryFile, "export {};\n");
+    await fs.writeFile(moduleFile, "export const x = 1;\n");
+
+    const base = Date.now() - 30_000;
+    await fs.utimes(sourceFile, new Date(base), new Date(base));
+    await fs.utimes(entryFile, new Date(base + 5_000), new Date(base + 5_000));
+    await fs.utimes(moduleFile, new Date(base + 6_000), new Date(base + 6_000));
+    let state = await inspectRuntimeBuildFreshness({ sourceRoot: src, artifactRoot: dist, toleranceMs: 0 });
+    assert.equal(state.sourceNewerThanBuild, false, "fresh dist was reported stale");
+
+    await fs.utimes(sourceFile, new Date(base + 10_000), new Date(base + 10_000));
+    state = await inspectRuntimeBuildFreshness({ sourceRoot: src, artifactRoot: dist, toleranceMs: 0 });
+    assert.equal(state.sourceNewerThanBuild, true, "source newer than dist was not detected");
+
+    await fs.utimes(sourceFile, new Date(base), new Date(base));
+    await fs.utimes(moduleFile, new Date(base + 20_000), new Date(base + 20_000));
+    state = await inspectRuntimeBuildFreshness({ sourceRoot: src, artifactRoot: dist, toleranceMs: 0 });
+    assert.equal(state.newestArtifactMtimeMs > Number((await fs.stat(entryFile)).mtimeMs), true, "non-entry dist module was ignored");
+    assert.equal(
+      isRuntimeArtifactStale(new Date(base + 10_000).toISOString(), state.newestArtifactMtimeMs, 0),
+      true,
+      "running process drift ignored a rebuilt non-entry module",
+    );
+  } finally {
+    await fs.rm(freshRoot, { recursive: true, force: true });
+  }
 }
 
 // Same-key work must serialize, and the queue must not retain settled keys.
