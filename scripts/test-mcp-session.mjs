@@ -222,6 +222,53 @@ await run("tools/list with valid session", async () => {
   }
 });
 
+await run("sessionless tool call is rejected and settles dispatch diagnostics", async () => {
+  const beforeRes = await fetch(`${BASE}/health`);
+  if (!beforeRes.ok) throw new Error(`health before HTTP ${beforeRes.status}`);
+  const before = await beforeRes.json();
+  const beforeStages = before.mcpDispatch?.stages;
+  if (!beforeStages?.MCP_REJECTED || !beforeStages?.MCP_IN_FLIGHT) {
+    throw new Error(`missing dispatch rejection diagnostics: ${JSON.stringify(before.mcpDispatch)}`);
+  }
+
+  const body = {
+    jsonrpc: "2.0",
+    id: 21,
+    method: "tools/call",
+    params: { name: "run_command", arguments: { command: "echo must-not-run-without-session" } },
+  };
+  const { status, json } = await mcpPost(
+    "/mcp",
+    body,
+    null,
+    { "mcp-protocol-version": "2025-03-26" }
+  );
+  if (status !== 400) throw new Error(`expected HTTP 400, got ${status}: ${JSON.stringify(json)}`);
+
+  const afterRes = await fetch(`${BASE}/health`);
+  if (!afterRes.ok) throw new Error(`health after HTTP ${afterRes.status}`);
+  const after = await afterRes.json();
+  const afterStages = after.mcpDispatch?.stages;
+  if (afterStages.MCP_REACHED.write_total !== beforeStages.MCP_REACHED.write_total + 1) {
+    throw new Error("sessionless write-like call did not increment MCP_REACHED.write_total exactly once");
+  }
+  if (afterStages.MCP_REJECTED.write_total !== beforeStages.MCP_REJECTED.write_total + 1) {
+    throw new Error("sessionless write-like call did not increment MCP_REJECTED.write_total exactly once");
+  }
+  if (afterStages.MCP_REJECTED.last_reason !== "MISSING_SESSION_ID") {
+    throw new Error(`unexpected rejection reason: ${afterStages.MCP_REJECTED.last_reason}`);
+  }
+  if (afterStages.MCP_REJECTED.last_write_reason !== "MISSING_SESSION_ID") {
+    throw new Error(`unexpected write rejection reason: ${afterStages.MCP_REJECTED.last_write_reason}`);
+  }
+  if (afterStages.MCP_REJECTED.reasons?.MISSING_SESSION_ID !== beforeStages.MCP_REJECTED.reasons?.MISSING_SESSION_ID + 1) {
+    throw new Error("sessionless call did not increment the MISSING_SESSION_ID reason counter exactly once");
+  }
+  if (afterStages.MCP_IN_FLIGHT.write_total !== beforeStages.MCP_IN_FLIGHT.write_total) {
+    throw new Error("sessionless rejected call leaked into MCP_IN_FLIGHT");
+  }
+});
+
 await run("stale session auto-recovery", async () => {
   const fakeId = "00000000-0000-4000-8000-000000000099";
   const { status, json } = await mcpPost(

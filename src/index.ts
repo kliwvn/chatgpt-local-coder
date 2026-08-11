@@ -32,7 +32,13 @@ import { getChatGptToolProfile } from "./lib/tool-profile.js";
 import { envIntegerOrThrow } from "./lib/env-utils.js";
 import { getManagedProcessStats, shutdownManagedProcesses } from "./tools/shell.js";
 import { ensureShellBootstrap, flushShellPersistence } from "./lib/persistent-shell.js";
-import { getMcpDispatchDiagnostics, recordMcpExecuted, recordMcpReached } from "./lib/mcp-dispatch-diagnostics.js";
+import {
+  getMcpDispatchDiagnostics,
+  recordMcpExecuted,
+  recordMcpReached,
+  recordMcpRejected,
+  type McpRejectReason,
+} from "./lib/mcp-dispatch-diagnostics.js";
 
 const PORT = envIntegerOrThrow("PORT", 3000, 1, 65_535);
 const ADMIN_PORT = envIntegerOrThrow("ADMIN_PORT", 3001, 1, 65_535);
@@ -237,6 +243,18 @@ app.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => {
 });
 
 async function handleMcpPost(req: express.Request, res: express.Response): Promise<void> {
+  let dispatchTool: string | null = null;
+  let dispatchSettled = false;
+  const markExecuted = () => {
+    if (!dispatchTool || dispatchSettled) return;
+    dispatchSettled = true;
+    recordMcpExecuted(dispatchTool);
+  };
+  const markRejected = (reason: McpRejectReason) => {
+    if (!dispatchTool || dispatchSettled) return;
+    dispatchSettled = true;
+    recordMcpRejected(dispatchTool, reason);
+  };
   try {
     // SEP-2575: server/discover (stateless discovery) — trả JSON-RPC error 200
     // để SDK client fallback về initialize ngay (tránh HTTP 400 → retry → tunnel-client probe timeout)
@@ -249,9 +267,12 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
       });
       return;
     }
-    const dispatchTool = recordMcpReached(req.body);
+    dispatchTool = recordMcpReached(req.body);
     const sessionId = validatedSessionId(req, res);
-    if (sessionId === null) return;
+    if (sessionId === null) {
+      markRejected("INVALID_SESSION_ID");
+      return;
+    }
     const requestId = extractRequestId(req.body);
 
     const existing = sessionId ? sessionManager.get(sessionId) : undefined;
@@ -271,7 +292,7 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
         return;
       }
       await sessionManager.handleExisting(existing, req, res, req.body);
-      recordMcpExecuted(dispatchTool);
+      markExecuted();
       return;
     }
 
@@ -291,19 +312,22 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
         req.body
       );
       if (recovered) {
-        recordMcpExecuted(dispatchTool);
+        markExecuted();
         return;
       }
+      markRejected("STALE_SESSION_REBUILD_FAILED");
       sessionManager.sendSessionNotFound(res, requestId);
       return;
     }
 
+    markRejected("MISSING_SESSION_ID");
     sessionManager.sendBadRequest(
       res,
       "Bad Request: Mcp-Session-Id header is required",
       requestId
     );
   } catch (error) {
+    markRejected("HANDLER_ERROR");
     // Capacity admission fail → HTTP 429 (deliberate, bounded) thay vì 500:
     // client biết là over-cap (retry sau) chứ không phải lỗi server.
     if (error instanceof SessionCapacityError) {

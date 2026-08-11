@@ -15,6 +15,7 @@ import {
   getMcpDispatchDiagnostics,
   recordMcpExecuted,
   recordMcpReached,
+  recordMcpRejected,
 } from "../dist/lib/mcp-dispatch-diagnostics.js";
 
 const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
@@ -141,17 +142,37 @@ try {
   const before = getMcpDispatchDiagnostics();
   const beforeReached = before.stages.MCP_REACHED.write_total;
   const beforeExecuted = before.stages.MCP_EXECUTED.write_total;
+  const beforeRejected = before.stages.MCP_REJECTED.write_total;
+  const beforeInFlight = before.stages.MCP_IN_FLIGHT.write_total;
   const tool = recordMcpReached({ method: "tools/call", params: { name: "write_file" } });
   assert.equal(tool, "write_file");
   let diag = getMcpDispatchDiagnostics();
   assert.equal(diag.stages.MCP_REACHED.write_total, beforeReached + 1);
   assert.equal(diag.stages.MCP_EXECUTED.write_total, beforeExecuted);
+  assert.equal(diag.stages.MCP_REJECTED.write_total, beforeRejected);
+  assert.equal(diag.stages.MCP_IN_FLIGHT.write_total, beforeInFlight + 1);
   assert.match(diag.interpretation, /HOST_NOT_INVOKED/);
   recordMcpExecuted(tool);
   diag = getMcpDispatchDiagnostics();
   assert.equal(diag.stages.MCP_EXECUTED.write_total, beforeExecuted + 1);
+  assert.equal(diag.stages.MCP_IN_FLIGHT.write_total, beforeInFlight);
 
-  console.log(`chatgpt-action-contract: ok (${Object.keys(expected).length} critical actions locked; apply_patch removal blocked; dispatch stages observable)`);
+  const rejectedTool = recordMcpReached({ method: "tools/call", params: { name: "write_file" } });
+  recordMcpRejected(rejectedTool, "MISSING_SESSION_ID");
+  diag = getMcpDispatchDiagnostics();
+  assert.equal(diag.stages.MCP_REACHED.write_total, beforeReached + 2);
+  assert.equal(diag.stages.MCP_REJECTED.write_total, beforeRejected + 1);
+  assert.equal(diag.stages.MCP_REJECTED.last_reason, "MISSING_SESSION_ID");
+  assert.equal(diag.stages.MCP_REJECTED.last_write_reason, "MISSING_SESSION_ID");
+  assert.ok(diag.stages.MCP_REJECTED.reasons.MISSING_SESSION_ID >= 1);
+  assert.equal(diag.stages.MCP_IN_FLIGHT.write_total, beforeInFlight);
+  assert.equal(
+    diag.stages.MCP_REACHED.write_total,
+    diag.stages.MCP_EXECUTED.write_total + diag.stages.MCP_REJECTED.write_total + diag.stages.MCP_IN_FLIGHT.write_total,
+    "write dispatch stages must conserve reached requests"
+  );
+
+  console.log(`chatgpt-action-contract: ok (${Object.keys(expected).length} critical actions locked; apply_patch removal blocked; dispatch terminal states conserved)`);
 } finally {
   await client?.close().catch(() => undefined);
   await server?.close().catch(() => undefined);
