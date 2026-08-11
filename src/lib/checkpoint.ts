@@ -50,6 +50,7 @@ const DEFAULT_MAX_NODES = 10_000;
 const MAX_DIRECTORY_DEPTH = 32;
 const CHECKPOINT_INDEX_MAX_BYTES = 32 * 1024 * 1024;
 const CHECKPOINT_MANIFEST_MAX_BYTES = 64 * 1024 * 1024;
+const CHECKPOINT_ID_PATTERN = /^cp_[0-9a-f]{12}$/;
 
 let checkpointMutationChain: Promise<void> = Promise.resolve();
 
@@ -92,8 +93,33 @@ function getMaxNodes(): number {
   return envBoundedInteger("CHECKPOINT_MAX_NODES", DEFAULT_MAX_NODES, 100, 100_000);
 }
 
+function normalizeFsPath(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function sameFsPath(left: string, right: string): boolean {
+  return normalizeFsPath(left) === normalizeFsPath(right);
+}
+
+function assertCheckpointId(id: string): void {
+  if (!CHECKPOINT_ID_PATTERN.test(id)) {
+    throw new Error(`CHECKPOINT_CORRUPT_ID: invalid checkpoint id ${JSON.stringify(id)}`);
+  }
+}
+
+function checkpointDataRoot(): string {
+  return path.resolve(getStoreRoot(), "data");
+}
+
 function checkpointDir(id: string): string {
-  return path.join(getStoreRoot(), "data", id);
+  assertCheckpointId(id);
+  const dataRoot = checkpointDataRoot();
+  const dir = path.resolve(dataRoot, id);
+  if (!sameFsPath(path.dirname(dir), dataRoot)) {
+    throw new Error(`CHECKPOINT_CORRUPT_ID: checkpoint directory escaped owned data root: ${JSON.stringify(id)}`);
+  }
+  return dir;
 }
 
 function indexPath(): string {
@@ -118,12 +144,88 @@ async function readIndex(): Promise<CheckpointIndex> {
     const raw = await readUtf8FileBounded(indexPath(), CHECKPOINT_INDEX_MAX_BYTES, "checkpoint index");
     const parsed = JSON.parse(raw) as CheckpointIndex;
     if (parsed.version === INDEX_VERSION && Array.isArray(parsed.checkpoints)) {
+      for (const checkpoint of parsed.checkpoints) assertCheckpointSummary(checkpoint);
       return parsed;
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
   return { version: INDEX_VERSION, checkpoints: [] };
+}
+
+function assertCheckpointSummary(summary: CheckpointSummary): void {
+  if (!summary || typeof summary !== "object") throw new Error("CHECKPOINT_CORRUPT_INDEX: invalid checkpoint summary");
+  assertCheckpointId(summary.id);
+  if (
+    typeof summary.created_at !== "string" ||
+    typeof summary.tool !== "string" ||
+    typeof summary.summary !== "string" ||
+    !Array.isArray(summary.files) ||
+    !summary.files.every((filePath) => typeof filePath === "string" && path.isAbsolute(filePath)) ||
+    !Number.isInteger(summary.file_count) ||
+    summary.file_count !== summary.files.length
+  ) {
+    throw new Error(`CHECKPOINT_CORRUPT_INDEX: malformed summary for ${summary.id}`);
+  }
+}
+
+function assertSnapshotTree(snapshot: CheckpointFileSnapshot, expectedPath: string, parentPath?: string): void {
+  if (!snapshot || typeof snapshot !== "object" || typeof snapshot.path !== "string" || !path.isAbsolute(snapshot.path)) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: invalid snapshot path for ${expectedPath}`);
+  }
+  if (!sameFsPath(snapshot.path, expectedPath)) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: snapshot path does not match index/parent: ${snapshot.path}`);
+  }
+  if (parentPath && !sameFsPath(path.dirname(path.resolve(snapshot.path)), path.resolve(parentPath))) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: snapshot escaped parent directory: ${snapshot.path}`);
+  }
+  if (
+    typeof snapshot.existed !== "boolean" ||
+    (snapshot.is_directory !== undefined && typeof snapshot.is_directory !== "boolean") ||
+    (snapshot.skipped !== undefined && typeof snapshot.skipped !== "boolean") ||
+    (snapshot.skip_reason !== undefined && typeof snapshot.skip_reason !== "string") ||
+    (snapshot.encoding !== undefined && snapshot.encoding !== "utf-8" && snapshot.encoding !== "base64") ||
+    (snapshot.content !== undefined && typeof snapshot.content !== "string")
+  ) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: malformed snapshot fields: ${snapshot.path}`);
+  }
+  if (!snapshot.existed && (snapshot.is_directory || snapshot.content !== undefined || snapshot.children !== undefined)) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: nonexistent snapshot carries restorable payload: ${snapshot.path}`);
+  }
+  if (snapshot.skipped && typeof snapshot.skip_reason !== "string") {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: skipped snapshot missing reason: ${snapshot.path}`);
+  }
+  if (snapshot.is_directory) {
+    if (!Array.isArray(snapshot.children)) {
+      throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: directory snapshot missing children: ${snapshot.path}`);
+    }
+    for (const child of snapshot.children) {
+      assertSnapshotTree(child, child.path, snapshot.path);
+    }
+  } else if (snapshot.children && snapshot.children.length > 0) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: file snapshot has children: ${snapshot.path}`);
+  } else if (snapshot.existed && !snapshot.skipped && (snapshot.encoding === undefined || snapshot.content === undefined)) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: file snapshot missing content/encoding: ${snapshot.path}`);
+  }
+}
+
+function assertManifestMatchesSummary(manifest: CheckpointManifest, summary: CheckpointSummary): void {
+  if (!manifest || typeof manifest !== "object" || manifest.version !== INDEX_VERSION || !Array.isArray(manifest.files)) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: malformed manifest for ${summary.id}`);
+  }
+  if (
+    manifest.id !== summary.id ||
+    manifest.created_at !== summary.created_at ||
+    manifest.tool !== summary.tool ||
+    manifest.summary !== summary.summary ||
+    manifest.files.length !== summary.file_count
+  ) {
+    throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: manifest/index metadata mismatch for ${summary.id}`);
+  }
+  for (let index = 0; index < manifest.files.length; index++) {
+    const indexedPath = summary.files[index];
+    assertSnapshotTree(manifest.files[index], indexedPath);
+  }
 }
 
 async function writeIndex(index: CheckpointIndex): Promise<void> {
@@ -184,7 +286,10 @@ function reserveSnapshotNode(
 async function snapshotFile(filePath: string, budget: SnapshotBudget): Promise<CheckpointFileSnapshot> {
   const resolved = path.resolve(filePath);
   try {
-    const stat = await fs.stat(resolved);
+    const stat = await fs.lstat(resolved);
+    if (stat.isSymbolicLink()) {
+      return skippedSnapshot(resolved, "checkpoint refuses symlink/junction/reparse alias");
+    }
     if (stat.isDirectory()) {
       return snapshotDirectory(resolved, 0, budget);
     }
@@ -232,6 +337,14 @@ async function snapshotDirectory(
   depth: number,
   budget: SnapshotBudget
 ): Promise<CheckpointFileSnapshot> {
+  const dirStat = await fs.lstat(dirPath);
+  if (dirStat.isSymbolicLink()) {
+    return skippedSnapshot(dirPath, "checkpoint refuses symlink/junction/reparse alias", true);
+  }
+  const realDir = path.resolve(await fs.realpath(dirPath));
+  if (!sameFsPath(realDir, dirPath)) {
+    return skippedSnapshot(dirPath, `checkpoint directory resolves through alias/reparse boundary: ${realDir}`, true);
+  }
   const nodeLimit = reserveSnapshotNode(dirPath, budget, true);
   if (nodeLimit) return nodeLimit;
   if (depth > MAX_DIRECTORY_DEPTH) {
@@ -243,8 +356,15 @@ async function snapshotDirectory(
   let incompleteReason: string | undefined;
   try {
     for await (const entry of handle) {
-      if (entry.isSymbolicLink()) continue;
       const full = path.join(dirPath, entry.name);
+      if (entry.isSymbolicLink()) {
+        const child = skippedSnapshot(full, "directory snapshot contains symlink/junction/reparse alias");
+        children.push(child);
+        if (!incompleteReason) {
+          incompleteReason = `directory snapshot incomplete: ${child.path}: ${child.skip_reason}`;
+        }
+        continue;
+      }
       let child: CheckpointFileSnapshot | null = null;
       if (entry.isDirectory()) child = await snapshotDirectory(full, depth + 1, budget);
       else if (entry.isFile()) child = await snapshotFile(full, budget);
@@ -279,6 +399,11 @@ async function snapshotDirectory(
 async function restoreSnapshot(snapshot: CheckpointFileSnapshot): Promise<void> {
   const target = snapshot.path;
 
+  // Recheck immediately before each mutation as well as during the global
+  // preflight. This narrows the window in which a restore parent could be
+  // replaced by a symlink/junction after preflight.
+  await assertRestoreSnapshotIdentity(snapshot);
+
   if (!snapshot.existed) {
     try {
       await fs.lstat(target);
@@ -307,6 +432,35 @@ async function restoreSnapshot(snapshot: CheckpointFileSnapshot): Promise<void> 
       ? Buffer.from(snapshot.content || "", "base64")
       : Buffer.from(snapshot.content || "", "utf-8");
   await atomicWriteFile(target, buffer);
+}
+
+async function canonicalizeRestoreTarget(target: string): Promise<string> {
+  let cursor = path.resolve(target);
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      const real = await fs.realpath(cursor);
+      return path.resolve(real, ...missingSegments);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) throw err;
+      missingSegments.unshift(path.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+async function assertRestoreSnapshotIdentity(snapshot: CheckpointFileSnapshot): Promise<void> {
+  const expected = path.resolve(snapshot.path);
+  const canonical = await canonicalizeRestoreTarget(expected);
+  if (!sameFsPath(expected, canonical)) {
+    throw new Error(
+      `CHECKPOINT_RESTORE_ALIAS_CHANGED: refusing restore because target now resolves through a symlink/junction/reparse alias: ${snapshot.path} -> ${canonical}`
+    );
+  }
+  for (const child of snapshot.children || []) await assertRestoreSnapshotIdentity(child);
 }
 
 async function removeCheckpointData(id: string): Promise<void> {
@@ -484,8 +638,10 @@ async function collectRestorePlan(targetId: string): Promise<{
   const skipped: CheckpointFileSnapshot[] = [];
 
   for (let i = 0; i < affected.length; i++) {
-    const manifest = await readManifest(affected[i].id);
-    if (!manifest) continue;
+    const summary = affected[i];
+    const manifest = await readManifest(summary.id);
+    if (!manifest) throw new Error(`CHECKPOINT_CORRUPT_MANIFEST: missing manifest for ${summary.id}`);
+    assertManifestMatchesSummary(manifest, summary);
     for (const snapshot of manifest.files) {
       if (!files.has(snapshot.path)) {
         files.set(snapshot.path, snapshot);
@@ -586,6 +742,13 @@ async function restoreToCheckpointUnlocked(targetId: string, plan?: RestorePlan)
   const restored: string[] = [];
   const deleted: string[] = [];
   const skipped: Array<{ path: string; reason?: string }> = [];
+
+  // Re-resolve every persisted target before the first mutation. A parent path
+  // may have been replaced by a junction/symlink/reparse alias after checkpoint
+  // creation; restoring through that alias could write or delete elsewhere.
+  for (const snapshot of files.values()) {
+    if (!snapshot.skipped) await assertRestoreSnapshotIdentity(snapshot);
+  }
 
   // Apply in reverse path order so nested directory restores stay consistent.
   const ordered = [...files.entries()].sort((a, b) => b[0].length - a[0].length);

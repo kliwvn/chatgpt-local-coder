@@ -80,6 +80,17 @@ function sameOrDescendant(candidate: string, parent: string): boolean {
   return rel !== "" && rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
+function canonicalHarnessTargets(): string[] {
+  const home = path.resolve(os.homedir());
+  return [
+    path.join(home, ".codex"),
+    path.join(home, ".codex", "AGENTS.md"),
+    path.join(home, ".agents"),
+    path.join(home, ".agents", "skills", "cross-project-delivery"),
+    path.join(home, ".agents", "retired", "global-harness-history"),
+  ];
+}
+
 function resolveRequestedPath(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) throw new Error("SAFE_DELETE_PROTECTED_TARGET: empty path");
@@ -139,6 +150,14 @@ async function assertSafeDeleteTarget(requestedPath: string, canonicalTarget?: s
     throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing user home/home-container root: ${canonical}`);
   }
 
+  for (const harnessTarget of canonicalHarnessTargets()) {
+    // Protect the canonical harness target itself and any broader target that
+    // would recursively encompass it (for example ~/.agents/skills).
+    if (samePath(canonical, harnessTarget) || sameOrDescendant(harnessTarget, canonical)) {
+      throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing canonical harness root/ancestor: ${canonical}`);
+    }
+  }
+
   const repoRoot = await findRepoRoot(requestedStat.isDirectory() ? canonical : path.dirname(canonical));
   const gitMetadataRoot = repoRoot ? path.join(repoRoot, ".git") : null;
   if (repoRoot && (samePath(canonical, repoRoot) || (gitMetadataRoot && sameOrDescendant(canonical, gitMetadataRoot)))) {
@@ -171,6 +190,10 @@ export async function safeDelete(requestedPath: string, canonicalTarget?: string
   if (process.platform !== "win32") {
     throw new Error("SAFE_DELETE_UNSUPPORTED: permanent deletion is disabled and Recycle Bin integration is currently implemented only on Windows");
   }
+  // Narrow the alias-swap window by revalidating immediately before invoking
+  // the OS recycle operation. The operation remains path-based, so this is an
+  // application guard rather than a filesystem transaction/OS sandbox.
+  await assertSafeDeleteTarget(target, target);
   await recycleWindows(target);
   try {
     await fsp.lstat(target);

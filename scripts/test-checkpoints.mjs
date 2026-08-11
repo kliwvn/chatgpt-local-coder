@@ -40,6 +40,17 @@ async function run(name, fn) {
   }
 }
 
+async function expectReject(fn, pattern, label) {
+  let rejected = false;
+  try {
+    await fn();
+  } catch (err) {
+    rejected = pattern.test(String(err?.message || err));
+    if (!rejected) throw err;
+  }
+  if (!rejected) throw new Error(`${label} did not fail closed`);
+}
+
 await fs.rm(tmpDir, { recursive: true, force: true });
 await fs.mkdir(tmpDir, { recursive: true });
 await clearCheckpoints();
@@ -112,6 +123,102 @@ await run("restores move by snapshotting source and destination", async () => {
   if (destText !== "old-dest\n") throw new Error(`dest: ${destText}`);
 });
 
+await run("rejects persisted checkpoint ids that can escape the owned data root", async () => {
+  await clearCheckpoints();
+  const sentinel = path.join(tmpDir, "checkpoint-id-sentinel.txt");
+  await fs.writeFile(sentinel, "must-survive\n", "utf8");
+  const corruptIndex = {
+    version: 1,
+    checkpoints: [{
+      id: "../../checkpoint-id-sentinel.txt",
+      created_at: new Date(0).toISOString(),
+      tool: "write_file",
+      summary: "corrupt-id",
+      files: [sentinel],
+      file_count: 1,
+    }],
+  };
+  await fs.writeFile(path.join(storeDir, "index.json"), JSON.stringify(corruptIndex, null, 2), "utf8");
+  await expectReject(() => clearCheckpoints(), /CHECKPOINT_CORRUPT_ID/i, "corrupt checkpoint id");
+  if ((await fs.readFile(sentinel, "utf8")) !== "must-survive\n") throw new Error("corrupt id touched sentinel");
+  await fs.writeFile(path.join(storeDir, "index.json"), JSON.stringify({ version: 1, checkpoints: [] }, null, 2), "utf8");
+});
+
+await run("binds manifest top-level paths to the persisted index summary", async () => {
+  await clearCheckpoints();
+  const file = path.join(tmpDir, "manifest-bound.txt");
+  const victim = path.join(tmpDir, "manifest-victim.txt");
+  await fs.writeFile(file, "before\n", "utf8");
+  await fs.writeFile(victim, "victim\n", "utf8");
+  const id = await checkpointBefore("write_file", [file]);
+  const manifestFile = path.join(storeDir, "data", id, "manifest.json");
+  const original = await fs.readFile(manifestFile, "utf8");
+  const manifest = JSON.parse(original);
+  manifest.files[0].path = victim;
+  await fs.writeFile(manifestFile, JSON.stringify(manifest, null, 2), "utf8");
+  await expectReject(() => previewRestore(id), /CHECKPOINT_CORRUPT_MANIFEST.*(?:index|path)/i, "manifest/index path mismatch");
+  if ((await fs.readFile(victim, "utf8")) !== "victim\n") throw new Error("corrupt manifest touched victim");
+  await fs.writeFile(manifestFile, original, "utf8");
+  await clearCheckpoints();
+});
+
+await run("rejects malformed snapshot semantics before rewind mutation", async () => {
+  await clearCheckpoints();
+  const file = path.join(tmpDir, "manifest-semantics.txt");
+  await fs.writeFile(file, "before\n", "utf8");
+  const id = await checkpointBefore("write_file", [file]);
+  const manifestFile = path.join(storeDir, "data", id, "manifest.json");
+  const original = await fs.readFile(manifestFile, "utf8");
+  const manifest = JSON.parse(original);
+  manifest.files[0].existed = "yes";
+  await fs.writeFile(manifestFile, JSON.stringify(manifest, null, 2), "utf8");
+  await expectReject(() => previewRestore(id), /CHECKPOINT_CORRUPT_MANIFEST.*malformed snapshot fields/i, "malformed snapshot semantics");
+  if ((await fs.readFile(file, "utf8")) !== "before\n") throw new Error("malformed manifest mutated live file");
+  await fs.writeFile(manifestFile, original, "utf8");
+  await clearCheckpoints();
+});
+
+await run("rejects nested snapshot paths that escape their persisted parent", async () => {
+  await clearCheckpoints();
+  const dir = path.join(tmpDir, "manifest-tree");
+  const child = path.join(dir, "child.txt");
+  const victim = path.join(tmpDir, "nested-victim.txt");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(child, "child\n", "utf8");
+  await fs.writeFile(victim, "victim\n", "utf8");
+  const id = await checkpointBefore("delete_directory", [dir]);
+  const manifestFile = path.join(storeDir, "data", id, "manifest.json");
+  const original = await fs.readFile(manifestFile, "utf8");
+  const manifest = JSON.parse(original);
+  manifest.files[0].children[0].path = victim;
+  await fs.writeFile(manifestFile, JSON.stringify(manifest, null, 2), "utf8");
+  await expectReject(() => previewRestore(id), /CHECKPOINT_CORRUPT_MANIFEST.*parent/i, "nested manifest path escape");
+  if ((await fs.readFile(victim, "utf8")) !== "victim\n") throw new Error("nested corrupt manifest touched victim");
+  await fs.writeFile(manifestFile, original, "utf8");
+  await clearCheckpoints();
+});
+
+await run("refuses rewind when a restore parent becomes a symlink or junction alias", async () => {
+  await clearCheckpoints();
+  const originalParent = path.join(tmpDir, "restore-parent");
+  const redirectedParent = path.join(tmpDir, "restore-redirected");
+  const file = path.join(originalParent, "item.txt");
+  const redirectedFile = path.join(redirectedParent, "item.txt");
+  await fs.mkdir(originalParent, { recursive: true });
+  await fs.mkdir(redirectedParent, { recursive: true });
+  await fs.writeFile(file, "checkpoint-value\n", "utf8");
+  await fs.writeFile(redirectedFile, "redirected-must-survive\n", "utf8");
+  const id = await checkpointBefore("write_file", [file]);
+  await fs.rm(originalParent, { recursive: true, force: true });
+  await fs.symlink(redirectedParent, originalParent, process.platform === "win32" ? "junction" : "dir");
+  await expectReject(() => restoreToCheckpoint(id), /CHECKPOINT_RESTORE_ALIAS_CHANGED/i, "restore alias change");
+  if ((await fs.readFile(redirectedFile, "utf8")) !== "redirected-must-survive\n") {
+    throw new Error("rewind followed alias and mutated redirected target");
+  }
+  await fs.rm(originalParent, { recursive: true, force: true });
+  await clearCheckpoints();
+});
+
 await run("directory checkpoint propagates oversized child as incomplete", async () => {
   await clearCheckpoints();
   process.env.CHECKPOINT_MAX_FILE_BYTES = "1024";
@@ -127,6 +234,27 @@ await run("directory checkpoint propagates oversized child as incomplete", async
   if (top?.action !== "skip") throw new Error(`incomplete directory was not skipped: ${JSON.stringify(plan)}`);
   if (!/directory snapshot incomplete/i.test(top.reason || "")) throw new Error(`missing incomplete reason: ${top.reason}`);
   if (!/CHECKPOINT_MAX_FILE_BYTES/i.test(top.reason || "")) throw new Error(`missing per-file cap reason: ${top.reason}`);
+});
+
+await run("directory checkpoint treats symlink child as incomplete", async () => {
+  await clearCheckpoints();
+  process.env.CHECKPOINT_MAX_FILE_BYTES = "65536";
+  process.env.CHECKPOINT_MAX_TOTAL_BYTES = "65536";
+  process.env.CHECKPOINT_MAX_NODES = "1000";
+  const dir = path.join(tmpDir, "symlink-child-dir");
+  const outside = path.join(tmpDir, "symlink-child-target");
+  const outsideFile = path.join(outside, "must-survive.txt");
+  const alias = path.join(dir, "alias-dir");
+  await fs.mkdir(dir, { recursive: true });
+  await fs.mkdir(outside, { recursive: true });
+  await fs.writeFile(outsideFile, "outside\n", "utf8");
+  await fs.symlink(outside, alias, process.platform === "win32" ? "junction" : "dir");
+  await expectReject(
+    () => checkpointBefore("delete_directory", [dir], { require_complete: true }),
+    /CHECKPOINT_INCOMPLETE.*symlink\/junction\/reparse alias/i,
+    "directory symlink child checkpoint"
+  );
+  if ((await fs.readFile(outsideFile, "utf8")) !== "outside\n") throw new Error("symlink checkpoint touched target");
 });
 
 await run("directory checkpoint enforces aggregate byte budget", async () => {
