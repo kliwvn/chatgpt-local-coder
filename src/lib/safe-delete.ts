@@ -91,6 +91,18 @@ function canonicalHarnessTargets(): string[] {
   ];
 }
 
+function assertNotCanonicalHarness(candidate: string): void {
+  for (const harnessTarget of canonicalHarnessTargets()) {
+    // Protect the canonical harness target itself and any broader target that
+    // would recursively encompass it (for example ~/.agents/skills). Checked
+    // on the resolved string BEFORE stat so protected zones stay fail-closed
+    // even when the target does not exist yet.
+    if (samePath(candidate, harnessTarget) || sameOrDescendant(harnessTarget, candidate)) {
+      throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing canonical harness root/ancestor: ${candidate}`);
+    }
+  }
+}
+
 function resolveRequestedPath(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) throw new Error("SAFE_DELETE_PROTECTED_TARGET: empty path");
@@ -118,7 +130,18 @@ async function findRepoRoot(start: string): Promise<string | null> {
 
 async function assertSafeDeleteTarget(requestedPath: string, canonicalTarget?: string): Promise<string> {
   const requested = resolveRequestedPath(requestedPath);
-  const requestedStat = await fsp.lstat(requested);
+  let requestedStat;
+  try {
+    requestedStat = await fsp.lstat(requested);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    // Fail closed for protected zones even when the target does not exist yet:
+    // a delete request naming a canonical harness path must never be silently
+    // retargeted later (e.g. by ancestor cleanup). Outside the zones the
+    // original ENOENT propagates unchanged.
+    assertNotCanonicalHarness(requested);
+    throw err;
+  }
   if (requestedStat.isSymbolicLink()) {
     throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing symlink/junction/reparse alias: ${requested}`);
   }
@@ -150,13 +173,7 @@ async function assertSafeDeleteTarget(requestedPath: string, canonicalTarget?: s
     throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing user home/home-container root: ${canonical}`);
   }
 
-  for (const harnessTarget of canonicalHarnessTargets()) {
-    // Protect the canonical harness target itself and any broader target that
-    // would recursively encompass it (for example ~/.agents/skills).
-    if (samePath(canonical, harnessTarget) || sameOrDescendant(harnessTarget, canonical)) {
-      throw new Error(`SAFE_DELETE_PROTECTED_TARGET: refusing canonical harness root/ancestor: ${canonical}`);
-    }
-  }
+  assertNotCanonicalHarness(canonical);
 
   const repoRoot = await findRepoRoot(requestedStat.isDirectory() ? canonical : path.dirname(canonical));
   const gitMetadataRoot = repoRoot ? path.join(repoRoot, ".git") : null;
