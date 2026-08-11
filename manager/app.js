@@ -111,6 +111,9 @@ function renderServerTunnel(s) {
   const installed = s.installed.dist && s.installed.nodeModules;
   $("install-status").textContent = installed ? "Trạng thái: Đã cài đặt OK" : "Trạng thái: Chưa cài đặt";
   setDot("install-dot", installed, null);
+  if (s.workspaceMissing) {
+    $("install-status").textContent = "⚠ WORKSPACE_PATH không tồn tại trên máy này — sửa trong Cấu hình (path từ máy cũ sau khi copy)";
+  }
   $("btn-install").disabled = busy;
 
   // server
@@ -311,14 +314,18 @@ async function loadInstances(initial) {
         const artifactDrift = Boolean(i.server.artifactDrift);
         const buildDrift = Boolean(i.server.buildDrift);
         const stateTxt = srv
-          ? `<span class="status-dot ${artifactDrift || buildDrift ? "bad" : "ok"}"></span>${buildDrift ? "Source chưa build" : artifactDrift ? "Server cần restart" : "Server chạy"} <span class="status-dot ok"></span>Tunnel ${tun ? "chạy" : "dừng"}`
+          ? `<span class="status-dot ${artifactDrift || buildDrift ? "bad" : "ok"}"></span>${buildDrift ? "Source chưa build" : artifactDrift ? "Server cần restart" : "Server chạy"} <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`
           : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`;
+        const wsWarn = i.workspaceMissing
+          ? `<div class="inst-warn" title="${esc(i.env.WORKSPACE_PATH || "")}">⚠ WORKSPACE_PATH không tồn tại trên máy này — sửa trong Cấu hình</div>`
+          : "";
         return (
           `<li class="inst-item${active}" data-name="${esc(i.name)}">` +
           `<div class="inst-main">` +
           `<div class="inst-top"><span class="inst-name mono">${esc(i.name)}</span><span class="inst-state">${stateTxt}</span></div>` +
           `<span class="inst-ws" title="${esc(ws)}">${esc(ws)}</span>` +
           extraHtml +
+          wsWarn +
           `<span class="inst-access">FULL_DISK_ACCESS: ${access}</span>` +
           `<span class="inst-meta">MCP ${esc(String(port))} · Admin ${esc(String(adminPort))} · pid ${esc(String(i.server.pid || "—"))}${srv && i.server.health ? ` · ${i.server.health.activeSessions ?? 0} đăng ký${i.server.health.connectedSessions != null ? ` · ${i.server.health.connectedSessions} kết nối` : ""}` : ""}</span>` +
           `</div>` +

@@ -117,6 +117,13 @@
             <p class="hint">Thư mục project ChatGPT được phép thao tác mặc định (đọc CLAUDE.md / AGENTS.md như Claude Code).</p>
           </div>
           <div class="field">
+            <label for="f-extra-ws">EXTRA_WORKSPACE_PATHS</label>
+            <div class="inline">
+              <input id="f-extra-ws" class="input grow mono" placeholder="D:\Coding\other-repo;E:\Data" spellcheck="false" />
+            </div>
+            <p class="hint">Workspace bổ sung được phép truy cập (phân cách bằng ;).</p>
+          </div>
+          <div class="field">
             <label for="f-full-disk">FULL_DISK_ACCESS</label>
             <select id="f-full-disk" class="input">
               <option value="false">false — path sandbox (workspace roots, mặc định)</option>
@@ -133,13 +140,6 @@
             <label for="f-mem-lines">PROJECT_MEMORY_MAX_LINES</label>
             <input id="f-mem-lines" class="input mono" inputmode="numeric" placeholder="200" />
             <p class="hint">Giới hạn số dòng. Trống = mặc định 200; 0 = không giới hạn.</p>
-          </div>
-          <div class="field">
-            <label for="f-extra-ws">EXTRA_WORKSPACE_PATHS</label>
-            <div class="inline">
-              <input id="f-extra-ws" class="input grow mono" placeholder="D:\Coding\other-repo;E:\Data" spellcheck="false" />
-            </div>
-            <p class="hint">Workspace bổ sung được phép truy cập (phân cách bằng ;).</p>
           </div>
           <div class="field">
             <label for="f-profile">CHATGPT_TOOL_PROFILE</label>

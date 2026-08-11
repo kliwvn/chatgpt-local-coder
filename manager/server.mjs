@@ -80,6 +80,7 @@ const IS_WIN = process.platform === "win32";
 const REPO_ROOT = ROOT; // thư mục repo (manager.bat nằm ở đây)
 const MANAGER_BAT = path.join(ROOT, "manager.bat");
 const MANAGER_HIDDEN_VBS = path.join(STATE_DIR, "manager-hidden.vbs");
+const MANAGER_HIDDEN_PS1 = path.join(STATE_DIR, "manager-hidden.ps1");
 const STARTUP_LNK = IS_WIN
   ? path.join(
       process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"),
@@ -384,33 +385,6 @@ function spawnDetached(cmd, args, logFile, extraEnv = null) {
   return child.pid;
 }
 
-let hiddenLaunchSeq = 0;
-function spawnHiddenDetached(cmd, args, logFile, extraEnv = null) {
-  const q = (value) => `"${String(value).replace(/"/g, '""')}"`;
-  const token = `${process.pid}-${Date.now().toString(36)}-${(++hiddenLaunchSeq).toString(36)}`;
-  const batPath = path.join(STATE_DIR, `spawn-hidden-${token}.cmd`);
-  const vbsPath = path.join(STATE_DIR, `spawn-hidden-${token}.vbs`);
-  const bat = `@echo off\r\ncd /d ${q(STATE_DIR)}\r\n${q(cmd)} ${args.map(q).join(" ")} >> ${q(logFile)} 2>&1\r\n`;
-  const vbs = [
-    'Set sh = CreateObject("WScript.Shell")',
-    "q = Chr(34)",
-    `sh.Run "cmd.exe /c " & q & "${batPath}" & q, 0, False`,
-  ].join("\r\n");
-  fs.writeFileSync(batPath, bat, "utf-8");
-  fs.writeFileSync(vbsPath, vbs, "utf-8");
-  const child = spawn("wscript.exe", [vbsPath], {
-    windowsHide: true,
-    stdio: "ignore",
-    detached: true,
-    env: extraEnv ? { ...process.env, ...extraEnv } : undefined,
-  });
-  child.on("error", (err) => console.error("[spawnHiddenDetached] wscript error:", err.message));
-  const cleanupTimer = setTimeout(() => {
-    void Promise.all([fsp.rm(batPath, { force: true }), fsp.rm(vbsPath, { force: true })]).catch(() => undefined);
-  }, 60000);
-  cleanupTimer.unref?.();
-  return child.pid;
-}
 
 
 
@@ -997,6 +971,19 @@ async function startServerUnlocked(name) {
     return { ok: false, error: `Session policy không hợp lệ — sửa trong Cấu hình: ${policy.errors.join("; ")}` };
   }
   const env = await readInstanceEnv(name);
+  // Chặn workspace thiếu (vd copy sang máy khác, WORKSPACE_PATH trỏ path cũ
+  // không còn tồn tại): server vẫn /health ok nhưng mọi tool file đều fail.
+  const wsRaw = String(env.WORKSPACE_PATH || "").trim();
+  if (wsRaw) {
+    const wsAbs = path.isAbsolute(wsRaw) ? wsRaw : path.resolve(ROOT, wsRaw);
+    try {
+      if (!(await fsp.stat(wsAbs)).isDirectory()) {
+        return { ok: false, workspaceMissing: true, error: `WORKSPACE_PATH không tồn tại: ${wsAbs} — sửa đường dẫn (hoặc tạo thư mục) rồi bật lại.` };
+      }
+    } catch {
+      return { ok: false, workspaceMissing: true, error: `WORKSPACE_PATH không tồn tại: ${wsAbs} — sửa đường dẫn (hoặc tạo thư mục) rồi bật lại.` };
+    }
+  }
   const adminPort = Number(env.ADMIN_PORT || 0);
   if (!Number.isInteger(adminPort) || adminPort <= 0 || adminPort >= 65536) {
     return { ok: false, error: "ADMIN_PORT is invalid; fix configuration before starting Local Coder." };
@@ -1391,7 +1378,7 @@ async function startTunnelUnlocked(name) {
     await writePidFile(inst.tunnelPid, null);
 
     await fsp.writeFile(inst.tunnelLog, "");
-    spawnHiddenDetached(client.path, ["run", "--profile-file", profileFile], inst.tunnelLog, {
+    spawnDetached(client.path, ["run", "--profile-file", profileFile], inst.tunnelLog, {
       OPENAI_TUNNEL_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_TUNNEL_ID: env.OPENAI_TUNNEL_ID,
@@ -1418,6 +1405,7 @@ async function startTunnelUnlocked(name) {
   const pid = spawnDetached(CLOUDFLARED, ["tunnel", "--url", `http://localhost:${port}`], inst.tunnelLog);
   invalidateProcessScanCache();
   await writePidFile(inst.tunnelPid, pid);
+
 
   let url = null;
   const deadline = Date.now() + 25000;
@@ -1844,12 +1832,20 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
     tunnelStatus(name),
     Promise.resolve({ dist: fs.existsSync(SERVER_ENTRY), nodeModules: fs.existsSync(path.join(ROOT, "node_modules")) }),
   ]);
+  let wsResolved;
+  try {
+    const ws = String(env.WORKSPACE_PATH || "").trim();
+    wsResolved = { path: ws, exists: !ws || (await fsp.stat(path.isAbsolute(ws) ? ws : path.resolve(ROOT, ws))).isDirectory() };
+  } catch {
+    wsResolved = { path: String(env.WORKSPACE_PATH || "").trim(), exists: false };
+  }
   const chk = includeCheck
     ? await checkConfig(name).catch((e) => ({ ok: false, items: [], error: String((e && e.message) || e) }))
     : null;
   return {
     name,
     node: process.version,
+    workspaceMissing: !wsResolved.exists,
     env: {
       PORT: env.PORT || "3000",
       ADMIN_PORT: env.ADMIN_PORT || "3001",
@@ -2076,6 +2072,17 @@ async function saveInstanceEnvUnlocked(name, body) {
   }
 
   const parsed = parseDotEnv(next);
+  const wsSaved = String(parsed.WORKSPACE_PATH || "").trim();
+  if (wsSaved) {
+    const wsAbs = path.isAbsolute(wsSaved) ? wsSaved : path.resolve(ROOT, wsSaved);
+    try {
+      if (!(await fsp.stat(wsAbs)).isDirectory()) {
+        return { ok: false, workspaceMissing: true, error: `WORKSPACE_PATH không tồn tại: ${wsAbs}` };
+      }
+    } catch {
+      return { ok: false, workspaceMissing: true, error: `WORKSPACE_PATH không tồn tại: ${wsAbs}` };
+    }
+  }
   const sessionPolicy = validateSessionPolicy(parsed);
   if (!sessionPolicy.ok) return { ok: false, error: sessionPolicy.errors.join("; ") };
   const runtimeLimits = validateRuntimeLimits(parsed);
@@ -2532,36 +2539,46 @@ async function handleApi(req, res, url, body) {
     if (req.method === "POST") {
       const enable = Boolean(body && body.enabled);
       if (enable) {
-        if (!fs.existsSync(STARTUP_LNK)) {
-          // Tạo shortcut .lnk trỏ manager-hidden.vbs (wscript, ẩn hoàn toàn khi login)
-          // VBS tự tái tạo mỗi lần bật autostart — manager/state/ bị gitignore nên không commit file
-          const vbsBody =
-            "Set sh = CreateObject(\"WScript.Shell\")\n" +
-            "q = Chr(34)\n" +
-            'sh.Run "cmd.exe /c " & q & "' +
+        // Luôn ghi lại launcher + shortcut (ghi đè LNK cũ kể cả khi đã tồn tại):
+        // LNK từ bản cũ có thể trỏ manager-hidden.vbs (VBScript engine không
+        // đăng ký sẵn trên nhiều Windows) — bật lại autostart phải tự sửa chữa.
+        {
+          // Tạo shortcut .lnk trỏ manager-hidden.ps1 chạy bằng PowerShell ẩn
+          // khi đăng nhập. KHÔNG dùng VBS/wscript: VBScript engine không
+          // đăng ký sẵn trên nhiều Windows hiện đại ("There is no script
+          // engine for file extension '.vbs'"), làm chết toàn bộ autostart.
+          const ps1Body =
+            '$proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/d", "/c", "`"' +
             MANAGER_BAT +
-            '" & q, 0, False\n';
-          await fsp.writeFile(MANAGER_HIDDEN_VBS, vbsBody, "utf8");
-          const vbs = [
-            'Set ws = CreateObject("WScript.Shell")',
-            'Set lnk = ws.CreateShortcut("' + STARTUP_LNK.replace(/\\/g, "\\\\") + '")',
-            'lnk.TargetPath = "' + MANAGER_HIDDEN_VBS.replace(/\\/g, "\\\\") + '"',
-            'lnk.WorkingDirectory = "' + REPO_ROOT.replace(/\\/g, "\\\\") + '"',
-            "lnk.WindowStyle = 7",
-            'lnk.Description = "ChatGPT Local Coder Manager (multi-instance, hidden)"',
-            "lnk.Save()",
-          ].join("\n");
-          const vbsPath = path.join(STATE_DIR, "make-startup-lnk.vbs");
-          await fsp.writeFile(vbsPath, vbs, "utf8");
-          const r = spawnSync("cscript", ["//nologo", "//B", vbsPath], {
-            encoding: "utf8",
-            windowsHide: true,
-            timeout: 30000,
-            maxBuffer: HELPER_OUTPUT_MAX_CHARS,
-          });
+            '`"" -WorkingDirectory "' + REPO_ROOT + '" -WindowStyle Hidden -PassThru\n' +
+            "Start-Sleep -Seconds 2\n" +
+            "if ($proc.HasExited) { exit 1 }\n";
+          await fsp.writeFile(MANAGER_HIDDEN_PS1, ps1Body, "utf8");
+          const ps1Make =
+            'param([string]$LnkPath, [string]$Launcher, [string]$WorkDir)\n' +
+            '$ws = New-Object -ComObject WScript.Shell\n' +
+            '$s = $ws.CreateShortcut($LnkPath)\n' +
+            '$s.TargetPath = Join-Path $env:SystemRoot "System32\\WindowsPowerShell\\v1.0\\powershell.exe"\n' +
+            '$s.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"" + $Launcher + "`""\n' +
+            '$s.WorkingDirectory = $WorkDir\n' +
+            '$s.WindowStyle = 7\n' +
+            '$s.Description = "ChatGPT Local Coder Manager (multi-instance, hidden)"\n' +
+            "$s.Save()\n";
+          const makePath = path.join(STATE_DIR, "make-startup-lnk.ps1");
+          await fsp.writeFile(makePath, ps1Make, "utf8");
+          const psExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+          const r = spawnSync(
+            psExe,
+            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", makePath, "-LnkPath", STARTUP_LNK, "-Launcher", MANAGER_HIDDEN_PS1, "-WorkDir", REPO_ROOT],
+            { encoding: "utf8", windowsHide: true, timeout: 30000, maxBuffer: HELPER_OUTPUT_MAX_CHARS }
+          );
           if (r.status !== 0) {
             return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: " + (r.stderr || r.stdout || "").trim().slice(-200) });
           }
+          // Dọn VBS cũ nếu còn (phiên bản cũ từng tạo) để không còn shortcut chết.
+          try {
+            if (fs.existsSync(MANAGER_HIDDEN_VBS)) await fsp.unlink(MANAGER_HIDDEN_VBS);
+          } catch { /* bỏ qua - không chặn bật autostart */ }
         }
         return json(res, 200, { ok: true, enabled: true });
       }

@@ -238,13 +238,13 @@ try {
   assert.doesNotMatch(managerHtml, /f-session-grace|MCP_SESSION_DELETE_GRACE_MS/, "DELETE drain grace is an internal lifecycle knob and must not clutter Manager UI");
   assert.doesNotMatch(managerApp, /f-session-grace/, "Manager structured form must not bind MCP_SESSION_DELETE_GRACE_MS");
   assert.doesNotMatch(adminUiSource.match(/const ENV_KEYS = \[([\s\S]*?)\];/)?.[1] || "", /MCP_SESSION_DELETE_GRACE_MS/, "Admin structured settings must keep internal DELETE drain grace hidden");
+  const extraWorkspacePos = managerHtml.indexOf('for="f-extra-ws"');
   const fullDiskPos = managerHtml.indexOf('for="f-full-disk"');
   const memoryBytesPos = managerHtml.indexOf('for="f-mem-bytes"');
   const memoryLinesPos = managerHtml.indexOf('for="f-mem-lines"');
-  const extraWorkspacePos = managerHtml.indexOf('for="f-extra-ws"');
   assert.ok(
-    fullDiskPos >= 0 && memoryBytesPos > fullDiskPos && memoryLinesPos > memoryBytesPos && extraWorkspacePos > memoryLinesPos,
-    "PROJECT_MEMORY_MAX_BYTES/LINES must sit immediately after FULL_DISK_ACCESS and before EXTRA_WORKSPACE_PATHS",
+    extraWorkspacePos >= 0 && fullDiskPos > extraWorkspacePos && memoryBytesPos > fullDiskPos && memoryLinesPos > memoryBytesPos,
+    "EXTRA_WORKSPACE_PATHS must sit immediately before FULL_DISK_ACCESS, then PROJECT_MEMORY_MAX_BYTES/LINES",
   );
   assert.doesNotMatch(runtimeEntrySource, /MCP_SESSION_RECOVERY|SESSION_RECOVERY/, "runtime recovery must be invariant, not controlled by a hidden env switch");
   assert.doesNotMatch(JSON.stringify(item.config), /connectorName/);
