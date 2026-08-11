@@ -5,7 +5,8 @@
  * This is an EXPLICIT developer operation. Running it regenerates the
  * authoritative contract fixture; the change must ship as an ABI bump commit.
  *
- * Usage: node scripts/generate-contract-fixture.mjs
+ * Usage: npm run build && node scripts/generate-contract-fixture.mjs
+ * (build first — the generator imports dist/, not src/).
  */
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -24,7 +25,13 @@ import {
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-fixture-"));
 const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
 const oldCwd = process.env.CODEX_WORKSPACE_ROOT;
+const oldDriftOverride = process.env.CHATGPT_PUBLIC_CONTRACT_DRIFT_OVERRIDE;
 try {
+  // The generator's whole purpose is to capture an intentionally changed ABI;
+  // the slim startup self-check would fail-closed against the previous
+  // fixture before we can list tools. Override is explicit, dev-only, and
+  // scoped to this process — production boots never set it.
+  process.env.CHATGPT_PUBLIC_CONTRACT_DRIFT_OVERRIDE = "1";
   process.env.CHATGPT_TOOL_PROFILE = "slim";
   setDefaultCwd(temp);
   setWorkspaceRoots([temp]);
@@ -49,6 +56,8 @@ try {
   else process.env.CHATGPT_TOOL_PROFILE = oldProfile;
   if (oldCwd === undefined) delete process.env.CODEX_WORKSPACE_ROOT;
   else process.env.CODEX_WORKSPACE_ROOT = oldCwd;
+  if (oldDriftOverride === undefined) delete process.env.CHATGPT_PUBLIC_CONTRACT_DRIFT_OVERRIDE;
+  else process.env.CHATGPT_PUBLIC_CONTRACT_DRIFT_OVERRIDE = oldDriftOverride;
   setDefaultCwd(os.homedir());
   setWorkspaceRoots([]);
   // Temp dir is left for OS-managed cleanup in os.tmpdir(): direct recursive

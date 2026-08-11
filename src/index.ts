@@ -20,6 +20,7 @@ import {
   isValidMcpSessionId,
   SessionCapacityError,
 } from "./lib/mcp-session-manager.js";
+import { getBootId, getContractFingerprint } from "./lib/contract-fingerprint.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { startAdminServer } from "./admin/server.js";
 import { formatLogTime, logMcpHttpEvent, logMcpRequest } from "./lib/activity-log.js";
@@ -202,8 +203,12 @@ app.use((req, res, next) => {
 // ChatGPT co the goi "/" hoac "/mcp" — ho tro ca hai
 const MCP_PATHS = ["/", "/mcp"];
 
-app.get("/health", (_req, res) => {
+app.get("/health", async (_req, res) => {
   const counts = sessionManager.counts();
+  // Fixture read is a deliberate failure policy: a missing/corrupt contract
+  // fixture must surface as mcp_contract: null (health stays up; the startup
+  // drift guard already failed closed on this process).
+  const mcpContract = await getContractFingerprint().catch(() => null);
   res.json({
     status: "ok",
     name: "codex-mcp-server",
@@ -226,6 +231,8 @@ app.get("/health", (_req, res) => {
     mcpDispatch: getMcpDispatchDiagnostics(),
     managedProcesses: getManagedProcessStats(),
     mcpEndpoints: MCP_PATHS,
+    boot_id: getBootId(),
+    mcp_contract: mcpContract,
     instructions: summarizeInstructionContext(instructionContext),
   });
 });

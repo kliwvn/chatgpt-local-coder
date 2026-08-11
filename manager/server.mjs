@@ -26,6 +26,7 @@ import path from "node:path";
 import net from "node:net";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { copyTruncateLogFile, isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
 import { recycleManagedDirectory } from "./safe-delete.mjs";
 import {
@@ -143,6 +144,31 @@ async function managerRuntimeStatus() {
     loadedAt,
     artifactDrift: isRuntimeArtifactStale(loadedAt, newestMtimeMs || Number.NaN),
   };
+}
+
+/* Canonical ChatGPT public contract (ABI v1) — read straight from the repo
+ * fixture so /health stays meaningful even when dist/ is stale. The manager
+ * cannot know which tool profile an instance runs with, so per-instance
+ * runtime state (profile, live hash, dynamic flags) comes from agent_status. */
+const CONTRACT_FIXTURE_PATH = path.join(ROOT, "scripts", "fixtures", "chatgpt-public-contract-v1.json");
+let managerBootId = null;
+function getManagerBootId() {
+  if (!managerBootId) managerBootId = randomUUID();
+  return managerBootId;
+}
+async function publicContractFingerprint() {
+  try {
+    const raw = JSON.parse(await fsp.readFile(CONTRACT_FIXTURE_PATH, "utf8"));
+    return {
+      version: raw.version,
+      hash: raw.hash,
+      tool_count: Array.isArray(raw.tools) ? raw.tools.length : null,
+    };
+  } catch {
+    // Fixture thiếu/hỏng không được làm chết health endpoint; instance-level
+    // self-check (MCP_PUBLIC_CONTRACT_DRIFT) vẫn fail-closed riêng.
+    return null;
+  }
 }
 
 function withoutSecrets(values) {
@@ -2599,6 +2625,8 @@ async function handleApi(req, res, url, body) {
       version: "2.0.0",
       multiInstance: true,
       ...(await managerRuntimeStatus()),
+      boot_id: getManagerBootId(),
+      mcp_public_contract: await publicContractFingerprint(),
     });
   }
 

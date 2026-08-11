@@ -11,6 +11,7 @@ import type { McpUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { refreshProxiedTools } from "./lib/mcp-tool-proxy.js";
 import { getChatGptToolProfile, shouldExposeTool } from "./lib/tool-profile.js";
 import { ensureShellBootstrap } from "./lib/persistent-shell.js";
+import { assertNoContractDrift } from "./lib/contract-fingerprint.js";
 
 const NOOP_TOOL = {
   remove: () => {},
@@ -114,5 +115,9 @@ export async function createMcpServer(
   // underlying Server after all registrations and before any transport
   // connects (the McpServer wrapper exposes `server` for advanced use).
   server.server.registerCapabilities({ tools: { listChanged: false } });
+  // Fail closed on accidental contract drift: compare the live registration
+  // (serialized exactly like a host tools/list) against the authoritative
+  // fixture before the session is publishable.
+  await assertNoContractDrift(server);
   return server;
 }

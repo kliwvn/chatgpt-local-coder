@@ -9,7 +9,8 @@ import { getDefaultCwd, getFullDiskAccess, getMachineRoots } from "../lib/path-s
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { MCP_QUICKSTART } from "../lib/quickstart.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
-import { getUpstreamManager } from "../lib/mcp-upstream-manager.js";
+import { getUpstreamManager, type UpstreamServerStatus } from "../lib/mcp-upstream-manager.js";
+import { getBootId, getContractFingerprint } from "../lib/contract-fingerprint.js";
 import { appendAutoMemory } from "../lib/auto-memory.js";
 import { loadPathRulesForFile } from "../lib/path-rules.js";
 import { toolResult } from "../lib/tool-result.js";
@@ -123,21 +124,33 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
     },
     async () => {
       const upstreamManager = getUpstreamManager();
-      let upstream: Awaited<ReturnType<typeof upstreamManager.listStatuses>> = [];
+      let upstream: UpstreamServerStatus[] = [];
       try {
         upstream = await upstreamManager.listStatuses({ probe: false });
       } catch {}
+      const fingerprint = await getContractFingerprint().catch(() => null);
       return toolResult("agent_status", {
         permission_profile: getPermissionProfile(),
         permission_description: describePermissionProfile(),
+        // Local executor permission is NOT host action approval. The ChatGPT
+        // host applies its own write gate that this server cannot observe.
+        local_executor_profile: getPermissionProfile(),
+        local_write_allowed: getPermissionProfile() === "open",
+        host_action_permission: "unobservable",
+        host_write_gate: "unobservable",
         full_machine_access: getFullDiskAccess(),
         path_sandbox_enabled: !getFullDiskAccess(),
         shell_commands_os_sandboxed: false,
         default_cwd: getDefaultCwd(),
         machine_roots: getMachineRoots(),
         audit_log: getAuditPath(),
-        pid: process.pid,
-        node: process.version,
+        boot: {
+          boot_id: getBootId(),
+          pid: process.pid,
+          node: process.version,
+          process_started_at: new Date(Date.now() - process.uptime() * 1000).toISOString(),
+        },
+        mcp_contract: fingerprint,
         quickstart: MCP_QUICKSTART,
         rewind: getCheckpointConfig(),
         upstream_mcp: {
