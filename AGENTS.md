@@ -96,6 +96,31 @@ Một số tool wrapper đôi khi có thể bị lớp an toàn của client ch�
 
 **Ổn định:** `git_status`, `git_diff`, `git_add`, `git_commit`, `git_log`, `git_branch`, `git_stash`, `git_reset` (`soft`/`mixed`), `git_pull`.
 
+## ChatGPT public MCP contract (ABI)
+
+ChatGPT host connector nhìn thấy **một ABI cố định, có version** — không phải tập
+tool nội bộ:
+
+- **Slim profile = 27 tools** (đóng băng): inventory chính xác, thứ tự, title,
+  description, input schema, annotations. Canonical document:
+  `scripts/fixtures/chatgpt-public-contract-v1.json` (SHA-256
+  `afd98bd3…39e6`).
+- **Internal executor changes không được đổi ABI public**: thêm/đổi tool nội bộ
+  chỉ được phép nếu không làm đổi `tools/list` slim (contract test sẽ fail nếu
+  drift). Đổi ABI là thao tác explicit: bump
+  `CHATGPT_PUBLIC_CONTRACT_VERSION` → `npm run build && node scripts/generate-contract-fixture.mjs`
+  → cập nhật test expected → commit fixture mới.
+  Startup fail-closed: nếu live registration lệch fixture → server từ chối
+  boot với `MCP_PUBLIC_CONTRACT_DRIFT` (override chỉ bằng env explicit
+  `CHATGPT_PUBLIC_CONTRACT_DRIFT_OVERRIDE=1`, dev-only).
+- **Refresh connector**: chỉ cần khi **contract version đổi**. Không refresh sau
+  mỗi update implementation nội bộ — ABI không đổi thì connector không cần đụng.
+- **Chẩn đoán layer chặn write**: `agent_status` trả `mcp_contract` (version,
+  hash, tool_count, dynamic flags), `boot.boot_id`, và tách bạch
+  `local_executor_profile`/`local_write_allowed` (local executor) vs
+  `host_action_permission: "unobservable"` (host ChatGPT gate — server không thể
+  biết). `/health` cũng expose `boot_id` + `mcp_contract`.
+
 ## Format `apply_patch` (Codex-style)
 
 ```

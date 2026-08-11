@@ -372,6 +372,37 @@ src/
 - **Session:** Stateful with auto-recovery when ChatGPT holds a stale session ID
 - **Output:** Structured JSON from every tool
 
+### ChatGPT public MCP contract (ABI)
+
+The ChatGPT host connector sees a **frozen, versioned ABI**, not the internal
+tool set. The `slim` profile (default for ChatGPT) always exposes exactly
+**27 tools** — exact names, order, titles, descriptions, input schemas and
+annotations — locked by `scripts/fixtures/chatgpt-public-contract-v1.json`
+(SHA-256 `afd98bd3…39e6`). Internal executor changes must not alter this ABI;
+the server **fails closed at boot** with `MCP_PUBLIC_CONTRACT_DRIFT` if the live
+registration drifts from the fixture (dev-only escape:
+`CHATGPT_PUBLIC_CONTRACT_DRIFT_OVERRIDE=1`).
+
+- **Refresh the ChatGPT connector only when the contract version changes** —
+  not after every internal implementation update.
+- `agent_status` reports `mcp_contract` (version, hash, tool_count,
+  dynamic_tools, list_changed) and `boot.boot_id`, and separates the local
+  executor profile (`local_executor_profile`, `local_write_allowed`) from the
+  host action gate (`host_action_permission: "unobservable"`), which the server
+  cannot observe.
+- `/health` exposes `boot_id` + `mcp_contract`; the manager `/api/health`
+  exposes `mcp_public_contract` + its own `boot_id`.
+- Changing the ABI is an explicit operation: bump
+  `CHATGPT_PUBLIC_CONTRACT_VERSION`, run
+  `npm run build && node scripts/generate-contract-fixture.mjs`, update test
+  expectations, and commit the new fixture.
+
+Regression coverage: `scripts/test-chatgpt-public-contract.mjs` (exact
+inventory + hash + no listChanged in slim), `scripts/test-chatgpt-action-contract.mjs`
+(critical action semantics), `scripts/test-chatgpt-legacy-compat.mjs`
+(backward-compatible inputs), `scripts/test-chatgpt-diagnostics.mjs`
+(fingerprint + drift guard).
+
 ## 🧪 Development
 
 ```powershell
