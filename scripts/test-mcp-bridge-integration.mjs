@@ -127,6 +127,10 @@ const hub = spawnNode(path.join(root, "dist/index.js"), {
   PORT: String(mcpPort),
   ADMIN_PORT: String(adminPort),
   MCP_UPSTREAM_CONFIG: configPath,
+  // The proxy under test is full-profile machinery (slim freezes its inventory
+  // by contract); without this the server defaults to slim and the allowlist
+  // proxy can never appear.
+  CHATGPT_TOOL_PROFILE: "full",
   WORKSPACE_PATH: root,
   MCP_SHELL_STATE_DIR: path.join(tmpDir, "shell-state"),
   CHECKPOINT_PATH: path.join(tmpDir, "checkpoints"),

@@ -3,6 +3,7 @@ import path from "path";
 import { appendBoundedTail, SHELL_OUTPUT_MAX_CHARS } from "./output-budget.js";
 import { redactSensitiveText } from "./redaction.js";
 import { requireCommandAllowed } from "./permissions.js";
+import { existsSync } from "node:fs";
 
 export interface ShellExecResult {
   command: string;
@@ -163,8 +164,18 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
 
 function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
   const { promise, resolve, reject } = Promise.withResolvers<ShellExecResult>();
+  // spawn() reports a missing cwd as "spawn powershell.exe ENOENT", hiding the
+  // real cause; fail fast with an actionable message instead.
+  if (!existsSync(cwd)) {
+    return Promise.reject(new Error(`shell cwd does not exist: ${cwd}`));
+  }
   const shell = process.platform === "win32" ? "powershell.exe" : "bash";
   const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
+  // The sync response deadline starts BEFORE spawn() so slow spawns (Windows AV
+  // scanning can stall powershell.exe ~2.5-3s) count against the budget. The
+  // MCP response is resolved AT the deadline; child-tree cleanup (taskkill)
+  // continues in the background and must not delay the response.
+  const startedAt = Date.now();
   const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
@@ -174,17 +185,27 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
   let stderrTruncated = false;
   let timedOut = false;
   let settled = false;
-  let forceSettleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const timedOutResult = (): ShellExecResult => ({
+    command,
+    cwd,
+    stdout: stdout.trim(),
+    stderr: stderr.trim(),
+    exit_code: null,
+    timed_out: true,
+    stdout_truncated: stdoutTruncated,
+    stderr_truncated: stderrTruncated,
+    output_max_chars: SHELL_OUTPUT_MAX_CHARS,
+  });
 
   const settle = (fn: () => void) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    if (forceSettleTimer) clearTimeout(forceSettleTimer);
     fn();
   };
 
-  const timer = setTimeout(() => {
+  const handleTimeout = () => {
     timedOut = true;
     // Giết cả process tree — child process con (npm test, node script) không bị bỏ lại
     if (process.platform === "win32" && child.pid) {
@@ -196,24 +217,21 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     } else {
       child.kill("SIGKILL");
     }
-    // Usually the child emits close promptly after tree-kill. Bound the rare OS
-    // edge where it never does so a timed-out run_command cannot hang forever.
-    forceSettleTimer = setTimeout(() => {
-      settle(() => resolve({
-        command,
-        cwd,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        exit_code: null,
-        timed_out: true,
-        stdout_truncated: stdoutTruncated,
-        stderr_truncated: stderrTruncated,
-        output_max_chars: SHELL_OUTPUT_MAX_CHARS,
-      }));
-    }, 1500);
-    forceSettleTimer.unref?.();
-  }, timeoutMs);
-  timer.unref?.();
+    // Resolve at the deadline, not after tree-kill settles. Detach the child
+    // handle so a slow kill can never pin shutdown; stray pipe writes after
+    // the deadline are discarded by the no-op error listeners below. (Pipes
+    // stay attached: this is a long-running server, and buffered output from
+    // an already-killed child is drained by the close event, not by detach.)
+    child.unref();
+    settle(() => resolve(timedOutResult()));
+  };
+
+  const remaining = timeoutMs - (Date.now() - startedAt);
+  const timer: NodeJS.Timeout | undefined =
+    remaining > 0
+      ? setTimeout(handleTimeout, remaining)
+      : (queueMicrotask(handleTimeout), undefined);
+  timer?.unref?.();
 
   child.stdout.on("data", (d: string) => {
     const next = appendBoundedTail(stdout, d, SHELL_OUTPUT_MAX_CHARS, stdoutTruncated);
@@ -225,20 +243,14 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
     stderr = next.text;
     stderrTruncated = next.truncated;
   });
+  // After a timed-out detach the pipes can EPIPE or EIO; never let that crash
+  // the server. Output is already discarded past the deadline.
+  child.stdout.on("error", () => {});
+  child.stderr.on("error", () => {});
   child.on("close", (code) => {
     settle(() => {
       if (timedOut) {
-        resolve({
-          command,
-          cwd,
-          stdout: stdout.trim(),
-          stderr: stderr.trim(),
-          exit_code: null,
-          timed_out: true,
-          stdout_truncated: stdoutTruncated,
-          stderr_truncated: stderrTruncated,
-          output_max_chars: SHELL_OUTPUT_MAX_CHARS,
-        });
+        resolve(timedOutResult());
         return;
       }
       resolve({
@@ -258,11 +270,13 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
   return promise;
 }
 
+
 /**
  * Chạy command trong shell session bền vững: cwd thay đổi qua `cd` được giữ
  * giữa các lần gọi khi command có `cd`/`Set-Location`/`pushd`. `workingDirectory`
  * chỉ là one-off execution cwd và không đổi persistent cwd.
  */
+
 export async function execInShellSession(
   command: string,
   defaultCwd: string,

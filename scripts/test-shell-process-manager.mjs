@@ -64,13 +64,19 @@ try {
   assert.deepEqual(getManagedProcessStats(), beforeGuardStats, "blocked start_process allocated a managed process");
 
   const syncStarted = Date.now();
-  const syncTimed = data(await call("run_command", { command: nodeCommand("setTimeout(() => {}, 1500)") }));
+  // Command runs ~15s, far beyond the 1s sync budget and the 10s assertion
+  // ceiling: an ignored budget would resolve after ~15s and fail this test.
+  // The response must come back at the deadline with timed_out: true while
+  // taskkill cleanup continues in the background.
+  const syncTimed = data(await call("run_command", { command: nodeCommand("setTimeout(() => {}, 15000)") }));
   const syncElapsed = Date.now() - syncStarted;
   assert.equal(syncTimed.timed_out, true, "run_command ignored the synchronous MCP response budget");
   assert.equal(syncTimed.configured_timeout_ms, 30_000);
   assert.equal(syncTimed.effective_timeout_ms, 1_000);
   assert.equal(syncTimed.sync_response_budget_ms, 1_000);
-  assert.ok(syncElapsed < 5_000, `run_command exceeded bounded synchronous response time: ${syncElapsed}ms`);
+  // Response bound includes slow Windows spawns (~2.5-3s under AV scanning);
+  // 10s keeps headroom while still proving the 15s command was cut off.
+  assert.ok(syncElapsed < 10_000, `run_command exceeded bounded synchronous response time: ${syncElapsed}ms`);
 
   const noisy = data(await call("start_process", { command: nodeCommand("process.stdout.write('x'.repeat(9000))") }));
   await waitFinished(noisy.id);

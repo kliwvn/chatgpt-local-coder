@@ -79,6 +79,9 @@ const unitScripts = [
   "scripts/test-project-memory.mjs",
   "scripts/test-tool-profile.mjs",
   "scripts/test-chatgpt-action-contract.mjs",
+  "scripts/test-chatgpt-public-contract.mjs",
+  "scripts/test-chatgpt-diagnostics.mjs",
+  "scripts/test-chatgpt-legacy-compat.mjs",
   "scripts/test-shell-persist.mjs",
   "scripts/test-shell-process-manager.mjs",
 ];
@@ -126,6 +129,9 @@ const server = spawn(process.execPath, ["dist/index.js"], {
     PORT: String(mcpPort),
     ADMIN_PORT: String(adminPort),
     CHATGPT_TOOL_PROFILE: "slim",
+    // The repo .env ships a template WORKSPACE_PATH that does not exist; the
+    // isolated server must override it or every shell spawn fails with ENOENT.
+    WORKSPACE_PATH: root,
     MCP_SHELL_STATE_DIR: path.join(integrationStateDir, "shell-state"),
     CHECKPOINT_PATH: path.join(integrationStateDir, "checkpoints"),
     AUDIT_LOG_PATH: path.join(integrationStateDir, "audit.log"),
@@ -146,7 +152,23 @@ try {
   if (!health.managedProcesses || health.managedProcesses.max_running !== 16) {
     throw new Error(`health missing managed process policy: ${JSON.stringify(health.managedProcesses)}`);
   }
-  console.log(`OK  health: profile=${health.instructions.tool_profile}, memory=${health.instructions.memory_files?.length ?? 0} files`);
+  const contractFixture = JSON.parse(
+    await fs.readFile(path.join(root, "scripts", "fixtures", "chatgpt-public-contract-v1.json"), "utf8")
+  );
+  if (!health.boot_id || typeof health.boot_id !== "string") throw new Error("health missing boot_id");
+  if (!health.mcp_contract || health.mcp_contract.version !== contractFixture.version) {
+    throw new Error(`health mcp_contract missing/version mismatch: ${JSON.stringify(health.mcp_contract)}`);
+  }
+  if (health.mcp_contract.hash !== contractFixture.hash) {
+    throw new Error(`health mcp_contract hash drift: ${health.mcp_contract.hash} != ${contractFixture.hash}`);
+  }
+  if (health.mcp_contract.tool_count !== contractFixture.tools.length) {
+    throw new Error(`health mcp_contract tool_count mismatch: ${health.mcp_contract.tool_count}`);
+  }
+  if (health.mcp_contract.dynamic_tools !== false || health.mcp_contract.list_changed !== false) {
+    throw new Error(`slim health must be non-dynamic: ${JSON.stringify(health.mcp_contract)}`);
+  }
+  console.log(`OK  health: profile=${health.instructions.tool_profile}, contract=v${health.mcp_contract.version} hash=${health.mcp_contract.hash.slice(0, 12)}…, memory=${health.instructions.memory_files?.length ?? 0} files`);
 
   const admin = await waitFor(`http://127.0.0.1:${adminPort}/health`);
   if (!admin.instructions) throw new Error("admin health missing instructions");
