@@ -1,0 +1,869 @@
+{
+  "version": 1,
+  "hash": "831a8ed5063c150bdcd9d199256828d9ea592d1348790eae40ada33d5e19e6e7",
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Read a file before editing. Use offset+limit for partial reads (1-based line numbers). Always read files you plan to patch.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "head": {
+            "exclusiveMinimum": 0,
+            "maximum": 100000,
+            "type": "integer"
+          },
+          "limit": {
+            "description": "Number of lines to read from offset",
+            "exclusiveMinimum": 0,
+            "maximum": 100000,
+            "type": "integer"
+          },
+          "offset": {
+            "description": "1-based line number to start reading",
+            "exclusiveMinimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "tail": {
+            "exclusiveMinimum": 0,
+            "maximum": 100000,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "read_text_file",
+      "title": "Read Text File"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Create or replace a local text file inside the configured path scope. A recovery checkpoint is created before overwrite.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ],
+        "type": "object"
+      },
+      "name": "write_file",
+      "title": "Write File"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Modify local text by exact replacement inside the configured path scope. Supports dry-run and creates a recovery checkpoint before changes.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "new_text": {
+            "type": "string"
+          },
+          "old_text": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "replace_all": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "old_text",
+          "new_text"
+        ],
+        "type": "object"
+      },
+      "name": "edit_file",
+      "title": "Edit File"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Modify one local text file with multiple exact replacements atomically. Supports dry-run and creates a recovery checkpoint before changes.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "edits": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "new_text": {
+                  "type": "string"
+                },
+                "old_text": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "replace_all": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "old_text",
+                "new_text"
+              ],
+              "type": "object"
+            },
+            "maxItems": 1000,
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "edits"
+        ],
+        "type": "object"
+      },
+      "name": "multi_edit",
+      "title": "Multi Edit"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Apply checkpointed local code edits with Codex @@ hunks or *** Begin Patch format. Supports dry-run. File removal is not allowed here; use the explicit removal tools.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "patch": {
+            "type": "string"
+          },
+          "path": {
+            "description": "Target file (single-file) or base directory (multi-file)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "patch"
+        ],
+        "type": "object"
+      },
+      "name": "apply_patch",
+      "title": "Apply Patch"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "List files and directories in a path. Claude LS equivalent with optional ignore globs.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "ignore": {
+            "description": "Glob patterns to ignore, e.g. node_modules, *.log",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "list_directory",
+      "title": "List Directory"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Explore: find files by name pattern under a directory. Use before read_text_file when you do not know exact paths.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "max_results": {
+            "default": 100,
+            "exclusiveMinimum": 0,
+            "maximum": 500,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Directory to search in; defaults to workspace root context",
+            "type": "string"
+          },
+          "pattern": {
+            "description": "Glob pattern like \"**/*.ts\" or \"src/**/*.tsx\"",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "name": "glob",
+      "title": "Glob"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Explore: search file contents by regex. Prefer over reading many files blindly. Modes: content, files_with_matches, count.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "case_insensitive": {
+            "default": false,
+            "type": "boolean"
+          },
+          "context_after": {
+            "default": 0,
+            "maximum": 20,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "context_around": {
+            "default": 0,
+            "maximum": 20,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "context_before": {
+            "default": 0,
+            "maximum": 20,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "glob": {
+            "default": "*",
+            "type": "string"
+          },
+          "head_limit": {
+            "default": 200,
+            "exclusiveMinimum": 0,
+            "maximum": 1000,
+            "type": "integer"
+          },
+          "multiline": {
+            "default": false,
+            "type": "boolean"
+          },
+          "output_mode": {
+            "default": "content",
+            "enum": [
+              "content",
+              "files_with_matches",
+              "count"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "pattern": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "name": "grep",
+      "title": "Grep"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Remove a file reversibly by moving it to the Windows Recycle Bin. Protected roots are refused.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "delete_file",
+      "title": "Delete File"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Remove a folder reversibly by moving it to the Windows Recycle Bin. Workspace/repo/home/drive roots are refused.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "delete_directory",
+      "title": "Remove Local Folder"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Run shell commands to verify work (tests, build, lint). Cwd persists across ChatGPT tool calls (saved to disk). Use shell_status to check cwd. Use start_process for long jobs.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "working_directory": {
+            "description": "One-off isolated cwd; does not mutate or enter persistent shell cwd/history",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "run_command",
+      "title": "Run Command"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Show persistent shell session cwd and recent commands.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {},
+        "type": "object"
+      },
+      "name": "shell_status",
+      "title": "Shell Status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Start a long-running command in the background. Use process_output/process_status/stop_process afterwards.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "working_directory": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command"
+        ],
+        "type": "object"
+      },
+      "name": "start_process",
+      "title": "Start Background Process"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Read stdout/stderr logs for a background process.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "tail_chars": {
+            "default": 40000,
+            "exclusiveMinimum": 0,
+            "maximum": 200000,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "name": "process_output",
+      "title": "Process Output"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Show git working tree status.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "git_status",
+      "title": "Git Status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Show unstaged or staged changes.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "staged": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "git_diff",
+      "title": "Git Diff"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Stage files for commit.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "all": {
+            "default": true,
+            "type": "boolean"
+          },
+          "files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "git_add",
+      "title": "Git Add"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Create a commit (stages all first unless stage_only=false).",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "stage_all": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "git_commit",
+      "title": "Git Commit"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Restore tracked file(s) in the current repo to the last committed version. Local workspace only.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "description": "Repo-relative file paths to restore",
+            "items": {
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "path": {
+            "type": "string"
+          },
+          "source": {
+            "default": "HEAD",
+            "description": "Revision to restore from (default HEAD)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "files"
+        ],
+        "type": "object"
+      },
+      "name": "git_restore",
+      "title": "Restore Tracked Files"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Load CLAUDE.md/AGENTS.md for a project path. Use when the task targets a repo other than WORKSPACE_PATH (default project is already in MCP instructions).",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "max_bytes_per_file": {
+            "default": 60000,
+            "exclusiveMinimum": 0,
+            "maximum": 200000,
+            "type": "integer"
+          },
+          "max_depth": {
+            "default": 3,
+            "maximum": 5,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_files": {
+            "default": 50,
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Project directory, defaults to primary workspace",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "project_context",
+      "title": "Project Context"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Optional: full tool cheat sheet, apply_patch format, permissions, and upstream MCP list. Default workflow is already in MCP instructions.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {},
+        "type": "object"
+      },
+      "name": "agent_status",
+      "title": "Agent Status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Save a note to auto memory for future ChatGPT sessions (like Claude Code MEMORY.md).",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "note": {
+            "description": "Short fact to remember: build command, convention, gotcha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "note"
+        ],
+        "type": "object"
+      },
+      "name": "remember",
+      "title": "Remember"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Load .claude/rules/*.md scoped to a file path (Claude Code path-specific rules). Call after read_text_file when editing unfamiliar areas.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "description": "File path to match against rule paths: frontmatter",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "load_path_rules",
+      "title": "Load Path Rules"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Claude Code-style code rewind. Lists automatic checkpoints captured before file edits, previews changes, or restores files to a prior checkpoint. Does not restore conversation history. Shell/bash file changes are not tracked.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "default": "list",
+            "description": "list=show checkpoints; preview=show planned file changes; restore=revert files; status=config; clear=delete all checkpoints",
+            "enum": [
+              "list",
+              "preview",
+              "restore",
+              "status",
+              "clear"
+            ],
+            "type": "string"
+          },
+          "checkpoint_id": {
+            "description": "Target checkpoint id (required for preview/restore)",
+            "type": "string"
+          },
+          "limit": {
+            "default": 30,
+            "description": "Max checkpoints to return for list",
+            "exclusiveMinimum": 0,
+            "maximum": 200,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "name": "rewind",
+      "title": "Rewind"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "description": "List configured upstream MCP servers on this machine with health status (connected/unreachable/disabled).",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "refresh": {
+            "default": false,
+            "description": "Force reconnect before reporting health",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "mcp_servers",
+      "title": "MCP Upstream Servers"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "description": "List tools exposed by a configured upstream MCP server.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "server_id": {
+            "description": "Upstream server id from mcp_servers",
+            "type": "string"
+          }
+        },
+        "required": [
+          "server_id"
+        ],
+        "type": "object"
+      },
+      "name": "mcp_tools",
+      "title": "MCP Upstream Tools"
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "description": "Invoke a tool on a configured upstream MCP server with JSON arguments.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "arguments": {
+            "additionalProperties": {},
+            "default": {},
+            "type": "object"
+          },
+          "server_id": {
+            "type": "string"
+          },
+          "tool": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "server_id",
+          "tool"
+        ],
+        "type": "object"
+      },
+      "name": "mcp_call",
+      "title": "MCP Upstream Call"
+    }
+  ]
+}
