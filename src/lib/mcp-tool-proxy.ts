@@ -1,11 +1,12 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import type { McpUpstreamManager } from "./mcp-upstream-manager.js";
 import type { UpstreamServerConfig } from "./mcp-upstream-config.js";
-import { toolAnnotations } from "./tool-annotations.js";
+import { MCP_TOOL_RESULT_MAX_BYTES } from "./output-budget.js";
+import { proxiedToolAnnotations } from "./tool-annotations.js";
 import { toolResult } from "./tool-result.js";
 
 interface ProxyRegistration {
@@ -78,7 +79,14 @@ function jsonSchemaValueToZod(schema: unknown): z.ZodTypeAny {
   if (rawType === "object" || s.properties) {
     const shape = jsonSchemaToZodShape(s as Tool["inputSchema"]);
     const object = z.object(shape);
-    return s.additionalProperties === false ? object.strict() : object.passthrough();
+    if (s.additionalProperties === false) return object.strict();
+    if (s.additionalProperties && typeof s.additionalProperties === "object") {
+      return object.catchall(jsonSchemaValueToZod(s.additionalProperties));
+    }
+    // JSON Schema defaults additionalProperties to true. passthrough() is
+    // therefore required here; Zod's default object mode would silently strip
+    // arbitrary upstream arguments before the proxy call reaches its server.
+    return object.passthrough();
   }
   return z.any();
 }
@@ -108,6 +116,57 @@ function shouldExposeTool(config: UpstreamServerConfig, toolName: string): boole
   return (config.tools ?? []).includes(toolName);
 }
 
+function proxiedCallResult(proxyName: string, upstreamServer: string, upstreamTool: string, raw: unknown): CallToolResult {
+  const obj = raw && typeof raw === "object"
+    ? raw as { content?: unknown; structuredContent?: unknown; isError?: unknown; _meta?: Record<string, unknown> }
+    : {};
+  const isError = Boolean(obj.isError);
+  const formatted = formatUpstreamResult(raw);
+
+  if (Array.isArray(obj.content)) {
+    // A direct MCP proxy should preserve protocol-level content blocks (image,
+    // resource, resource_link, audio, etc.), not bury them inside JSON text.
+    // Keep the local envelope in structuredContent without duplicating those
+    // blocks unless the upstream already supplied structuredContent.
+    const envelopeResult = obj.structuredContent !== undefined
+      ? obj.structuredContent
+      : { content_blocks_preserved: true, count: obj.content.length };
+    const envelope = toolResult(
+      proxyName,
+      { upstream_server: upstreamServer, upstream_tool: upstreamTool, result: envelopeResult },
+      { ok: !isError, summary: isError ? `${upstreamTool} failed upstream` : undefined },
+    );
+    const candidate: CallToolResult = {
+      ...envelope,
+      // Keep the local-coder JSON envelope as content[0] for backward
+      // compatibility, then append upstream blocks verbatim so rich MCP content
+      // remains usable by clients instead of being flattened into JSON.
+      content: [...envelope.content, ...(obj.content as CallToolResult["content"])],
+      ...(isError ? { isError: true } : {}),
+      ...(obj._meta ? { _meta: obj._meta } : {}),
+    };
+    if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= MCP_TOOL_RESULT_MAX_BYTES) {
+      return candidate;
+    }
+  }
+
+  // Oversized or non-content upstream results use the standard bounded JSON
+  // envelope. Preserve isError so clients can self-correct from tool failures.
+  const fallback: CallToolResult = {
+    ...toolResult(
+      proxyName,
+      { upstream_server: upstreamServer, upstream_tool: upstreamTool, result: formatted },
+      { ok: !isError, summary: isError ? `${upstreamTool} failed upstream` : undefined },
+    ),
+    ...(isError ? { isError: true } : {}),
+  };
+  if (obj._meta) {
+    const withMeta: CallToolResult = { ...fallback, _meta: obj._meta };
+    if (Buffer.byteLength(JSON.stringify(withMeta), "utf8") <= MCP_TOOL_RESULT_MAX_BYTES) return withMeta;
+  }
+  return fallback;
+}
+
 export async function refreshProxiedTools(server: McpServer, manager: McpUpstreamManager): Promise<string[]> {
   const registry = getRegistry(server);
   const activeNames = new Set<string>();
@@ -135,6 +194,8 @@ export async function refreshProxiedTools(server: McpServer, manager: McpUpstrea
         title: tool.title ?? tool.name,
         description: tool.description ?? tool.name,
         inputSchema: tool.inputSchema ?? {},
+        annotations: tool.annotations ?? null,
+        meta: tool._meta ?? null,
       });
       const existing = registry.get(proxyName);
       if (existing?.signature === signature) continue;
@@ -143,30 +204,20 @@ export async function refreshProxiedTools(server: McpServer, manager: McpUpstrea
         registry.delete(proxyName);
       }
 
-      const inputShape = jsonSchemaToZodShape(tool.inputSchema);
-      const hasSchema = Object.keys(inputShape).length > 0;
+      const inputSchema = jsonSchemaValueToZod(tool.inputSchema);
 
       const registered = server.registerTool(
         proxyName,
         {
           title: tool.title ?? tool.name,
           description: `[${config.name}] ${tool.description ?? tool.name}`,
-          inputSchema: hasSchema ? inputShape : {},
-          annotations: toolAnnotations("edit"),
+          inputSchema,
+          annotations: proxiedToolAnnotations(tool.annotations),
+          _meta: tool._meta,
         },
         async (args: Record<string, unknown>) => {
           const raw = await manager.callTool(config.id, tool.name, args ?? {});
-          const content = formatUpstreamResult(raw);
-          const isErr =
-            typeof raw === "object" &&
-            raw !== null &&
-            "isError" in raw &&
-            Boolean(raw.isError);
-          return toolResult(proxyName, {
-            upstream_server: config.id,
-            upstream_tool: tool.name,
-            result: content,
-          }, { ok: !isErr, summary: isErr ? `${tool.name} failed upstream` : undefined });
+          return proxiedCallResult(proxyName, config.id, tool.name, raw);
         }
       );
       registry.set(proxyName, { registered, signature });

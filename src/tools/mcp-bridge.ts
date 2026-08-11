@@ -15,7 +15,7 @@ export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamMa
       inputSchema: {
         refresh: z.boolean().optional().default(false).describe("Force reconnect before reporting health"),
       },
-      annotations: toolAnnotations("read"),
+      annotations: toolAnnotations("external_read"),
     },
     async ({ refresh }) => {
       if (refresh) await manager.reloadConfig();
@@ -33,7 +33,7 @@ export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamMa
       inputSchema: {
         server_id: z.string().describe("Upstream server id from mcp_servers"),
       },
-      annotations: toolAnnotations("read"),
+      annotations: toolAnnotations("external_read"),
     },
     async ({ server_id }) => {
       const config = manager.getServerConfig(server_id);
@@ -66,7 +66,7 @@ export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamMa
         tool: z.string(),
         arguments: z.record(z.string(), z.any()).optional().default({}),
       },
-      annotations: toolAnnotations("edit"),
+      annotations: toolAnnotations("external"),
     },
     async ({ server_id, tool, arguments: args }) => {
       const config = manager.getServerConfig(server_id);

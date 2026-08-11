@@ -66,6 +66,8 @@ const unitScripts = [
   "scripts/test-audit-path.mjs",
   "scripts/test-state-concurrency.mjs",
   "scripts/test-filesystem-safety.mjs",
+  "scripts/test-destructive-safety.mjs",
+  "scripts/test-git-safety.mjs",
   "scripts/test-output-budget.mjs",
   "scripts/test-post-edit-hooks.mjs",
   "scripts/test-manager-log-utils.mjs",
@@ -80,6 +82,18 @@ const unitScripts = [
   "scripts/test-shell-persist.mjs",
   "scripts/test-shell-process-manager.mjs",
 ];
+const selfContainedIntegrationScripts = ["scripts/test-mcp-bridge-integration.mjs"];
+const specialScripts = ["scripts/test-read-text-streaming.mjs", "scripts/test-mcp-session.mjs"];
+const coveredTestFiles = new Set(
+  [...unitScripts, ...selfContainedIntegrationScripts, ...specialScripts].map((script) => path.basename(script)),
+);
+const discoveredTestFiles = (await fs.readdir(path.join(root, "scripts")))
+  .filter((name) => /^test-.*\.mjs$/.test(name))
+  .sort();
+const omittedTestFiles = discoveredTestFiles.filter((name) => !coveredTestFiles.has(name));
+if (omittedTestFiles.length > 0) {
+  throw new Error(`test:all coverage drift: unreferenced test scripts: ${omittedTestFiles.join(", ")}`);
+}
 
 console.log("\n=== Unit tests ===");
 for (const script of unitScripts) {
@@ -96,6 +110,12 @@ await new Promise((resolve, reject) => {
   });
   child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`test-read-text-streaming.mjs exit ${code}`))));
 });
+
+console.log("\n=== Self-contained integration tests ===");
+for (const script of selfContainedIntegrationScripts) {
+  console.log(`\n--- ${script} ---`);
+  await runNode(script);
+}
 
 console.log("\n=== Integration (spawn server) ===");
 const integrationStateDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-integration-state-"));
@@ -283,6 +303,7 @@ try {
   await runNode("scripts/test-mcp-session.mjs", {
     PORT: String(mcpPort),
     ADMIN_PORT: String(adminPort),
+    MCP_SESSION_TEST_ISOLATED: "1",
   });
   console.log("OK  test-mcp-session");
 } finally {

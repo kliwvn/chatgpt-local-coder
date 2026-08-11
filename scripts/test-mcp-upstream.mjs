@@ -84,6 +84,139 @@ await run("jsonSchemaToZodShape respects required fields", async () => {
   if (!bParsed.success) throw new Error("b should be optional");
 });
 
+await run("proxy preserves root additionalProperties arguments", async () => {
+  const calls = [];
+  const manager = {
+    listServerConfigs: () => [
+      { id: "dynamic", name: "Dynamic", enabled: true, expose: "all", tool_prefix: "dynamic" },
+    ],
+    listTools: async () => [
+      {
+        name: "echo",
+        description: "Echo arbitrary key/value arguments",
+        inputSchema: { type: "object", additionalProperties: { type: "string" } },
+      },
+    ],
+    callTool: async (_serverId, _toolName, args) => {
+      calls.push(args);
+      return { content: [{ type: "text", text: "ok" }] };
+    },
+  };
+  const hub = new McpServer({ name: "dynamic-proxy-test", version: "1" });
+  const client = new Client({ name: "dynamic-proxy-client", version: "1" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await refreshProxiedTools(hub, manager);
+    await Promise.all([hub.connect(serverTransport), client.connect(clientTransport)]);
+    await client.callTool({ name: "dynamic__echo", arguments: { alpha: "one", beta: "two" } });
+    assert.deepEqual(calls[0], { alpha: "one", beta: "two" }, "proxy stripped JSON Schema additionalProperties arguments");
+  } finally {
+    await client.close().catch(() => undefined);
+    await hub.close().catch(() => undefined);
+  }
+});
+
+await run("proxy enforces typed root additionalProperties", async () => {
+  const calls = [];
+  const manager = {
+    listServerConfigs: () => [
+      { id: "typed-dynamic", name: "Typed Dynamic", enabled: true, expose: "all", tool_prefix: "typed_dynamic" },
+    ],
+    listTools: async () => [
+      {
+        name: "echo",
+        inputSchema: { type: "object", additionalProperties: { type: "string" } },
+      },
+    ],
+    callTool: async (_serverId, _toolName, args) => {
+      calls.push(args);
+      return { content: [{ type: "text", text: "ok" }] };
+    },
+  };
+  const hub = new McpServer({ name: "typed-dynamic-proxy-test", version: "1" });
+  const client = new Client({ name: "typed-dynamic-proxy-client", version: "1" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await refreshProxiedTools(hub, manager);
+    await Promise.all([hub.connect(serverTransport), client.connect(clientTransport)]);
+    await client.callTool({ name: "typed_dynamic__echo", arguments: { alpha: "one" } });
+    assert.deepEqual(calls[0], { alpha: "one" });
+    const invalid = await client.callTool({ name: "typed_dynamic__echo", arguments: { alpha: 123 } });
+    assert.equal(invalid.isError, true, "typed additionalProperties accepted an invalid value");
+    assert.equal(calls.length, 1, "invalid dynamic argument reached the upstream handler");
+  } finally {
+    await client.close().catch(() => undefined);
+    await hub.close().catch(() => undefined);
+  }
+});
+
+await run("proxy preserves upstream mixed content blocks at MCP result level", async () => {
+  const manager = {
+    listServerConfigs: () => [
+      { id: "mixed", name: "Mixed", enabled: true, expose: "all", tool_prefix: "mixed" },
+    ],
+    listTools: async () => [
+      { name: "content", inputSchema: { type: "object", properties: {} } },
+    ],
+    callTool: async () => ({
+      content: [
+        { type: "text", text: "hello" },
+        { type: "resource_link", uri: "file:///tmp/example.txt", name: "example" },
+      ],
+    }),
+  };
+  const hub = new McpServer({ name: "mixed-proxy-test", version: "1" });
+  const client = new Client({ name: "mixed-proxy-client", version: "1" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await refreshProxiedTools(hub, manager);
+    await Promise.all([hub.connect(serverTransport), client.connect(clientTransport)]);
+    const result = await client.callTool({ name: "mixed__content", arguments: {} });
+    assert.equal(result.content?.[0]?.type, "text");
+    assert.doesNotThrow(() => JSON.parse(result.content?.[0]?.text || ""), "proxy dropped the local-coder JSON envelope");
+    const upstreamText = result.content?.find((block, index) => index > 0 && block.type === "text" && block.text === "hello");
+    const resource = result.content?.find((block) => block.type === "resource_link");
+    assert.ok(upstreamText, "proxy dropped the upstream text block");
+    assert.ok(resource, "proxy flattened upstream resource_link into JSON text");
+    assert.equal(resource.uri, "file:///tmp/example.txt");
+  } finally {
+    await client.close().catch(() => undefined);
+    await hub.close().catch(() => undefined);
+  }
+});
+
+await run("proxy preserves upstream isError and result metadata", async () => {
+  const manager = {
+    listServerConfigs: () => [
+      { id: "error-meta", name: "Error Meta", enabled: true, expose: "all", tool_prefix: "error_meta" },
+    ],
+    listTools: async () => [
+      { name: "fail", inputSchema: { type: "object", properties: {} } },
+    ],
+    callTool: async () => ({
+      content: [{ type: "text", text: "upstream failure" }],
+      isError: true,
+      _meta: { "mock/result-meta": "preserve-me" },
+    }),
+  };
+  const hub = new McpServer({ name: "error-meta-proxy-test", version: "1" });
+  const client = new Client({ name: "error-meta-proxy-client", version: "1" }, { capabilities: {} });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await refreshProxiedTools(hub, manager);
+    await Promise.all([hub.connect(serverTransport), client.connect(clientTransport)]);
+    const result = await client.callTool({ name: "error_meta__fail", arguments: {} });
+    assert.equal(result.isError, true, "proxy discarded upstream isError");
+    assert.equal(result._meta?.["mock/result-meta"], "preserve-me", "proxy discarded upstream result _meta");
+    const envelope = JSON.parse(result.content?.[0]?.text || "{}");
+    assert.equal(envelope.ok, false, "local-coder envelope did not mirror upstream tool failure");
+    assert.ok(result.content?.some((block, index) => index > 0 && block.type === "text" && block.text === "upstream failure"));
+  } finally {
+    await client.close().catch(() => undefined);
+    await hub.close().catch(() => undefined);
+  }
+});
+
 await run("upstream result preserves mixed MCP content blocks", async () => {
   const textOnly = formatUpstreamResult({
     content: [{ type: "text", text: "alpha" }, { type: "text", text: "beta" }],
@@ -477,6 +610,33 @@ try {
     if (!proxied.includes("mockhttp__add")) throw new Error(JSON.stringify(proxied));
     const names = manager.getProxiedToolNames(manager.getServerConfig("mockhttp"), await manager.listTools("mockhttp"));
     if (!names.includes("mockhttp__add")) throw new Error(JSON.stringify(names));
+    const client = new Client({ name: "proxy-annotation-test", version: "1" }, { capabilities: {} });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([hub.connect(serverTransport), client.connect(clientTransport)]);
+    const listed = await client.listTools();
+    const add = listed.tools.find((tool) => tool.name === "mockhttp__add");
+    if (!add) throw new Error("proxied add tool missing from tools/list");
+    assert.equal(add.annotations?.title, "Upstream Add Annotation", "proxy discarded upstream annotation title");
+    assert.equal(add.annotations?.readOnlyHint, true, "proxy discarded upstream readOnlyHint");
+    assert.equal(add.annotations?.destructiveHint, false, "proxy discarded upstream destructiveHint");
+    assert.equal(add.annotations?.idempotentHint, true, "proxy discarded upstream idempotentHint");
+    assert.equal(add.annotations?.openWorldHint, false, "proxy discarded upstream openWorldHint");
+    assert.equal(add._meta?.["mock/upstream-meta"], "preserve-me", "proxy discarded upstream tool _meta");
+    const bridgeServers = listed.tools.find((tool) => tool.name === "mcp_servers");
+    const bridgeTools = listed.tools.find((tool) => tool.name === "mcp_tools");
+    for (const bridgeRead of [bridgeServers, bridgeTools]) {
+      if (!bridgeRead) throw new Error("MCP bridge discovery tool missing from tools/list");
+      assert.equal(bridgeRead.annotations?.readOnlyHint, true, `${bridgeRead.name} must remain read-only`);
+      assert.equal(bridgeRead.annotations?.openWorldHint, true, `${bridgeRead.name} can contact upstream servers`);
+    }
+    const bridgeCall = listed.tools.find((tool) => tool.name === "mcp_call");
+    if (!bridgeCall) throw new Error("mcp_call bridge tool missing from tools/list");
+    assert.equal(bridgeCall.annotations?.readOnlyHint, false, "mcp_call must not claim read-only behavior");
+    assert.equal(bridgeCall.annotations?.destructiveHint, true, "mcp_call must conservatively allow destructive upstream effects");
+    assert.equal(bridgeCall.annotations?.idempotentHint, false, "mcp_call must not be retried as idempotent");
+    assert.equal(bridgeCall.annotations?.openWorldHint, true, "mcp_call crosses the upstream trust boundary");
+    await client.close();
+    await hub.close();
     await manager.shutdown();
   });
 

@@ -17,6 +17,8 @@ function buildServer() {
       title: "Add",
       description: "Add two numbers",
       inputSchema: { a: z.number(), b: z.number() },
+      annotations: { title: "Upstream Add Annotation", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      _meta: { "mock/upstream-meta": "preserve-me" },
     },
     async ({ a, b }) => ({
       content: [{ type: "text", text: String(a + b) }],

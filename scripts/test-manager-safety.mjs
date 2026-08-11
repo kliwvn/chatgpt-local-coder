@@ -232,6 +232,20 @@ try {
   assert.doesNotMatch(managerApp, /f-auto-approve|CHATGPT_AUTO_APPROVE/);
   assert.doesNotMatch(adminUiSource.match(/const ENV_KEYS = \[([\s\S]*?)\];/)?.[1] || "", /CHATGPT_AUTO_APPROVE/);
   assert.doesNotMatch(envExampleSource, /^CHATGPT_AUTO_APPROVE=/m);
+  assert.doesNotMatch(managerHtml, /f-session-cleanup|MCP_SESSION_CLEANUP_MS/, "cleanup cadence is an internal runtime knob and must not clutter Manager UI");
+  assert.doesNotMatch(managerApp, /f-session-cleanup/, "Manager structured form must not bind MCP_SESSION_CLEANUP_MS");
+  assert.doesNotMatch(adminUiSource.match(/const ENV_KEYS = \[([\s\S]*?)\];/)?.[1] || "", /MCP_SESSION_CLEANUP_MS/, "Admin structured settings must keep internal cleanup cadence hidden");
+  assert.doesNotMatch(managerHtml, /f-session-grace|MCP_SESSION_DELETE_GRACE_MS/, "DELETE drain grace is an internal lifecycle knob and must not clutter Manager UI");
+  assert.doesNotMatch(managerApp, /f-session-grace/, "Manager structured form must not bind MCP_SESSION_DELETE_GRACE_MS");
+  assert.doesNotMatch(adminUiSource.match(/const ENV_KEYS = \[([\s\S]*?)\];/)?.[1] || "", /MCP_SESSION_DELETE_GRACE_MS/, "Admin structured settings must keep internal DELETE drain grace hidden");
+  const fullDiskPos = managerHtml.indexOf('for="f-full-disk"');
+  const memoryBytesPos = managerHtml.indexOf('for="f-mem-bytes"');
+  const memoryLinesPos = managerHtml.indexOf('for="f-mem-lines"');
+  const extraWorkspacePos = managerHtml.indexOf('for="f-extra-ws"');
+  assert.ok(
+    fullDiskPos >= 0 && memoryBytesPos > fullDiskPos && memoryLinesPos > memoryBytesPos && extraWorkspacePos > memoryLinesPos,
+    "PROJECT_MEMORY_MAX_BYTES/LINES must sit immediately after FULL_DISK_ACCESS and before EXTRA_WORKSPACE_PATHS",
+  );
   assert.doesNotMatch(runtimeEntrySource, /MCP_SESSION_RECOVERY|SESSION_RECOVERY/, "runtime recovery must be invariant, not controlled by a hidden env switch");
   assert.doesNotMatch(JSON.stringify(item.config), /connectorName/);
   assert.doesNotMatch(await fs.readFile(path.join(demo, "config.json"), "utf8"), /connectorName/, "startup must scrub obsolete connectorName from existing instance config");

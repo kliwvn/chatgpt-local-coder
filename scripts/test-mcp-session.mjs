@@ -2,6 +2,13 @@
  * Integration test: MCP session init, tool call, stale-session recovery.
  * Requires server running on PORT (default 3000).
  */
+if (process.env.MCP_SESSION_TEST_ISOLATED !== "1") {
+  throw new Error(
+    "Refusing to run session-capacity integration tests against a potentially live Gateway. " +
+      "Use scripts/run-all-tests.mjs, which spawns an isolated test server."
+  );
+}
+
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const BASE = `http://127.0.0.1:${PORT}`;
 
@@ -565,21 +572,33 @@ await run("parallel initializes respect hard cap (bounded, no hang)", async () =
     new Promise((res) => setTimeout(() => res({ timeout: true }), 15000)),
   ]);
   if (results.timeout) throw new Error(`parallel initializes hung (batch > 15s)`);
-  const bounded = results.filter((r) => r.status === 200 && r.sid).length;
+  const successfulSessionIds = results.filter((r) => r.status === 200 && r.sid).map((r) => r.sid);
+  const bounded = successfulSessionIds.length;
   const rejected = results.filter((r) => r.status === 429).length;
   const unexpected = results.filter((r) => !((r.status === 200 && r.sid) || r.status === 429));
-  if (bounded + rejected !== total) {
-    throw new Error(
-      `unexpected statuses: ${JSON.stringify(results.map((r) => r.status).slice(0, 20))} ` +
-        `(${bounded} ok, ${rejected} 429, ${unexpected.length} unexpected of ${total})`
-    );
+  try {
+    if (bounded + rejected !== total) {
+      throw new Error(
+        `unexpected statuses: ${JSON.stringify(results.map((r) => r.status).slice(0, 20))} ` +
+          `(${bounded} ok, ${rejected} 429, ${unexpected.length} unexpected of ${total})`
+      );
+    }
+    if (bounded < 1) throw new Error(`expected at least one successful initialize, got ${bounded}`);
+    // Mọi reject phải là 429 admission — không phải 500 (bug) hay timeout.
+    if (unexpected.length) throw new Error(`over-cap returned non-429: ${JSON.stringify(unexpected.map((r) => r.status))}`);
+    const after = await adminSessions();
+    if (after.total > max) throw new Error(`retained ${after.total} > max ${max} after ${total} parallel initializes`);
+    console.log(`     (parallel init: ${bounded} ok, ${rejected} over-cap 429, retained ${after.total}/${max})`);
+  } finally {
+    // This case intentionally churns more than the retention cap. Dispose every
+    // successful initialize so the deterministic connected-cap case below does
+    // not inherit a full 64-session pool from test order. Already-evicted IDs
+    // may return 404 here, which is an acceptable cleanup outcome.
+    for (const sid of successfulSessionIds) {
+      await mcpPost("/mcp", undefined, sid, {}, "DELETE").catch(() => undefined);
+    }
+    await new Promise((r) => setTimeout(r, 100));
   }
-  if (bounded < 1) throw new Error(`expected at least one successful initialize, got ${bounded}`);
-  // Mọi reject phải là 429 admission — không phải 500 (bug) hay timeout.
-  if (unexpected.length) throw new Error(`over-cap returned non-429: ${JSON.stringify(unexpected.map((r) => r.status))}`);
-  const after = await adminSessions();
-  if (after.total > max) throw new Error(`retained ${after.total} > max ${max} after ${total} parallel initializes`);
-  console.log(`     (parallel init: ${bounded} ok, ${rejected} over-cap 429, retained ${after.total}/${max})`);
 });
 
 await run("over-cap initialize rejected with exactly 429 when all sessions connected", async () => {

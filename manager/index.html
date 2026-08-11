@@ -125,6 +125,16 @@
             <p class="hint">Giới hạn path-aware tools; run_command/start_process vẫn là native shell và không được OS-sandbox.</p>
           </div>
           <div class="field">
+            <label for="f-mem-bytes">PROJECT_MEMORY_MAX_BYTES</label>
+            <input id="f-mem-bytes" class="input mono" inputmode="numeric" placeholder="25000" />
+            <p class="hint">Giới hạn CLAUDE.md/AGENTS.md inject. Trống = mặc định 25000; 0 = không giới hạn.</p>
+          </div>
+          <div class="field">
+            <label for="f-mem-lines">PROJECT_MEMORY_MAX_LINES</label>
+            <input id="f-mem-lines" class="input mono" inputmode="numeric" placeholder="200" />
+            <p class="hint">Giới hạn số dòng. Trống = mặc định 200; 0 = không giới hạn.</p>
+          </div>
+          <div class="field">
             <label for="f-extra-ws">EXTRA_WORKSPACE_PATHS</label>
             <div class="inline">
               <input id="f-extra-ws" class="input grow mono" placeholder="D:\Coding\other-repo;E:\Data" spellcheck="false" />
@@ -153,29 +163,9 @@
             <p class="hint">Idle TTL; mặc định 2 phút. Session đang SSE/in-flight không bị evict; stale POST tự recover.</p>
           </div>
           <div class="field">
-            <label for="f-session-cleanup">MCP_SESSION_CLEANUP_MS</label>
-            <input id="f-session-cleanup" class="input mono" inputmode="numeric" placeholder="15000" />
-            <p class="hint">Chu kỳ dọn session idle; mặc định 15 giây.</p>
-          </div>
-          <div class="field">
-            <label for="f-session-grace">MCP_SESSION_DELETE_GRACE_MS</label>
-            <input id="f-session-grace" class="input mono" inputmode="numeric" placeholder="45000" />
-            <p class="hint">Grace sau DELETE để request đang chạy kết thúc; mặc định 45 giây.</p>
-          </div>
-          <div class="field">
             <label for="f-session-max">MCP_MAX_SESSIONS</label>
             <input id="f-session-max" class="input mono" inputmode="numeric" placeholder="64" />
             <p class="hint">Hard cap session giữ trong RAM; chỉ evict session idle cũ nhất.</p>
-          </div>
-          <div class="field">
-            <label for="f-mem-bytes">PROJECT_MEMORY_MAX_BYTES</label>
-            <input id="f-mem-bytes" class="input mono" inputmode="numeric" placeholder="25000" />
-            <p class="hint">Giới hạn CLAUDE.md/AGENTS.md inject. Trống = mặc định 25000; 0 = không giới hạn.</p>
-          </div>
-          <div class="field">
-            <label for="f-mem-lines">PROJECT_MEMORY_MAX_LINES</label>
-            <input id="f-mem-lines" class="input mono" inputmode="numeric" placeholder="200" />
-            <p class="hint">Giới hạn số dòng. Trống = mặc định 200; 0 = không giới hạn.</p>
           </div>
         </div>
 

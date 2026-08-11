@@ -727,7 +727,7 @@ export function registerFilesystemTools(server: McpServer): void {
       description: "Create a directory (and parents if needed).",
       inputSchema: { path: z.string() },
 
-      annotations: toolAnnotations("edit"),
+      annotations: toolAnnotations("idempotent_additive"),
     },
     async ({ path: dirPath }) => {
       requireWriteAllowed();

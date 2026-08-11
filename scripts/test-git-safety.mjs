@@ -48,9 +48,11 @@ try {
   process.env.CHECKPOINT_MAX_FILE_BYTES = "5242880";
 
   const handlers = new Map();
+  const definitions = new Map();
   registerGitTools(
     {
-      registerTool(name, _definition, handler) {
+      registerTool(name, definition, handler) {
+        definitions.set(name, definition);
         handlers.set(name, handler);
       },
     },
@@ -65,6 +67,13 @@ try {
   assert.equal(typeof restore, "function", "git_restore handler not registered");
   for (const [name, handler] of [["git_branch", branchTool], ["git_checkout", checkout], ["git_push", push], ["git_pull", pull], ["git_reset", reset]]) {
     assert.equal(typeof handler, "function", `${name} handler not registered`);
+  }
+  for (const name of ["git_push", "git_pull"]) {
+    assert.deepEqual(
+      definitions.get(name)?.annotations,
+      { readOnlyHint: false, destructiveHint: true, openWorldHint: true, idempotentHint: false },
+      `${name} must stay conservative across the remote/network boundary`,
+    );
   }
 
   const tracked = path.join(repo, "a.txt");
