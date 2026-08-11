@@ -257,7 +257,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
   });
 
   server.registerTool("git_restore", {
-    title: "Restore Tracked Files",
+    title: "Git Restore",
     description:
       "Restore tracked file(s) in the current repo to the last committed version. Local workspace only.",
     inputSchema: {

@@ -743,7 +743,7 @@ export function registerFilesystemTools(server: McpServer): void {
   server.registerTool(
     "delete_directory",
     {
-      title: "Remove Local Folder",
+      title: "Delete Directory",
       description:
         "Remove a folder reversibly by moving it to the Windows Recycle Bin. Workspace/repo/home/drive roots are refused.",
       inputSchema: { path: z.string() },

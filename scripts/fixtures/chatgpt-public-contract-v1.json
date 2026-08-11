@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "hash": "831a8ed5063c150bdcd9d199256828d9ea592d1348790eae40ada33d5e19e6e7",
+  "hash": "afd98bd357ca28dfa8ad498eda1b7837583b4948837a47dda168c82885dd39e6",
   "tools": [
     {
       "annotations": {
@@ -386,7 +386,7 @@
         "type": "object"
       },
       "name": "delete_directory",
-      "title": "Remove Local Folder"
+      "title": "Delete Directory"
     },
     {
       "annotations": {
@@ -635,7 +635,7 @@
         "type": "object"
       },
       "name": "git_restore",
-      "title": "Restore Tracked Files"
+      "title": "Git Restore"
     },
     {
       "annotations": {
