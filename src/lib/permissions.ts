@@ -215,6 +215,52 @@ function stripSingleQuotedLiterals(input: string): string {
   return out;
 }
 
+function foldSimpleStringConcatenations(input: string): string {
+  let current = input;
+  const pair = /(['"])([A-Za-z0-9_.:-]*)\1\s*\.\s*(['"])([A-Za-z0-9_.:-]*)\3/g;
+  for (let pass = 0; pass < 8; pass++) {
+    const next = current.replace(pair, (_match, _q1, left: string, _q2, right: string) => `'${left}${right}'`);
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+function foldSimplePlusStringConcatenations(input: string): string {
+  let current = input;
+  const pair = /(['"])([A-Za-z0-9_.:-]*)\1\s*\+\s*(['"])([A-Za-z0-9_.:-]*)\3/g;
+  for (let pass = 0; pass < 8; pass++) {
+    const next = current.replace(pair, (_match, _q1, left: string, _q2, right: string) => `'${left}${right}'`);
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+function propagateBareAliases(input: string, bindings: Set<string>): void {
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = false;
+    for (const match of input.matchAll(/\b(?:const\s+|let\s+|var\s+)?([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*;?/g)) {
+      if (!bindings.has(match[2]) || bindings.has(match[1])) continue;
+      bindings.add(match[1]);
+      changed = true;
+    }
+    if (!changed) break;
+  }
+}
+
+function propagateSigilAliases(input: string, bindings: Set<string>): void {
+  for (let pass = 0; pass < 8; pass++) {
+    let changed = false;
+    for (const match of input.matchAll(/\$([A-Za-z_]\w*)\s*=\s*\$([A-Za-z_]\w*)\s*;?/g)) {
+      if (!bindings.has(match[2]) || bindings.has(match[1])) continue;
+      bindings.add(match[1]);
+      changed = true;
+    }
+    if (!changed) break;
+  }
+}
+
 function firstCommandIndex(tokens: string[]): number {
   let index = 0;
   while (index < tokens.length) {
@@ -281,76 +327,251 @@ function destructiveInlineCode(executable: string, code: string): boolean {
   if (PYTHON_BINARIES.test(executable)) {
     const importsFilesystemModule =
       /\bimport\s+(?:os|shutil|pathlib)\b|\bfrom\s+(?:os|shutil|pathlib)\s+import\b|__import__\s*\(\s*['"](?:os|shutil|pathlib)['"]\s*\)/i.test(code);
+    const filesystemBindings = new Set<string>();
+    const pathBindings = new Set<string>();
+    const destructiveFunctionBindings = new Set<string>();
+    const opaqueFilesystemFunctionBindings = new Set<string>();
+    for (const match of code.matchAll(/\bimport\s+(os|shutil|pathlib)\b(?:\s+as\s+([A-Za-z_]\w*))?/gi)) {
+      filesystemBindings.add(match[2] || match[1]);
+    }
+    for (const match of code.matchAll(/\bfrom\s+(os|shutil)\s+import\s+(rmtree|remove|unlink|rmdir|removedirs)\b(?:\s+as\s+([A-Za-z_]\w*))?/gi)) {
+      destructiveFunctionBindings.add(match[3] || match[2]);
+    }
+    for (const match of code.matchAll(/\bfrom\s+pathlib\s+import\s+Path\b(?:\s+as\s+([A-Za-z_]\w*))?/gi)) {
+      pathBindings.add(match[1] || "Path");
+    }
     if (/\b(?:eval|exec)\s*\(/i.test(visible)) return true;
-    const dynamicFilesystemLookup =
-      importsFilesystemModule &&
-      (/(?:\bvars\s*\([^)]*\)|\.__dict__)\s*\[[^\]]+\]\s*\(/i.test(code) ||
-        /\bgetattr\s*\([^,]+,\s*(?!['"](?:rmtree|remove|unlink|rmdir|removedirs)['"]\s*\))[^)]+\)\s*\(/i.test(code));
-    const destructiveAlias =
-      /\b([A-Za-z_]\w*)\s*=\s*(?:shutil\s*\.\s*rmtree|os\s*\.\s*(?:remove|unlink|rmdir|removedirs)|getattr\s*\([^,]+,\s*['"](?:rmtree|remove|unlink|rmdir|removedirs)['"]\s*\))\s*;?[\s\S]*\b\1\s*\(/i.test(code);
+    for (const binding of filesystemBindings) {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      for (const match of code.matchAll(new RegExp(`\\b([A-Za-z_]\\w*)\\s*=\\s*${escaped}\\s*\\.\\s*(?:rmtree|remove|unlink|rmdir|removedirs)\\b`, "gi"))) {
+        destructiveFunctionBindings.add(match[1]);
+      }
+    }
+    for (const match of code.matchAll(/\b([A-Za-z_]\w*)\s*=\s*getattr\s*\([^,]+,\s*['"](?:rmtree|remove|unlink|rmdir|removedirs)['"]\s*\)/gi)) {
+      destructiveFunctionBindings.add(match[1]);
+    }
+    for (const binding of filesystemBindings) {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      for (const match of code.matchAll(new RegExp(`\\b([A-Za-z_]\\w*)\\s*=\\s*getattr\\s*\\(\\s*${escaped}\\s*,\\s*([^)]*)\\)`, "gi"))) {
+        const selector = match[2].trim();
+        const literal = /^['"]([A-Za-z_]\w*)['"]$/.exec(selector);
+        if (!literal) opaqueFilesystemFunctionBindings.add(match[1]);
+      }
+      for (const match of code.matchAll(new RegExp(`\\b([A-Za-z_]\\w*)\\s*=\\s*(?:vars\\s*\\(\\s*${escaped}\\s*\\)|${escaped}\\s*\\.__dict__)\\s*\\[\\s*([^\\]]+)\\s*\\]`, "gi"))) {
+        const selector = match[2].trim();
+        const literal = /^['"]([A-Za-z_]\w*)['"]$/.exec(selector);
+        if (!literal) opaqueFilesystemFunctionBindings.add(match[1]);
+        else if (/^(?:rmtree|remove|unlink|rmdir|removedirs)$/i.test(literal[1])) destructiveFunctionBindings.add(match[1]);
+      }
+    }
+    propagateBareAliases(code, destructiveFunctionBindings);
+    propagateBareAliases(code, opaqueFilesystemFunctionBindings);
+    const boundFilesystemDelete = [...filesystemBindings].some((binding) => {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`\\b${escaped}\\s*\\.\\s*(?:rmtree|remove|unlink|rmdir|removedirs)\\s*\\(`, "i").test(visible)) return true;
+      for (const match of code.matchAll(new RegExp(`\\bgetattr\\s*\\(\\s*${escaped}\\s*,\\s*([^)]*)\\)\\s*\\(`, "gi"))) {
+        const literal = /^['"]([A-Za-z_]\w*)['"]$/.exec(match[1].trim());
+        if (!literal || /^(?:rmtree|remove|unlink|rmdir|removedirs)$/i.test(literal[1])) return true;
+      }
+      for (const match of code.matchAll(new RegExp(`\\b(?:vars\\s*\\(\\s*${escaped}\\s*\\)|${escaped}\\s*\\.__dict__)\\s*\\[\\s*([^\\]]+)\\s*\\]\\s*\\(`, "gi"))) {
+        const literal = /^['"]([A-Za-z_]\w*)['"]$/.exec(match[1].trim());
+        if (!literal || /^(?:rmtree|remove|unlink|rmdir|removedirs)$/i.test(literal[1])) return true;
+      }
+      return false;
+    });
+    const importedDeleteCall = [...destructiveFunctionBindings].some((binding) => {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`\\b${escaped}\\s*\\(`).test(visible);
+    });
+    const opaqueFilesystemCall = [...opaqueFilesystemFunctionBindings].some((binding) => {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`\\b${escaped}\\s*\\(`).test(visible);
+    });
+    const pathlibDelete = [...pathBindings].some((binding) => {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`\\b${escaped}\\s*\\([^)]*\\)\\s*\\.\\s*(?:unlink|rmdir)\\s*\\(`, "i").test(visible);
+    });
     return (
       /\bshutil\s*\.\s*rmtree\s*\(|\bos\s*\.\s*(?:remove|unlink|rmdir|removedirs)\s*\(/i.test(visible) ||
       /\b(?:pathlib\s*\.\s*)?Path\s*\([^)]*\)\s*\.\s*(?:unlink|rmdir)\s*\(/i.test(visible) ||
       /__import__\s*\(\s*['"](?:shutil|os)['"]\s*\)\s*\.\s*(?:rmtree|remove|unlink|rmdir|removedirs)\s*\(/i.test(code) ||
       /\bgetattr\s*\([^,]+,\s*['"](?:rmtree|remove|unlink|rmdir|removedirs)['"]\s*\)\s*\(/i.test(code) ||
       /\boperator\s*\.\s*methodcaller\s*\(\s*['"](?:rmtree|remove|unlink|rmdir|removedirs)['"]/i.test(code) ||
-      destructiveAlias ||
-      dynamicFilesystemLookup ||
+      boundFilesystemDelete ||
+      importedDeleteCall ||
+      opaqueFilesystemCall ||
+      pathlibDelete ||
       (importsFilesystemModule && /\b(?:rmtree|remove|unlink|rmdir|removedirs)\s*\(/i.test(visible))
     );
   }
   if (NODE_BINARIES.test(executable)) {
+    const requireBindings = new Set<string>(["require"]);
+    for (const match of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*;?/gi)) {
+      requireBindings.add(match[1]);
+    }
+    const requireCall = [...requireBindings]
+      .map((binding) => binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join("|");
     const importsFilesystemModule =
-      /\brequire\s*\(\s*['"]?(?:node:)?fs(?:\/promises)?['"]?\s*\)|\bfrom\s*['"](?:node:)?fs(?:\/promises)?['"]|\bimport\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/i.test(code);
+      new RegExp(`\\b(?:${requireCall})\\s*\\(\\s*['"](?:node:)?fs(?:\\/promises)?['"]\\s*\\)`, "i").test(code) ||
+      /\bfrom\s*['"](?:node:)?fs(?:\/promises)?['"]|\bimport\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/i.test(code);
     const filesystemBindings = new Set<string>();
-    for (const match of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/gi)) {
-      filesystemBindings.add(match[1]);
+    const filesystemNameBindings = new Set<string>();
+    for (const match of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*['"](?:node:)?fs(?:\/promises)?['"]\s*;?/gi)) {
+      filesystemNameBindings.add(match[1]);
+    }
+    for (const binding of requireBindings) {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const bindingPattern = new RegExp(
+        `\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${escaped}\\s*\\(\\s*['"](?:node:)?fs(?:\\/promises)?['"]\\s*\\)`,
+        "gi",
+      );
+      for (const match of code.matchAll(bindingPattern)) filesystemBindings.add(match[1]);
+      for (const moduleName of filesystemNameBindings) {
+        const escapedModule = moduleName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const dynamicBindingPattern = new RegExp(
+          `\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${escaped}\\s*\\(\\s*${escapedModule}\\s*\\)`,
+          "gi",
+        );
+        for (const match of code.matchAll(dynamicBindingPattern)) filesystemBindings.add(match[1]);
+      }
     }
     for (const match of code.matchAll(/\bimport\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+['"](?:node:)?fs(?:\/promises)?['"]/gi)) {
       filesystemBindings.add(match[1]);
     }
     if (/\b(?:eval|Function)\s*\(/.test(visible)) return true;
+    const destructiveFunctionBindings = new Set<string>();
+    for (const binding of filesystemBindings) {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      for (const match of code.matchAll(new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${escaped}\\s*\\.\\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\\b`, "gi"))) {
+        destructiveFunctionBindings.add(match[1]);
+      }
+    }
+    for (const match of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)\s*\.\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\b/gi)) {
+      destructiveFunctionBindings.add(match[1]);
+    }
+    for (const match of code.matchAll(/\{([^}]*)\}\s*=\s*require\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)/gi)) {
+      for (const part of match[1].split(",")) {
+        const named = /^\s*(rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\s*(?::\s*([A-Za-z_$][\w$]*))?\s*$/i.exec(part);
+        if (named) destructiveFunctionBindings.add(named[2] || named[1]);
+      }
+    }
+    for (const match of code.matchAll(/\bimport\s*\{([^}]*)\}\s*from\s*['"](?:node:)?fs(?:\/promises)?['"]/gi)) {
+      for (const part of match[1].split(",")) {
+        const named = /^\s*(rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\s*(?:as\s+([A-Za-z_$][\w$]*))?\s*$/i.exec(part);
+        if (named) destructiveFunctionBindings.add(named[2] || named[1]);
+      }
+    }
+    propagateBareAliases(code, destructiveFunctionBindings);
+    const aliasedDeleteCall = [...destructiveFunctionBindings].some((binding) => {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`\\b${escaped}\\s*\\(`).test(visible);
+    });
     const dynamicFilesystemMember = [...filesystemBindings].some((binding) => {
       const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      return (
-        new RegExp(`\\b${escaped}\\s*\\[[^\\]]+\\]\\s*\\(`).test(code) ||
-        new RegExp(`\\bReflect\\s*\\.\\s*get\\s*\\(\\s*${escaped}\\s*,\\s*['"](?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)['"]\\s*\\)\\s*\\(`, "i").test(code) ||
-        new RegExp(`\\b${escaped}\\s*\\.\\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\\s*\\.\\s*bind\\s*\\([^)]*\\)\\s*\\(`, "i").test(code) ||
-        new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${escaped}\\s*\\.\\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\\s*;?[\\s\\S]*\\b\\1\\s*\\(`, "i").test(code)
-      );
+      if (new RegExp(`\\b${escaped}\\s*\\.\\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\\s*\\(`, "i").test(visible)) return true;
+      if (new RegExp(`\\b${escaped}\\s*\\.\\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\\s*\\.\\s*bind\\s*\\([^)]*\\)\\s*\\(`, "i").test(code)) return true;
+      if (new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${escaped}\\s*\\.\\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\\s*;?[\\s\\S]*\\b\\1\\s*\\(`, "i").test(code)) return true;
+      for (const match of code.matchAll(new RegExp(`\\b${escaped}\\s*\\[\\s*([^\\]]+)\\s*\\]\\s*\\(`, "gi"))) {
+        const literal = /^['"]([A-Za-z_$][\w$]*)['"]$/.exec(match[1].trim());
+        if (!literal || /^(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)$/i.test(literal[1])) return true;
+      }
+      for (const match of code.matchAll(new RegExp(`\\bReflect\\s*\\.\\s*get\\s*\\(\\s*${escaped}\\s*,\\s*([^)]*)\\)\\s*\\(`, "gi"))) {
+        const literal = /^['"]([A-Za-z_$][\w$]*)['"]$/.exec(match[1].trim());
+        if (!literal || /^(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)$/i.test(literal[1])) return true;
+      }
+      return false;
     });
+    let directRequireMember = false;
+    for (const match of code.matchAll(/\brequire\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)\s*\[\s*([^\]]+)\s*\]\s*\(/gi)) {
+      const literal = /^['"]([A-Za-z_$][\w$]*)['"]$/.exec(match[1].trim());
+      if (!literal || /^(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)$/i.test(literal[1])) {
+        directRequireMember = true;
+        break;
+      }
+    }
     return (
       /\bfs(?:\s*\.\s*promises)?\s*\.\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\s*\(/i.test(visible) ||
       /require\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)(?:\s*\.\s*promises)?\s*(?:\.\s*|\[\s*['"])(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)(?:['"]\s*\])?\s*\(/i.test(code) ||
-      /require\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)\s*\[[^\]]+\]\s*\(/i.test(code) ||
+      directRequireMember ||
+      /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)\s*\.\s*(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\s*;?[\s\S]*\b\1\s*\(/i.test(code) ||
       /\{[^}]*\b(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\s*:\s*([A-Za-z_$][\w$]*)[^}]*\}\s*=\s*require\s*\(\s*['"](?:node:)?fs(?:\/promises)?['"]\s*\)[\s\S]*\b\1\s*\(/i.test(code) ||
       (importsFilesystemModule && /\[\s*['"](?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)['"]\s*\]\s*\(/i.test(code)) ||
       (importsFilesystemModule && /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*['"](?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)['"][^;]*;[\s\S]*\[\s*\1\s*\]\s*\(/i.test(code)) ||
+      aliasedDeleteCall ||
       dynamicFilesystemMember ||
       (importsFilesystemModule && /\b(?:rm|rmsync|unlink|unlinksync|rmdir|rmdirsync)\s*\(/i.test(visible))
     );
   }
   if (PERL_BINARIES.test(executable)) {
     if (/\beval\b/i.test(visible)) return true;
+    const folded = foldSimpleStringConcatenations(code);
+    const destructiveFunctionBindings = new Set<string>();
+    const literalFunctionBindings = new Map<string, string>();
+    for (const match of folded.matchAll(/\$([A-Za-z_]\w*)\s*=\s*['"]([A-Za-z_]\w*)['"]\s*;?/gi)) literalFunctionBindings.set(match[1], match[2]);
+    for (const match of folded.matchAll(/\$([A-Za-z_]\w*)\s*=\s*['"](?:unlink|rmdir)['"]\s*;?/gi)) destructiveFunctionBindings.add(match[1]);
+    propagateSigilAliases(folded, destructiveFunctionBindings);
+    const aliasedDeleteCall = [...destructiveFunctionBindings].some((binding) => {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`&\\s*\\$${escaped}\\s*\\(`, "i").test(folded);
+    });
+    for (const match of folded.matchAll(/&\s*\$([A-Za-z_]\w*)\s*\(/g)) {
+      if (!literalFunctionBindings.has(match[1])) return true;
+    }
     return (
       /\b(?:unlink|rmdir)\b/i.test(visible) ||
-      /\$([A-Za-z_]\w*)\s*=\s*['"](?:unlink|rmdir)['"]\s*;?[\s\S]*&\s*\$\1\s*\(/i.test(code)
+      aliasedDeleteCall
     );
   }
   if (RUBY_BINARIES.test(executable)) {
     if (/\b(?:eval|class_eval|instance_eval)\b/i.test(visible)) return true;
+    const folded = foldSimplePlusStringConcatenations(code);
+    const destructiveMethodBindings = new Set<string>();
+    const destructiveSymbolBindings = new Set<string>();
+    const literalSelectorBindings = new Map<string, string>();
+    for (const match of folded.matchAll(/\b([A-Za-z_]\w*)\s*=\s*(?::([A-Za-z_]\w*)|['"]([A-Za-z_]\w*)['"](?:\s*\.\s*to_sym)?)\s*;?/gi)) {
+      literalSelectorBindings.set(match[1], match[2] || match[3]);
+    }
+    for (const match of folded.matchAll(/\b([A-Za-z_]\w*)\s*=\s*(?:File|Dir|FileUtils)\s*\.\s*method\s*\(\s*:(?:delete|unlink|rmdir|rm|rm_f|rm_r|rm_rf|remove|remove_dir|remove_entry|remove_entry_secure)\s*\)/gi)) {
+      destructiveMethodBindings.add(match[1]);
+    }
+    for (const match of folded.matchAll(/\b([A-Za-z_]\w*)\s*=\s*(?::|['"])(?:delete|unlink|rmdir|rm|rm_f|rm_r|rm_rf|remove|remove_dir|remove_entry|remove_entry_secure)(?:['"](?:\s*\.\s*to_sym)?)?\b/gi)) {
+      destructiveSymbolBindings.add(match[1]);
+    }
+    propagateBareAliases(folded, destructiveMethodBindings);
+    propagateBareAliases(folded, destructiveSymbolBindings);
+    const aliasedMethodCall = [...destructiveMethodBindings].some((binding) => new RegExp(`\\b${binding}\\s*\\.\\s*call\\s*\\(`).test(folded));
+    const aliasedSymbolSend = [...destructiveSymbolBindings].some((binding) => new RegExp(`\\b(?:File|Dir|FileUtils)\\s*\\.\\s*(?:send|public_send)\\s*\\(\\s*${binding}\\b`, "i").test(folded));
+    for (const match of folded.matchAll(/\b(?:File|Dir|FileUtils)\s*\.\s*(?:send|public_send)\s*\(\s*([A-Za-z_]\w*)\b/gi)) {
+      if (!literalSelectorBindings.has(match[1])) return true;
+    }
     return (
       /\b(?:File\s*\.\s*(?:delete|unlink)|Dir\s*\.\s*rmdir|FileUtils\s*\.\s*(?:rm|rm_f|rm_r|rm_rf|remove|remove_dir|remove_entry|remove_entry_secure))\s*\(/i.test(visible) ||
       /\b(?:File|Dir|FileUtils)\s*\.\s*(?:send|public_send)\s*\(\s*:(?:delete|unlink|rmdir|rm|rm_f|rm_r|rm_rf|remove|remove_dir|remove_entry|remove_entry_secure)\b/i.test(code) ||
-      /\b(?:File|Dir|FileUtils)\s*\.\s*method\s*\(\s*:(?:delete|unlink|rmdir|rm|rm_f|rm_r|rm_rf|remove|remove_dir|remove_entry|remove_entry_secure)\s*\)\s*\.\s*call\s*\(/i.test(code)
+      /\b(?:File|Dir|FileUtils)\s*\.\s*method\s*\(\s*:(?:delete|unlink|rmdir|rm|rm_f|rm_r|rm_rf|remove|remove_dir|remove_entry|remove_entry_secure)\s*\)\s*\.\s*call\s*\(/i.test(code) ||
+      aliasedMethodCall ||
+      aliasedSymbolSend
     );
   }
   if (PHP_BINARIES.test(executable)) {
     if (/\beval\s*\(/i.test(visible)) return true;
+    const folded = foldSimpleStringConcatenations(code);
+    const destructiveFunctionBindings = new Set<string>();
+    const literalFunctionBindings = new Map<string, string>();
+    for (const match of folded.matchAll(/\$([A-Za-z_]\w*)\s*=\s*['"]([A-Za-z_]\w*)['"]\s*;?/gi)) literalFunctionBindings.set(match[1], match[2]);
+    for (const match of folded.matchAll(/\$([A-Za-z_]\w*)\s*=\s*['"](?:unlink|rmdir)['"]\s*;?/gi)) destructiveFunctionBindings.add(match[1]);
+    propagateSigilAliases(folded, destructiveFunctionBindings);
+    const aliasedDeleteCall = [...destructiveFunctionBindings].some((binding) => {
+      const escaped = binding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`\\$${escaped}\\s*\\(`, "i").test(folded);
+    });
+    for (const match of folded.matchAll(/\$([A-Za-z_]\w*)\s*\(/g)) {
+      if (!literalFunctionBindings.has(match[1])) return true;
+    }
     return (
       /\b(?:unlink|rmdir)\s*\(/i.test(visible) ||
       /\bcall_user_func(?:_array)?\s*\(\s*['"](?:unlink|rmdir)['"]/i.test(code) ||
-      /\$([A-Za-z_]\w*)\s*=\s*['"](?:unlink|rmdir)['"]\s*;?[\s\S]*\$\1\s*\(/i.test(code)
+      aliasedDeleteCall
     );
   }
   return false;
@@ -362,6 +583,16 @@ function destructiveDynamicInvocation(command: string): boolean {
   // text classifier. Fail closed rather than allowing an uninspectable command
   // name to resolve to Remove-Item/rm/etc. Quoted examples remain harmless.
   if (/&\s*(?:\$(?:\{|[A-Za-z_])|\()/i.test(visible)) return true;
+  if (/\[(?:system\.)?io\.(?:file|directory)\][\s\S]*\.\s*getmethods?\s*\([\s\S]*\.\s*invoke\s*\(/i.test(command)) return true;
+  if (/\[(?:system\.)?io\.(?:file|directory)\]\s*\.\s*invokemember\s*\(/i.test(command)) return true;
+  if (/\b(?:get-item|get-childitem|gi|gci)\b[\s\S]*\|[\s\S]*(?:foreach-object\b|%)[\s\S]*\$_\s*\.\s*delete\s*\(/i.test(visible)) return true;
+  if (/\b(?:get-item|get-childitem|gi|gci)\b[\s\S]*\|[\s\S]*(?:foreach-object\b|%)[\s\S]*\$_\s*\.\s*psobject\s*\.\s*methods\s*\[\s*['"]delete['"]\s*\]\s*\.\s*invoke\s*\(/i.test(command)) return true;
+  for (const match of visible.matchAll(/\$([A-Za-z_]\w*)\s*=\s*(?:\(\s*)?(?:get-item|get-childitem|gi|gci)\b[^;\r\n]*;[\s\S]*?\$\1\s*\.\s*delete\s*\(/gi)) {
+    if (match[0]) return true;
+  }
+  for (const match of visible.matchAll(/\$([A-Za-z_]\w*)\s*=\s*\[(?:system\.)?io\.(?:fileinfo|directoryinfo)\]\s*::\s*new\s*\([^;\r\n]*;[\s\S]*?\$\1\s*\.\s*delete\s*\(/gi)) {
+    if (match[0]) return true;
+  }
 
   for (const match of command.matchAll(/\bset\s+"?([A-Za-z_][A-Za-z0-9_]*)=([^&|\r\n"]+)/gi)) {
     const name = match[1];
@@ -375,8 +606,15 @@ function destructiveDynamicInvocation(command: string): boolean {
     const name = match[1];
     const value = executableName(match[2]);
     if (!DELETE_COMMANDS.has(value) && !CRITICAL_DISK_COMMANDS.has(value)) continue;
-    const expansion = new RegExp(`(?:^|[;&|]\\s*)\\$(?:\\{${name}\\}|${name})(?:\\s|$)`, "i");
-    if (expansion.test(visible)) return true;
+    const expansion = new RegExp(`(?:^|[;&|]\\s*)(?:command|env|sudo)\\s+\\$(?:\\{${name}\\}|${name})(?:\\s+([^;&|\\r\\n]*))?(?:$|[;&|])`, "i");
+    const invocation = expansion.exec(visible);
+    if (invocation && classifyCommand(`${match[2]} ${invocation[1] || ""}`.trim())) return true;
+  }
+  const knownPosixAssignments = new Set<string>();
+  for (const match of visible.matchAll(/(?:^|[;&|]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[A-Za-z0-9_.-]+/g)) knownPosixAssignments.add(match[1]);
+  for (const match of visible.matchAll(/(?:^|[;&|]\s*)(?:command|env|sudo)\s+\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))(?:\s|$)/g)) {
+    const name = match[1] || match[2];
+    if (!knownPosixAssignments.has(name)) return true;
   }
   return false;
 }

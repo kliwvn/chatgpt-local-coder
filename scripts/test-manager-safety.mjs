@@ -219,6 +219,7 @@ try {
   assert.match(managerHtml, /id="btn-server-restart"[^>]*class="[^"]*btn-green[^"]*"[^>]*>[^<]*Khởi động lại Gateway/, "Gateway restart must use the same green emphasis as Connector");
   assert.match(managerHtml, /id="btn-connector"[^>]*class="[^"]*btn-green[^"]*"/, "Connector button must retain the shared green emphasis");
   assert.match(managerHtml, /id="foot-admin"[^>]*class="[^"]*btn-primary[^"]*"/, "Admin UI link must be visually emphasized");
+  assert.doesNotMatch(managerHtml, /Focus Server|Focus Tunnel/, "user-facing Manager UI must not expose the ambiguous Focus label");
   assert.match(managerHtml, /id="f-admin-port"/);
   assert.match(managerHtml, /id="add-admin-port"/);
   assert.doesNotMatch(managerHtml, /f-connector|Tên Connector/);
