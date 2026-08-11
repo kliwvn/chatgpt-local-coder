@@ -8,6 +8,7 @@ import type { UpstreamServerConfig } from "./mcp-upstream-config.js";
 import { MCP_TOOL_RESULT_MAX_BYTES } from "./output-budget.js";
 import { proxiedToolAnnotations } from "./tool-annotations.js";
 import { toolResult } from "./tool-result.js";
+import { getChatGptToolProfile } from "./tool-profile.js";
 
 interface ProxyRegistration {
   registered: RegisteredTool;
@@ -168,9 +169,13 @@ function proxiedCallResult(proxyName: string, upstreamServer: string, upstreamTo
 }
 
 export async function refreshProxiedTools(server: McpServer, manager: McpUpstreamManager): Promise<string[]> {
+  // The slim profile is a frozen ChatGPT ABI: native upstream proxies must
+  // never appear in (or disappear from) the stable inventory. Proxy refresh is
+  // a full-profile-only activity; the mcp_call bridge still reaches upstream.
+  if (getChatGptToolProfile() !== "full") return [];
+
   const registry = getRegistry(server);
   const activeNames = new Set<string>();
-
   for (const config of manager.listServerConfigs()) {
     if (!config.enabled) continue;
     if (config.expose !== "all" && config.expose !== "allowlist") continue;

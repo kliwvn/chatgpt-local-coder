@@ -14,6 +14,8 @@ import {
   type UpstreamServerConfig,
   resolveUpstreamConfigPath,
 } from "./mcp-upstream-config.js";
+import { refreshProxiedTools } from "./mcp-tool-proxy.js";
+import { getChatGptToolProfile } from "./tool-profile.js";
 
 export type UpstreamHealth = "unknown" | "connected" | "reachable" | "unreachable" | "disabled";
 
@@ -453,7 +455,9 @@ export class McpUpstreamManager {
   }
 
   async refreshAllProxies(): Promise<void> {
-    const { refreshProxiedTools } = await import("./mcp-tool-proxy.js");
+    // Slim servers advertise a frozen inventory (listChanged absent): never
+    // broadcast a list-changed notification for them.
+    if (getChatGptToolProfile() !== "full") return;
     for (const server of this.servers) {
       await refreshProxiedTools(server, this);
       server.sendToolListChanged();

@@ -56,7 +56,10 @@ export async function createMcpServer(
     {
       capabilities: {
         logging: {},
-        tools: { listChanged: true },
+        // The slim profile is a frozen ChatGPT ABI: the tool inventory never
+        // changes after initialize, so listChanged must not be advertised.
+        // The full (dynamic) profile keeps listChanged for upstream proxies.
+        tools: getChatGptToolProfile() === "full" ? { listChanged: true } : {},
       },
       // instruction-context already builds the complete server instruction
       // document (agent workflow + env/git/project memory + quick pointers).
@@ -69,6 +72,7 @@ export async function createMcpServer(
     }
   );
 
+  const profile = getChatGptToolProfile();
   const restoreRegisterTool = applyToolProfile(server);
 
   registerFilesystemTools(server);
@@ -77,24 +81,38 @@ export async function createMcpServer(
   registerContextTools(server, workspaceRoot);
   registerRewindTools(server);
 
-  if (upstreamManager) {
-    registerMcpBridgeTools(server, upstreamManager);
+  if (profile === "full") {
+    // Bridge tools exist on every server regardless of manager attachment; the
+    // full profile additionally restores raw registration so upstream proxies
+    // can be registered dynamically.
+    registerMcpBridgeTools(server, upstreamManager ?? null);
     restoreRegisterTool();
-    upstreamManager.registerMcpServer(server);
-    // A client may issue tools/list immediately after initialize. Do not expose
-    // the session until all configured proxy tools have been registered, or the
-    // first tools/list becomes timing-dependent. Upstream tool discovery itself
-    // is cached by McpUpstreamManager, so warm-session cost stays low.
-    try {
-      await refreshProxiedTools(server, upstreamManager);
-    } catch (err) {
-      upstreamManager.unregisterMcpServer(server);
-      await server.close().catch(() => undefined);
-      throw err;
+    if (upstreamManager) {
+      upstreamManager.registerMcpServer(server);
+      // A client may issue tools/list immediately after initialize. Do not expose
+      // the session until all configured proxy tools have been registered, or the
+      // first tools/list becomes timing-dependent. Upstream tool discovery itself
+      // is cached by McpUpstreamManager, so warm-session cost stays low.
+      try {
+        await refreshProxiedTools(server, upstreamManager);
+      } catch (err) {
+        upstreamManager.unregisterMcpServer(server);
+        await server.close().catch(() => undefined);
+        throw err;
+      }
     }
-  } else {
-    restoreRegisterTool();
+    return server;
   }
-
+  // slim: keep the profile filter attached for the whole server lifetime so no
+  // later proxy refresh can ever leak native upstream tools into the stable
+  // ChatGPT inventory, and register the bridge tools unconditionally (with or
+  // without an upstream manager) so the tool list is invariant.
+  registerMcpBridgeTools(server, upstreamManager ?? null);
+  // The SDK hard-codes `listChanged: true` the moment the first tool is
+  // registered. The slim profile is a frozen inventory that never changes, so
+  // it must not advertise listChanged; override the capability on the
+  // underlying Server after all registrations and before any transport
+  // connects (the McpServer wrapper exposes `server` for advanced use).
+  server.server.registerCapabilities({ tools: { listChanged: false } });
   return server;
 }

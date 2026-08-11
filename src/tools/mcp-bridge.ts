@@ -5,7 +5,58 @@ import { audit } from "../lib/audit.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 
-export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamManager): void {
+export function registerMcpBridgeTools(server: McpServer, manager: McpUpstreamManager | null): void {
+
+  // The bridge tools are part of the stable slim inventory and MUST exist on
+  // every server, independent of whether an upstream manager is attached.
+  // Without a manager (test seams, degraded boot) they answer with structured
+  // empty/unavailable results instead of crashing the tool list.
+  if (!manager) {
+    server.registerTool(
+      "mcp_servers",
+      {
+        title: "MCP Upstream Servers",
+        description:
+          "List configured upstream MCP servers on this machine with health status (connected/unreachable/disabled).",
+        inputSchema: {
+          refresh: z.boolean().optional().default(false).describe("Force reconnect before reporting health"),
+        },
+        annotations: toolAnnotations("external_read"),
+      },
+      async () => toolResult("mcp_servers", { servers: [], count: 0 })
+    );
+    server.registerTool(
+      "mcp_tools",
+      {
+        title: "MCP Upstream Tools",
+        description: "List tools exposed by a configured upstream MCP server.",
+        inputSchema: {
+          server_id: z.string().describe("Upstream server id from mcp_servers"),
+        },
+        annotations: toolAnnotations("external_read"),
+      },
+      async () => {
+        throw new Error("No upstream MCP manager is available");
+      }
+    );
+    server.registerTool(
+      "mcp_call",
+      {
+        title: "MCP Upstream Call",
+        description: "Invoke a tool on a configured upstream MCP server with JSON arguments.",
+        inputSchema: {
+          server_id: z.string(),
+          tool: z.string(),
+          arguments: z.record(z.string(), z.any()).optional().default({}),
+        },
+        annotations: toolAnnotations("external"),
+      },
+      async () => {
+        throw new Error("No upstream MCP manager is available");
+      }
+    );
+    return;
+  }
   server.registerTool(
     "mcp_servers",
     {

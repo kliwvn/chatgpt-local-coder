@@ -24,6 +24,11 @@ import { registerMcpBridgeTools } from "../dist/tools/mcp-bridge.js";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-mcp-upstream-"));
+// This suite exercises upstream proxy machinery, which is full-profile-only
+// (the slim profile deliberately never registers native proxies). Individual
+// slim-specific cases override CHATGPT_TOOL_PROFILE themselves.
+const suiteProfile = process.env.CHATGPT_TOOL_PROFILE;
+process.env.CHATGPT_TOOL_PROFILE = "full";
 
 let passed = 0;
 let failed = 0;
@@ -586,61 +591,68 @@ try {
     await manager.shutdown();
   });
 
-  await run("allowlist proxy registers prefixed tool", async () => {
+  await run("allowlist proxy registers prefixed tool (full profile)", async () => {
+    const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
+    process.env.CHATGPT_TOOL_PROFILE = "full";
     const manager = new McpUpstreamManager(configPath);
-    await manager.init();
-    await manager.updateConfig({
-      version: 1,
-      servers: [
-        {
-          id: "mockhttp",
-          name: "Mock HTTP",
-          enabled: true,
-          transport: "http",
-          url: `http://127.0.0.1:${httpPort}/mcp`,
-          expose: "allowlist",
-          tools: ["add"],
-          tool_prefix: "mockhttp",
-        },
-      ],
-    });
-    const hub = new McpServer({ name: "test-hub", version: "1.0.0" }, { capabilities: { tools: { listChanged: true } } });
-    registerMcpBridgeTools(hub, manager);
-    const proxied = await refreshProxiedTools(hub, manager);
-    if (!proxied.includes("mockhttp__add")) throw new Error(JSON.stringify(proxied));
-    const names = manager.getProxiedToolNames(manager.getServerConfig("mockhttp"), await manager.listTools("mockhttp"));
-    if (!names.includes("mockhttp__add")) throw new Error(JSON.stringify(names));
-    const client = new Client({ name: "proxy-annotation-test", version: "1" }, { capabilities: {} });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await Promise.all([hub.connect(serverTransport), client.connect(clientTransport)]);
-    const listed = await client.listTools();
-    const add = listed.tools.find((tool) => tool.name === "mockhttp__add");
-    if (!add) throw new Error("proxied add tool missing from tools/list");
-    assert.equal(add.annotations?.title, "Upstream Add Annotation", "proxy discarded upstream annotation title");
-    assert.equal(add.annotations?.readOnlyHint, true, "proxy discarded upstream readOnlyHint");
-    assert.equal(add.annotations?.destructiveHint, false, "proxy discarded upstream destructiveHint");
-    assert.equal(add.annotations?.idempotentHint, true, "proxy discarded upstream idempotentHint");
-    assert.equal(add.annotations?.openWorldHint, false, "proxy discarded upstream openWorldHint");
-    assert.equal(add._meta?.["mock/upstream-meta"], "preserve-me", "proxy discarded upstream tool _meta");
-    const bridgeServers = listed.tools.find((tool) => tool.name === "mcp_servers");
-    const bridgeTools = listed.tools.find((tool) => tool.name === "mcp_tools");
-    for (const bridgeRead of [bridgeServers, bridgeTools]) {
-      if (!bridgeRead) throw new Error("MCP bridge discovery tool missing from tools/list");
-      assert.equal(bridgeRead.annotations?.readOnlyHint, true, `${bridgeRead.name} must remain read-only`);
-      assert.equal(bridgeRead.annotations?.openWorldHint, true, `${bridgeRead.name} can contact upstream servers`);
+    try {
+      await manager.init();
+      await manager.updateConfig({
+        version: 1,
+        servers: [
+          {
+            id: "mockhttp",
+            name: "Mock HTTP",
+            enabled: true,
+            transport: "http",
+            url: `http://127.0.0.1:${httpPort}/mcp`,
+            expose: "allowlist",
+            tools: ["add"],
+            tool_prefix: "mockhttp",
+          },
+        ],
+      });
+      const hub = new McpServer({ name: "test-hub", version: "1.0.0" }, { capabilities: { tools: { listChanged: true } } });
+      registerMcpBridgeTools(hub, manager);
+      const proxied = await refreshProxiedTools(hub, manager);
+      if (!proxied.includes("mockhttp__add")) throw new Error(JSON.stringify(proxied));
+      const names = manager.getProxiedToolNames(manager.getServerConfig("mockhttp"), await manager.listTools("mockhttp"));
+      if (!names.includes("mockhttp__add")) throw new Error(JSON.stringify(names));
+      const client = new Client({ name: "proxy-annotation-test", version: "1" }, { capabilities: {} });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      await Promise.all([hub.connect(serverTransport), client.connect(clientTransport)]);
+      const listed = await client.listTools();
+      const add = listed.tools.find((tool) => tool.name === "mockhttp__add");
+      if (!add) throw new Error("proxied add tool missing from tools/list");
+      assert.equal(add.annotations?.title, "Upstream Add Annotation", "proxy discarded upstream annotation title");
+      assert.equal(add.annotations?.readOnlyHint, true, "proxy discarded upstream readOnlyHint");
+      assert.equal(add.annotations?.destructiveHint, false, "proxy discarded upstream destructiveHint");
+      assert.equal(add.annotations?.idempotentHint, true, "proxy discarded upstream idempotentHint");
+      assert.equal(add.annotations?.openWorldHint, false, "proxy discarded upstream openWorldHint");
+      assert.equal(add._meta?.["mock/upstream-meta"], "preserve-me", "proxy discarded upstream tool _meta");
+      const bridgeServers = listed.tools.find((tool) => tool.name === "mcp_servers");
+      const bridgeTools = listed.tools.find((tool) => tool.name === "mcp_tools");
+      for (const bridgeRead of [bridgeServers, bridgeTools]) {
+        if (!bridgeRead) throw new Error("MCP bridge discovery tool missing from tools/list");
+        assert.equal(bridgeRead.annotations?.readOnlyHint, true, `${bridgeRead.name} must remain read-only`);
+        assert.equal(bridgeRead.annotations?.openWorldHint, true, `${bridgeRead.name} can contact upstream servers`);
+      }
+      const bridgeCall = listed.tools.find((tool) => tool.name === "mcp_call");
+      if (!bridgeCall) throw new Error("mcp_call bridge tool missing from tools/list");
+      assert.equal(bridgeCall.annotations?.readOnlyHint, false, "mcp_call must not claim read-only behavior");
+      assert.equal(bridgeCall.annotations?.destructiveHint, true, "mcp_call must conservatively allow destructive upstream effects");
+      assert.equal(bridgeCall.annotations?.idempotentHint, false, "mcp_call must not be retried as idempotent");
+      assert.equal(bridgeCall.annotations?.openWorldHint, true, "mcp_call crosses the upstream trust boundary");
+      await client.close();
+      await hub.close();
+    } finally {
+      await manager.shutdown();
+      if (oldProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
+      else process.env.CHATGPT_TOOL_PROFILE = oldProfile;
     }
-    const bridgeCall = listed.tools.find((tool) => tool.name === "mcp_call");
-    if (!bridgeCall) throw new Error("mcp_call bridge tool missing from tools/list");
-    assert.equal(bridgeCall.annotations?.readOnlyHint, false, "mcp_call must not claim read-only behavior");
-    assert.equal(bridgeCall.annotations?.destructiveHint, true, "mcp_call must conservatively allow destructive upstream effects");
-    assert.equal(bridgeCall.annotations?.idempotentHint, false, "mcp_call must not be retried as idempotent");
-    assert.equal(bridgeCall.annotations?.openWorldHint, true, "mcp_call crosses the upstream trust boundary");
-    await client.close();
-    await hub.close();
-    await manager.shutdown();
   });
 
-  await run("slim profile keeps configured proxy but hides heavy local tools", async () => {
+  await run("slim profile hides configured proxy and keeps stable inventory", async () => {
     const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
     process.env.CHATGPT_TOOL_PROFILE = "slim";
     const manager = new McpUpstreamManager(configPath);
@@ -669,8 +681,11 @@ try {
       await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
       const list = await client.listTools();
       const names = new Set((list.tools || []).map((t) => t.name));
-      if (!names.has("mockhttp__add")) throw new Error(`proxy missing from slim: ${[...names].join(",")}`);
+      if (names.has("mockhttp__add")) throw new Error(`native proxy leaked into slim: ${[...names].join(",")}`);
       if (names.has("read_multiple_files")) throw new Error("heavy local tool leaked into slim profile");
+      for (const t of ["read_text_file", "write_file", "run_command", "mcp_servers", "mcp_tools", "mcp_call"]) {
+        if (!names.has(t)) throw new Error(`stable tool missing from slim: ${t}`);
+      }
     } finally {
       await client?.close().catch(() => undefined);
       await server?.close().catch(() => undefined);
@@ -708,6 +723,9 @@ await run("manager connects to stdio mock upstream", async () => {
   await manager.disconnect("mockstdio");
   await manager.shutdown();
 });
+
+if (suiteProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
+else process.env.CHATGPT_TOOL_PROFILE = suiteProfile;
 
 await fs.rm(tmpDir, { recursive: true, force: true });
 
