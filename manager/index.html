@@ -24,6 +24,7 @@
         <div class="manager-info">
           <span id="mgr-status" class="conn-dot ok"></span>
           <span id="mgr-version">Manager 127.0.0.1:…</span>
+          <button id="btn-mgr-restart" class="btn btn-ghost btn-sm" title="Khởi động lại Manager (giữ nguyên Server + Tunnel của các workspace)">↻ Restart Manager</button>
         </div>
         <div class="header-actions">
           <button id="btn-guide" class="btn btn-ghost btn-sm">📖 Hướng Dẫn Sử Dụng</button>
@@ -193,7 +194,7 @@
           <span id="server-status" class="status-label">Đang kiểm tra…</span>
           <span id="server-dot" class="status-dot"></span>
           <a id="foot-admin" class="btn btn-primary btn-sm" href="#" target="_blank">🛠 Admin UI (nâng cao) ↗</a>
-          <button id="btn-server-restart" class="btn btn-green" disabled title="Graceful restart Local Coder gateway; giữ Tunnel đang chạy">↻ Khởi động lại Gateway</button>
+          <button id="btn-server-restart" class="btn btn-green" disabled title="Graceful restart Local Coder Server; giữ Tunnel đang chạy">↻ Khởi động lại Local Coder Server</button>
           <button id="btn-server" class="btn btn-primary" disabled>Bật</button>
         </div>
         <p class="hint" id="server-detail"></p>

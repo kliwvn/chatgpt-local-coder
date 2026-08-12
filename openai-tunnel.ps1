@@ -12,7 +12,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
-$TUNNEL_VERSION = "v0.0.10"
+$TUNNEL_VERSION = "v0.0.11"
 $BinDir = Join-Path $ScriptDir "bin"
 $TunnelExe = Join-Path $BinDir "tunnel-client.exe"
 $ProfileName = "codex-local"

@@ -27,6 +27,7 @@ let busy = false;
 const ACTION_IDS = [
   "btn-install", "btn-server", "btn-server-restart", "btn-tunnel", "btn-save", "btn-check",
   "btn-profile-save", "btn-profile-del", "btn-tunnel-dl", "btn-del-inst", "add-create",
+  "btn-mgr-restart",
 ];
 const setBusy = (b) => {
   busy = b;
@@ -121,9 +122,10 @@ function renderServerTunnel(s) {
   const serverConflict = Boolean(srv.portOccupied);
   const artifactDrift = Boolean(srv.artifactDrift);
   const buildDrift = Boolean(srv.buildDrift);
-  const serverCurrent = srv.running && !artifactDrift && !buildDrift;
-  setDot("server-dot", serverCurrent, srv.running ? (buildDrift ? "Đang chạy • source chưa build" : artifactDrift ? "Đang chạy • cần restart" : "Đang chạy") : serverConflict ? "Xung đột cổng" : "Dừng");
-  setDot("inst-server-dot", serverCurrent, srv.running ? (buildDrift ? "Server: source chưa build" : artifactDrift ? "Server: cần restart" : "Server: chạy") : serverConflict ? "Server: xung đột cổng" : "Server: dừng");
+  const configDrift = Boolean(srv.configDrift);
+  const serverCurrent = srv.running && !configDrift && !artifactDrift && !buildDrift;
+  setDot("server-dot", serverCurrent, srv.running ? (buildDrift ? "Đang chạy • source chưa build" : artifactDrift ? "Đang chạy • cần restart" : configDrift ? "Đang chạy • cấu hình cũ" : "Đang chạy") : serverConflict ? "Xung đột cổng" : "Dừng");
+  setDot("inst-server-dot", serverCurrent, srv.running ? (buildDrift ? "Server: source chưa build" : artifactDrift ? "Server: cần restart" : configDrift ? "Server: cấu hình cũ" : "Server: chạy") : serverConflict ? "Server: xung đột cổng" : "Server: dừng");
   $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
   $("btn-server").disabled = busy || serverConflict;
   $("btn-server-restart").disabled = busy || !srv.running || serverConflict || buildDrift;
@@ -135,7 +137,7 @@ function renderServerTunnel(s) {
       ? `${roots[0]} (+${roots.length - 1} path mở rộng)`
       : roots[0] || (srv.health && srv.health.defaultCwd) || "—";
   $("server-detail").textContent = srv.running
-    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}${buildDrift ? " • source mới hơn dist — cần Build rồi restart Gateway" : artifactDrift ? " • build mới hơn process — cần Khởi động lại Gateway" : ""}`
+    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}${buildDrift ? " • source mới hơn dist — cần Build rồi restart Gateway" : artifactDrift ? " • build mới hơn process — cần Khởi động lại Gateway" : configDrift ? " • process đang dùng cấu hình cũ — cần Khởi động lại Gateway" : ""}`
     : serverConflict
       ? `Cổng ${srv.port} đang bị process khác chiếm${srv.pid ? ` (PID ${srv.pid})` : ""}. Đổi PORT hoặc dừng process đó trước khi bật Local Coder.`
       : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
@@ -173,6 +175,14 @@ function renderServerTunnel(s) {
   $("btn-tunnel-dl").classList.toggle("hidden", tun.cloudflaredExists !== false || tun.running);
 
   const managerDrift = Boolean(state.manager?.artifactDrift);
+  const mgrBtn = $("btn-mgr-restart");
+  if (mgrBtn) {
+    mgrBtn.disabled = busy;
+    mgrBtn.classList.toggle("btn-green", managerDrift);
+    mgrBtn.title = managerDrift
+      ? "Manager đang chạy code cũ — bấm để nạp code mới (giữ nguyên Server + Tunnel)"
+      : "Khởi động lại Manager (giữ nguyên Server + Tunnel của các workspace)";
+  }
   $("mgr-version").textContent = `Manager 127.0.0.1:${location.port} • Node ${s.node}${managerDrift ? " • Manager source mới hơn process — cần restart Manager" : ""}`;
 }
 
@@ -313,8 +323,9 @@ async function loadInstances(initial) {
         const active = state.current === i.name ? " active" : "";
         const artifactDrift = Boolean(i.server.artifactDrift);
         const buildDrift = Boolean(i.server.buildDrift);
+        const configDrift = Boolean(i.server.configDrift);
         const stateTxt = srv
-          ? `<span class="status-dot ${artifactDrift || buildDrift ? "bad" : "ok"}"></span>${buildDrift ? "Source chưa build" : artifactDrift ? "Server cần restart" : "Server chạy"} <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`
+          ? `<span class="status-dot ${artifactDrift || buildDrift || configDrift ? "bad" : "ok"}"></span>${buildDrift ? "Source chưa build" : artifactDrift ? "Server cần restart" : configDrift ? "Server cấu hình cũ" : "Server chạy"} <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`
           : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`;
         const wsWarn = i.workspaceMissing
           ? `<div class="inst-warn" title="${esc(i.env.WORKSPACE_PATH || "")}">⚠ WORKSPACE_PATH không tồn tại trên máy này — sửa trong Cấu hình</div>`
@@ -595,6 +606,42 @@ async function restartGateway() {
   }
 }
 
+async function restartManager() {
+  if (!confirm("Khởi động lại Manager?\n\nServer + Tunnel của các workspace được giữ nguyên — Manager mới sẽ tự nhận nuôi lại.")) return;
+  const oldPid = state.manager?.pid || null;
+  setBusy(true);
+  try {
+    const r = await api("/api/manager/restart", "POST");
+    if (!r.ok) throw new Error(r.error || "Restart Manager thất bại");
+    toast("Manager đang khởi động lại…", "ok");
+    const deadline = Date.now() + 25000;
+    let back = null;
+    while (Date.now() < deadline) {
+      await new Promise((res) => setTimeout(res, 1200));
+      try {
+        const h = await fetch("/api/health", { cache: "no-store" });
+        if (h.ok) {
+          const j = await h.json();
+          if (j.ok && j.name === "chatgpt-local-coder-manager" && j.pid && j.pid !== oldPid) {
+            back = j;
+            break;
+          }
+        }
+      } catch {}
+    }
+    if (back) {
+      toast(`Manager đã khởi động lại (PID ${back.pid})`, "ok");
+      location.reload();
+    } else {
+      toast("Manager chưa phản hồi — kiểm tra cửa sổ manager.bat", "err");
+      setBusy(false);
+    }
+  } catch (err) {
+    toast("Restart Manager lỗi: " + err.message, "err");
+    setBusy(false);
+  }
+}
+
 async function toggleTunnel() {
   if (!state.current) return;
   const name = state.current;
@@ -639,6 +686,14 @@ async function doAddInstance() {
   const adminPort = $("add-admin-port").value.trim();
   if (!name) {
     toast("Nhập tên workspace", "err");
+    return;
+  }
+  if (!workspacePath) {
+    toast("Chọn WORKSPACE_PATH chính xác cho project", "err");
+    return;
+  }
+  if (workspacePath.includes(";")) {
+    toast("WORKSPACE_PATH chỉ được chứa 1 project. Dùng EXTRA_WORKSPACE_PATHS sau khi tạo nếu cần thêm project.", "err");
     return;
   }
   const parsedPort = port ? Number(port) : undefined;
@@ -758,7 +813,8 @@ async function copyUrl() {
 
 function init() {
   setBusy(true);
-
+  $("btn-server-restart").addEventListener("click", restartGateway);
+  $("btn-mgr-restart").addEventListener("click", restartManager);
   // data-open buttons → window.open
   document.querySelectorAll("[data-open]").forEach((el) => {
     el.addEventListener("click", () => window.open(el.dataset.open, "_blank"));
@@ -768,7 +824,6 @@ function init() {
   $("btn-check").addEventListener("click", doCheck);
   $("btn-save").addEventListener("click", doSave);
   $("btn-server").addEventListener("click", toggleServer);
-  $("btn-server-restart").addEventListener("click", restartGateway);
   $("btn-tunnel").addEventListener("click", toggleTunnel);
   $("btn-tunnel-dl").addEventListener("click", doTunnelDownload);
   $("btn-copy-url").addEventListener("click", copyUrl);
