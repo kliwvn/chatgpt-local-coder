@@ -16,6 +16,7 @@ import { loadPathRulesForFile } from "../lib/path-rules.js";
 import { toolResult } from "../lib/tool-result.js";
 import { readUtf8FilePrefix } from "../lib/bounded-file.js";
 import { getMcpDispatchDiagnostics } from "../lib/mcp-dispatch-diagnostics.js";
+import { areAgentProcessesOsSandboxed, getProcessSecurityStatus } from "../lib/process-executor.js";
 
 
 
@@ -129,6 +130,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
         upstream = await upstreamManager.listStatuses({ probe: false });
       } catch {}
       const fingerprint = await getContractFingerprint().catch(() => null);
+      const processSecurity = getProcessSecurityStatus();
       return toolResult("agent_status", {
         permission_profile: getPermissionProfile(),
         permission_description: describePermissionProfile(),
@@ -138,9 +140,11 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
         local_write_allowed: getPermissionProfile() === "open",
         host_action_permission: "unobservable",
         host_write_gate: "unobservable",
+        host_not_invoked_semantics: "externally_inferred_only",
         full_machine_access: getFullDiskAccess(),
         path_sandbox_enabled: !getFullDiskAccess(),
-        shell_commands_os_sandboxed: false,
+        shell_commands_os_sandboxed: areAgentProcessesOsSandboxed(),
+        process_security: processSecurity,
         default_cwd: getDefaultCwd(),
         machine_roots: getMachineRoots(),
         audit_log: getAuditPath(),

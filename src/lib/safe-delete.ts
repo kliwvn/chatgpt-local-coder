@@ -184,10 +184,22 @@ async function assertSafeDeleteTarget(requestedPath: string, canonicalTarget?: s
 }
 
 async function recycleWindows(target: string): Promise<void> {
+  const systemRoot = process.env.SystemRoot || process.env.WINDIR || "C:\\Windows";
+  const mediatorEnv: NodeJS.ProcessEnv = {
+    SystemRoot: systemRoot,
+    WINDIR: systemRoot,
+    COMSPEC: path.join(systemRoot, "System32", "cmd.exe"),
+    PATHEXT: process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD",
+    PROCESSOR_ARCHITECTURE: process.env.PROCESSOR_ARCHITECTURE || "AMD64",
+    NUMBER_OF_PROCESSORS: process.env.NUMBER_OF_PROCESSORS || "1",
+    TEMP: process.env.TEMP,
+    TMP: process.env.TMP,
+    CLC_SAFE_DELETE_TARGET: target,
+  };
   await new Promise<void>((resolve, reject) => {
     const child = spawn("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_RECYCLE_SCRIPT], {
       windowsHide: true,
-      env: { ...process.env, CLC_SAFE_DELETE_TARGET: target },
+      env: mediatorEnv,
       stdio: ["ignore", "ignore", "pipe"],
     });
     let stderr = "";

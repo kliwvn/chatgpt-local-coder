@@ -1,6 +1,7 @@
-import { spawn } from "child_process";
 import os from "os";
 import { appendBoundedHead, appendBoundedTail } from "./output-budget.js";
+import { spawnProcess } from "./process-executor.js";
+import { buildGitProcessInvocation } from "./git-process.js";
 
 const GIT_SNAPSHOT_TIMEOUT_MS = 5_000;
 const GIT_SNAPSHOT_STDOUT_MAX_CHARS = 32_768;
@@ -15,13 +16,28 @@ interface GitRunResult {
   stderr_truncated: boolean;
 }
 
-function runGit(args: string[], cwd: string): Promise<GitRunResult> {
+async function runGit(args: string[], cwd: string): Promise<GitRunResult> {
   const { promise, resolve } = Promise.withResolvers<GitRunResult>();
-  const child = spawn("git", args, {
-    cwd,
-    windowsHide: true,
-    detached: process.platform !== "win32",
-  });
+  let processHandle;
+  try {
+    const invocation = buildGitProcessInvocation(cwd, args);
+    processHandle = await spawnProcess({
+      executable: "git",
+      args: invocation.args,
+      cwd: invocation.cwd,
+      timeoutMs: GIT_SNAPSHOT_TIMEOUT_MS,
+    });
+  } catch (error) {
+    return {
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+      exit_code: 127,
+      timed_out: false,
+      stdout_truncated: false,
+      stderr_truncated: false,
+    };
+  }
+  const child = processHandle.child;
   let stdout = "";
   let stderr = "";
   let stdoutTruncated = false;
@@ -46,18 +62,7 @@ function runGit(args: string[], cwd: string): Promise<GitRunResult> {
   });
   const timer = setTimeout(() => {
     timedOut = true;
-    if (process.platform === "win32" && child.pid) {
-      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-      killer.unref();
-    } else if (child.pid) {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
-    } else {
-      child.kill("SIGKILL");
-    }
+    void processHandle.terminate(true);
     forceSettleTimer = setTimeout(() => settle(() => resolve(result(124))), 1_000);
     forceSettleTimer.unref?.();
   }, GIT_SNAPSHOT_TIMEOUT_MS);

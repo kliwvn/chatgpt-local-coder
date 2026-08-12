@@ -28,7 +28,11 @@ const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-mcp-upstream-"));
 // (the slim profile deliberately never registers native proxies). Individual
 // slim-specific cases override CHATGPT_TOOL_PROFILE themselves.
 const suiteProfile = process.env.CHATGPT_TOOL_PROFILE;
+const suiteFullDiskAccess = process.env.FULL_DISK_ACCESS;
 process.env.CHATGPT_TOOL_PROFILE = "full";
+// Existing upstream feature tests intentionally exercise trusted local HTTP and
+// stdio transports. Strict-mode denial is tested separately below.
+process.env.FULL_DISK_ACCESS = "true";
 
 let passed = 0;
 let failed = 0;
@@ -724,8 +728,74 @@ await run("manager connects to stdio mock upstream", async () => {
   await manager.shutdown();
 });
 
+await run("strict mode blocks stdio upstream before process spawn", async () => {
+  const previous = process.env.FULL_DISK_ACCESS;
+  process.env.FULL_DISK_ACCESS = "false";
+  const marker = path.join(tmpDir, "strict-stdio-spawned.txt");
+  const markerScript = path.join(tmpDir, "strict-stdio-marker.mjs");
+  await fs.writeFile(markerScript, [
+    "import fs from 'node:fs/promises';",
+    `await fs.writeFile(${JSON.stringify(marker)}, 'spawned', 'utf8');`,
+    "setInterval(() => {}, 1000);",
+  ].join("\n"), "utf8");
+  const strictPath = path.join(tmpDir, "strict-stdio-upstream.json");
+  const manager = new McpUpstreamManager(strictPath);
+  try {
+    await manager.init();
+    await manager.updateConfig({
+      version: 1,
+      servers: [{
+        id: "strict-stdio",
+        name: "Strict stdio",
+        enabled: true,
+        transport: "stdio",
+        command: process.execPath,
+        args: [markerScript],
+        expose: "meta_only",
+      }],
+    });
+    await assert.rejects(
+      () => manager.listTools("strict-stdio"),
+      /UPSTREAM_LOCAL_ACCESS_BLOCKED: local stdio upstream/,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await assert.rejects(fs.stat(marker), undefined, "strict stdio policy spawned the upstream before blocking it");
+  } finally {
+    await manager.shutdown();
+    if (previous === undefined) delete process.env.FULL_DISK_ACCESS;
+    else process.env.FULL_DISK_ACCESS = previous;
+  }
+});
+
+await run("strict mode blocks loopback/private HTTP upstream before connect", async () => {
+  const previous = process.env.FULL_DISK_ACCESS;
+  process.env.FULL_DISK_ACCESS = "false";
+  const strictPath = path.join(tmpDir, "strict-http-upstream.json");
+  const manager = new McpUpstreamManager(strictPath);
+  try {
+    await manager.init();
+    for (const [id, url, pattern] of [
+      ["loopback-name", "http://localhost:65534/mcp", /UPSTREAM_LOCAL_ACCESS_BLOCKED: loopback upstream/],
+      ["loopback-ip", "http://127.0.0.1:65534/mcp", /UPSTREAM_LOCAL_ACCESS_BLOCKED: non-public upstream address/],
+      ["private-ip", "http://192.168.1.1:65534/mcp", /UPSTREAM_LOCAL_ACCESS_BLOCKED: non-public upstream address/],
+    ]) {
+      await manager.updateConfig({
+        version: 1,
+        servers: [{ id, name: id, enabled: true, transport: "http", url, expose: "meta_only" }],
+      });
+      await assert.rejects(() => manager.listTools(id), pattern);
+    }
+  } finally {
+    await manager.shutdown();
+    if (previous === undefined) delete process.env.FULL_DISK_ACCESS;
+    else process.env.FULL_DISK_ACCESS = previous;
+  }
+});
+
 if (suiteProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
 else process.env.CHATGPT_TOOL_PROFILE = suiteProfile;
+if (suiteFullDiskAccess === undefined) delete process.env.FULL_DISK_ACCESS;
+else process.env.FULL_DISK_ACCESS = suiteFullDiskAccess;
 
 await fs.rm(tmpDir, { recursive: true, force: true });
 

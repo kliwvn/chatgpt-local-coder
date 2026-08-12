@@ -19,6 +19,10 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../dist/server-factory.js";
 import { setDefaultCwd, setWorkspaceRoots } from "../dist/lib/path-security.js";
 import {
+  initializeProcessSecurity,
+  resetProcessSecurityForTests,
+} from "../dist/lib/process-executor.js";
+import {
   CHATGPT_PUBLIC_CONTRACT_VERSION,
   MCP_PUBLIC_CONTRACT_DRIFT,
 } from "../dist/lib/chatgpt-public-contract.js";
@@ -29,6 +33,13 @@ const fixtureRaw = JSON.parse(await fs.readFile(fixturePath, "utf8"));
 
 let passed = 0;
 let failed = 0;
+const oldEnv = Object.fromEntries([
+  "FULL_DISK_ACCESS",
+  "LOCAL_CODER_INSTANCE_ID",
+  "CLC_SANDBOX_PROFILE_NAME",
+  "CLC_SANDBOX_STATE_DIR",
+  "SANDBOX_NETWORK_MODE",
+].map((key) => [key, process.env[key]]));
 function ok(m) { console.log(`OK  ${m}`); passed++; }
 function fail(m, e) { console.error(`FAIL ${m}: ${e}`); failed++; }
 function check(name, cond, detail) {
@@ -49,10 +60,19 @@ async function callTool(server, name, args) {
 const servers = [];
 let temp;
 try {
-  temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-diag-"));
+  const testBase = path.resolve(process.env.WORKSPACE_PATH?.trim() || path.dirname(process.cwd()));
+  temp = await fs.mkdtemp(path.join(testBase, "clc-diag-"));
   setDefaultCwd(temp);
   setWorkspaceRoots([temp]);
   process.env.CHATGPT_TOOL_PROFILE = "slim";
+  process.env.FULL_DISK_ACCESS = "false";
+  process.env.LOCAL_CODER_INSTANCE_ID = "tests";
+  process.env.CLC_SANDBOX_PROFILE_NAME = "ChatGPTLocalCoder.tests";
+  process.env.CLC_SANDBOX_STATE_DIR = path.join(temp, ".sandbox-state");
+  process.env.SANDBOX_NETWORK_MODE = "none";
+  resetProcessSecurityForTests();
+  const sandbox = await initializeProcessSecurity();
+  check("strict sandbox self-test passed", sandbox.sandbox_self_test === "passed", sandbox.sandbox_error || sandbox.sandbox_self_test);
 
   const server = await createMcpServer(temp, 10, [temp], false);
   servers.push(server);
@@ -81,6 +101,11 @@ try {
   check("local_write_allowed true", status.local_write_allowed === true, `${status.local_write_allowed}`);
   check("host_action_permission unobservable", status.host_action_permission === "unobservable", `${status.host_action_permission}`);
   check("host_write_gate unobservable", status.host_write_gate === "unobservable", `${status.host_write_gate}`);
+  check("HOST_NOT_INVOKED is externally inferred only", status.host_not_invoked_semantics === "externally_inferred_only", `${status.host_not_invoked_semantics}`);
+  check("agent_status process sandbox required", status.process_security?.process_sandbox_mode === "required", `${status.process_security?.process_sandbox_mode}`);
+  check("agent_status AppContainer backend", status.process_security?.sandbox_backend === "windows_appcontainer", `${status.process_security?.sandbox_backend}`);
+  check("agent_status sandbox self-test passed", status.process_security?.sandbox_self_test === "passed", `${status.process_security?.sandbox_self_test}`);
+  check("shell_commands_os_sandboxed true", status.shell_commands_os_sandboxed === true, `${status.shell_commands_os_sandboxed}`);
 
   // --- 3. drift guard: fails closed on corruption --------------------------
   const internal = server._registeredTools;
@@ -122,6 +147,12 @@ try {
   fail("setup", e);
 } finally {
   for (const s of servers) await s.close().catch(() => {});
+  resetProcessSecurityForTests();
+  for (const [key, value] of Object.entries(oldEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  if (temp) await fs.rm(temp, { recursive: true, force: true }).catch(() => {});
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -1,4 +1,3 @@
-import { spawn } from "child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
@@ -10,6 +9,8 @@ import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import { appendBoundedHead, appendBoundedTail, GIT_OUTPUT_MAX_CHARS } from "../lib/output-budget.js";
 import { checkpointBefore } from "../lib/checkpoint.js";
+import { spawnProcess } from "../lib/process-executor.js";
+import { buildGitProcessInvocation } from "../lib/git-process.js";
 
 interface GitRunResult {
   stdout: string;
@@ -30,9 +31,21 @@ function markTruncated(text: string, truncated: boolean, where: "head" | "tail")
   return `${marker}\n${text.slice(-room).trimStart()}`;
 }
 
-function runGit(args: string[], cwd: string, timeoutMs = 30_000): Promise<GitRunResult> {
+async function runGit(args: string[], cwd: string, timeoutMs = 30_000): Promise<GitRunResult> {
   const { promise, resolve, reject } = Promise.withResolvers<GitRunResult>();
-  const child = spawn("git", args, { cwd, windowsHide: true });
+  let processHandle;
+  try {
+    const invocation = buildGitProcessInvocation(cwd, args);
+    processHandle = await spawnProcess({
+      executable: "git",
+      args: invocation.args,
+      cwd: invocation.cwd,
+      timeoutMs,
+    });
+  } catch (error) {
+    throw new Error(`git execution unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const child = processHandle.child;
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   let stdout = "";
@@ -43,7 +56,7 @@ function runGit(args: string[], cwd: string, timeoutMs = 30_000): Promise<GitRun
   const timer = setTimeout(() => {
     if (settled) return;
     settled = true;
-    child.kill("SIGKILL");
+    void processHandle.terminate(true);
     resolve({
       stdout: markTruncated(stdout, stdoutTruncated, "head"),
       stderr: stderr

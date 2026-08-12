@@ -1,11 +1,11 @@
 import path from "path";
-import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { readUtf8FileBounded } from "./bounded-file.js";
 import { appendBoundedTail } from "./output-budget.js";
 import { globToRegExp, matchesCompiledGlob } from "./glob-match.js";
 import { clampSyncTimeoutMs, getSyncResponseBudgetMs } from "./sync-response-budget.js";
 import { requireCommandAllowed } from "./permissions.js";
+import { spawnProcess } from "./process-executor.js";
 
 export interface PostEditHook {
   glob: string;
@@ -69,7 +69,7 @@ async function loadHooksConfig(): Promise<HooksConfig> {
   }
 }
 
-function runHook(command: string, filePath: string, timeoutMs: number): Promise<HookRunResult> {
+async function runHook(command: string, filePath: string, timeoutMs: number): Promise<HookRunResult> {
   const expanded = command.replace(/\{path\}/g, filePath).replace(/\{file\}/g, filePath);
   try {
     // Hook config is project-controlled input. Apply the exact same shell guard
@@ -88,7 +88,24 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
   const args = process.platform === "win32" ? ["-NoProfile", "-Command", expanded] : ["-lc", expanded];
 
   const { promise, resolve } = Promise.withResolvers<HookRunResult>();
-  const child = spawn(shell, args, { cwd: path.dirname(filePath), windowsHide: true });
+  let processHandle;
+  try {
+    processHandle = await spawnProcess({
+      executable: shell,
+      args,
+      cwd: path.dirname(filePath),
+      timeoutMs,
+    });
+  } catch (error) {
+    return {
+      stdout: "",
+      stderr: error instanceof Error ? error.message : String(error),
+      exit_code: 126,
+      stdout_truncated: false,
+      stderr_truncated: false,
+    };
+  }
+  const child = processHandle.child;
   let stdout = "";
   let stderr = "";
   let stdoutTruncated = false;
@@ -96,7 +113,7 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
   let timedOut = false;
   let settled = false;
   let childClosed = false;
-  let windowsKillerClosed = process.platform !== "win32";
+  let terminationRequested = false;
   let forceSettleTimer: ReturnType<typeof setTimeout> | undefined;
   const settle = (fn: () => void) => {
     if (settled) return;
@@ -106,7 +123,7 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
     fn();
   };
   const settleTimedOutIfTreeClosed = () => {
-    if (!timedOut || !childClosed || !windowsKillerClosed) return;
+    if (!timedOut || !childClosed) return;
     settle(() => resolve({
       stdout: stdout.trim(),
       stderr: stderr.trim() || "hook timeout",
@@ -117,18 +134,8 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
   };
   const timer = setTimeout(() => {
     timedOut = true;
-    if (process.platform === "win32" && child.pid) {
-      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
-      windowsKillerClosed = false;
-      const markKillerClosed = () => {
-        windowsKillerClosed = true;
-        settleTimedOutIfTreeClosed();
-      };
-      killer.once("close", markKillerClosed);
-      killer.once("error", markKillerClosed);
-    } else {
-      child.kill("SIGKILL");
-    }
+    terminationRequested = true;
+    void processHandle.terminate(true);
     // Prefer waiting for the child close event so the caller does not move on
     // while a timed-out hook tree is still alive. Keep a bounded fallback in
     // case the OS never reports close after forced termination.

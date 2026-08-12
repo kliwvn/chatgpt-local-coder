@@ -1,4 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import dns from "node:dns/promises";
+import net from "node:net";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -16,6 +18,7 @@ import {
 } from "./mcp-upstream-config.js";
 import { refreshProxiedTools } from "./mcp-tool-proxy.js";
 import { getChatGptToolProfile } from "./tool-profile.js";
+import { getFullDiskAccess } from "./path-security.js";
 
 export type UpstreamHealth = "unknown" | "connected" | "reachable" | "unreachable" | "disabled";
 
@@ -55,8 +58,81 @@ function positiveEnvInt(name: string, fallback: number, min = 1000, max = 600_00
 const UPSTREAM_CONNECT_TIMEOUT_MS = positiveEnvInt("MCP_UPSTREAM_CONNECT_TIMEOUT_MS", 15_000);
 const UPSTREAM_DISCOVERY_TIMEOUT_MS = positiveEnvInt("MCP_UPSTREAM_DISCOVERY_TIMEOUT_MS", 15_000);
 const UPSTREAM_TOOL_TIMEOUT_MS = positiveEnvInt("MCP_UPSTREAM_TOOL_TIMEOUT_MS", 120_000, 1000, 3_600_000);
+const UPSTREAM_LOCAL_ACCESS_BLOCKED = "UPSTREAM_LOCAL_ACCESS_BLOCKED";
 
 let singleton: McpUpstreamManager | null = null;
+
+function isPrivateIpv4(address: string): boolean {
+  const parts = address.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
+  const [a, b] = parts;
+  return (
+    a === 0 || a === 10 || a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    a >= 224
+  );
+}
+
+function isPrivateIp(address: string): boolean {
+  const version = net.isIP(address);
+  if (version === 4) return isPrivateIpv4(address);
+  if (version !== 6) return true;
+  const normalized = address.toLowerCase().split("%")[0];
+  if (normalized === "::" || normalized === "::1") return true;
+  if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true;
+  if (/^fe[89ab]/.test(normalized)) return true;
+  const mapped = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  return mapped ? isPrivateIpv4(mapped[1]) : false;
+}
+
+async function assertStrictUpstreamAllowed(config: UpstreamServerConfig): Promise<void> {
+  if (getFullDiskAccess()) return;
+  if (config.transport === "stdio") {
+    throw new Error(
+      `${UPSTREAM_LOCAL_ACCESS_BLOCKED}: local stdio upstream '${config.id}' is disabled while FULL_DISK_ACCESS=false; ` +
+      "run it through a sandbox-managed transport or use explicit trusted full-disk mode"
+    );
+  }
+
+  const url = new URL(config.url!);
+  const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) {
+    throw new Error(`${UPSTREAM_LOCAL_ACCESS_BLOCKED}: loopback upstream '${config.id}' is blocked in strict mode`);
+  }
+
+  const literalVersion = net.isIP(hostname);
+  if (literalVersion) {
+    if (isPrivateIp(hostname)) {
+      throw new Error(`${UPSTREAM_LOCAL_ACCESS_BLOCKED}: non-public upstream address ${hostname} is blocked in strict mode`);
+    }
+    return;
+  }
+
+  let addresses: Array<{ address: string; family: number }>;
+  try {
+    addresses = await Promise.race([
+      dns.lookup(hostname, { all: true, verbatim: true }),
+      new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error(`DNS policy lookup timed out for ${hostname}`)), 5000);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (error) {
+    throw new Error(
+      `${UPSTREAM_LOCAL_ACCESS_BLOCKED}: cannot verify upstream '${config.id}' resolves only to public addresses: ` +
+      `${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  if (!addresses.length || addresses.some((entry) => isPrivateIp(entry.address))) {
+    throw new Error(
+      `${UPSTREAM_LOCAL_ACCESS_BLOCKED}: upstream '${config.id}' resolves to a local/private/non-public address in strict mode`
+    );
+  }
+}
 
 export class McpUpstreamManager {
   private config: UpstreamConfigFile;
@@ -208,6 +284,10 @@ export class McpUpstreamManager {
     transport: StdioClientTransport | StreamableHTTPClientTransport;
     pid: number | null;
   }> {
+    // mcp_tools/listTools is execution-triggering for stdio transports, and a
+    // pre-existing loopback/private HTTP MCP can itself have full host authority.
+    // Enforce strict-mode upstream policy before constructing either transport.
+    await assertStrictUpstreamAllowed(config);
     const client = new Client({ name: "codex-mcp-hub", version: "2.0.0" });
 
     if (config.transport === "stdio") {

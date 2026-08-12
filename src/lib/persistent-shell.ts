@@ -1,9 +1,10 @@
-import { spawn } from "child_process";
 import path from "path";
 import { appendBoundedTail, SHELL_OUTPUT_MAX_CHARS } from "./output-budget.js";
 import { redactSensitiveText } from "./redaction.js";
 import { requireCommandAllowed } from "./permissions.js";
 import { existsSync } from "node:fs";
+import { validatePath } from "./path-security.js";
+import { spawnProcess } from "./process-executor.js";
 
 export interface ShellExecResult {
   command: string;
@@ -30,31 +31,56 @@ let bootstrapPromise: Promise<void> | null = null;
 let shellPersistenceTail: Promise<void> = Promise.resolve();
 const history: string[] = [];
 const MAX_HISTORY = 50;
+let nextStateSequence = 0;
+let latestCommittedStateSequence = 0;
+
+function reserveStateSequence(): number {
+  nextStateSequence += 1;
+  return nextStateSequence;
+}
+
+function commitStateSequence(sequence: number): void {
+  if (sequence > latestCommittedStateSequence) latestCommittedStateSequence = sequence;
+}
 
 export function setShellPersistenceRoot(workspaceRoot: string): void {
   persistenceRoot = path.resolve(workspaceRoot);
 }
 
 export function initShellSession(defaultCwd: string): void {
+  const sequence = reserveStateSequence();
   sessionCwd = path.resolve(defaultCwd);
   sessionInitializedAt = new Date().toISOString();
   history.length = 0;
+  commitStateSequence(sequence);
 }
 
 /** Restore cwd from disk (ChatGPT = new MCP session per tool call). */
 export async function bootstrapShellSession(defaultCwd: string): Promise<void> {
+  const sequence = reserveStateSequence();
   setShellPersistenceRoot(defaultCwd);
   const saved = await loadGlobalShellState(defaultCwd, defaultCwd);
   if (saved?.cwd) {
-    sessionCwd = path.resolve(saved.cwd);
-    sessionInitializedAt = saved.updated_at;
-    if (saved.recent_commands?.length) {
-      history.length = 0;
-      history.push(...saved.recent_commands.slice(-MAX_HISTORY));
+    try {
+      // Persisted cwd is broker state, but it may have been written under an old
+      // workspace policy. Re-validate it against the current roots before reuse.
+      sessionCwd = await validatePath(saved.cwd);
+      sessionInitializedAt = saved.updated_at;
+      if (saved.recent_commands?.length) {
+        history.length = 0;
+        history.push(...saved.recent_commands.slice(-MAX_HISTORY));
+      }
+      commitStateSequence(sequence);
+      return;
+    } catch {
+      // Policy tightened or the saved directory disappeared. Never resurrect a
+      // cwd outside the current workspace; reset to the configured default.
     }
-    return;
   }
-  initShellSession(defaultCwd);
+  sessionCwd = path.resolve(defaultCwd);
+  sessionInitializedAt = new Date().toISOString();
+  history.length = 0;
+  commitStateSequence(sequence);
 }
 
 /**
@@ -83,9 +109,11 @@ export function getShellCwd(): string {
 }
 
 export function resetShellSession(cwd: string): void {
+  const sequence = reserveStateSequence();
   sessionCwd = path.resolve(cwd);
   sessionInitializedAt = new Date().toISOString();
   history.length = 0;
+  commitStateSequence(sequence);
   scheduleShellSnapshot();
 }
 
@@ -162,7 +190,7 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
   return { cwd, command: rest || "pwd", changed };
 }
 
-function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
+async function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
   const { promise, resolve, reject } = Promise.withResolvers<ShellExecResult>();
   // spawn() reports a missing cwd as "spawn powershell.exe ENOENT", hiding the
   // real cause; fail fast with an actionable message instead.
@@ -176,7 +204,14 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
   // MCP response is resolved AT the deadline; child-tree cleanup (taskkill)
   // continues in the background and must not delay the response.
   const startedAt = Date.now();
-  const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });
+  const handle = await spawnProcess({
+    executable: shell,
+    args,
+    cwd,
+    env: process.env,
+    timeoutMs,
+  });
+  const child = handle.child;
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   let stdout = "";
@@ -207,16 +242,9 @@ function runOnce(command: string, cwd: string, timeoutMs: number): Promise<Shell
 
   const handleTimeout = () => {
     timedOut = true;
-    // Giết cả process tree — child process con (npm test, node script) không bị bỏ lại
-    if (process.platform === "win32" && child.pid) {
-      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
-        windowsHide: true,
-        stdio: "ignore",
-      });
-      killer.unref();
-    } else {
-      child.kill("SIGKILL");
-    }
+    // Central executor owns process-tree termination. In strict mode the broker
+    // owns a KILL_ON_JOB_CLOSE Job Object; there is no native fallback.
+    void handle.terminate(true);
     // Resolve at the deadline, not after tree-kill settles. Detach the child
     // handle so a slow kill can never pin shutdown; stray pipe writes after
     // the deadline are discarded by the no-op error listeners below. (Pipes
@@ -289,8 +317,24 @@ export async function execInShellSession(
   if (!sessionCwd) initShellSession(defaultCwd);
 
   const isolated = Boolean(workingDirectory);
-  const baseCwd = isolated ? path.resolve(workingDirectory!) : sessionCwd!;
-  const { cwd, command: effective, changed } = applyCwdDirectives(baseCwd, command);
+  // Reserve ordering before the first await. A reset/bootstrap or a newer shell
+  // invocation that commits state while this call is validating/spawning must
+  // remain authoritative even if this older call resumes later.
+  const stateSequence = isolated ? 0 : reserveStateSequence();
+  const baseCwd = await validatePath(isolated ? path.resolve(workingDirectory!) : sessionCwd!);
+  const parsed = applyCwdDirectives(baseCwd, command);
+  let cwd: string;
+  try {
+    // Defense in depth for cd / Set-Location / pushd. The OS sandbox remains the
+    // hard boundary, but persistent shell state must never store an escaped cwd.
+    cwd = await validatePath(parsed.cwd);
+  } catch (error) {
+    throw new Error(
+      `SHELL_CWD_OUTSIDE_SANDBOX: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+  const effective = parsed.command;
+  const changed = parsed.changed;
 
   // An explicit workingDirectory is a fully isolated one-off invocation: cwd
   // directives inside it affect only that child process, and its command/history
@@ -299,10 +343,13 @@ export async function execInShellSession(
   // cwd/history. Calls without workingDirectory retain the legacy persistent-shell
   // behavior for interactive use.
   if (!isolated) {
-    if (changed) sessionCwd = cwd;
-    history.push(effective);
-    if (history.length > MAX_HISTORY) history.shift();
-    scheduleShellSnapshot();
+    if (stateSequence > latestCommittedStateSequence) {
+      if (changed) sessionCwd = cwd;
+      history.push(effective);
+      if (history.length > MAX_HISTORY) history.shift();
+      commitStateSequence(stateSequence);
+      scheduleShellSnapshot();
+    }
   }
 
   const result = await runOnce(effective, cwd, timeoutMs);

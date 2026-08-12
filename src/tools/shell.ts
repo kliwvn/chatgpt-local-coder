@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
+import type { ChildProcessWithoutNullStreams } from "child_process";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
@@ -14,6 +14,7 @@ import {
   getShellStatus,
   resetShellSession,
 } from "../lib/persistent-shell.js";
+import { spawnProcess, type ProcessHandle } from "../lib/process-executor.js";
 
 interface ManagedProcess {
   id: string;
@@ -21,6 +22,7 @@ interface ManagedProcess {
   cwd: string;
   startedAt: string;
   child: ChildProcessWithoutNullStreams;
+  processHandle: ProcessHandle;
   stdout: ManagedLogBuffer;
   stderr: ManagedLogBuffer;
   exitCode: number | null;
@@ -111,34 +113,7 @@ function markFinished(item: ManagedProcess, code: number | null, signal: NodeJS.
 async function killProcessTree(item: ManagedProcess, force = true): Promise<boolean> {
   if (!item.child.pid || !isRunning(item)) return false;
   try {
-    if (process.platform === "win32") {
-      const args = ["/PID", String(item.child.pid), "/T"];
-      if (force) args.push("/F");
-      const killer = spawn("taskkill", args, { windowsHide: true, stdio: "ignore" });
-      return await new Promise<boolean>((resolve) => {
-        let settled = false;
-        const finish = (value: boolean) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(value);
-        };
-        const timer = setTimeout(() => {
-          killer.kill();
-          finish(false);
-        }, 3000);
-        timer.unref?.();
-        killer.once("error", () => finish(false));
-        killer.once("close", (code) => finish(code === 0));
-      });
-    }
-    const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
-    try {
-      process.kill(-item.child.pid, signal);
-    } catch {
-      item.child.kill(signal);
-    }
-    return true;
+    return await item.processHandle.terminate(force);
   } catch {
     return false;
   }
@@ -270,15 +245,17 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         throw new Error(`Background process capacity reached (${runningCount}/${MAX_RUNNING_PROCESSES})`);
       }
       requireCommandAllowed(command);
-      const cwd = working_directory ? await validatePath(working_directory) : getShellStatus().cwd || defaultCwd;
+      const cwd = await validatePath(working_directory ? working_directory : getShellStatus().cwd || defaultCwd);
       const shell = process.platform === "win32" ? "powershell.exe" : "bash";
       const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
-      const child = spawn(shell, args, {
+      const processHandle = await spawnProcess({
+        executable: shell,
+        args,
         cwd,
-        windowsHide: true,
         env: process.env,
         detached: process.platform !== "win32",
       });
+      const child = processHandle.child;
       const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const item: ManagedProcess = {
         id,
@@ -286,6 +263,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         cwd,
         startedAt: new Date().toISOString(),
         child,
+        processHandle,
         stdout: newLogBuffer(),
         stderr: newLogBuffer(),
         exitCode: null,
@@ -323,8 +301,22 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         processes.delete(id);
         throw new Error(`Failed to start background process: ${err instanceof Error ? err.message : String(err)}`);
       }
-      await audit({ tool: "start_process", action: "start", target: cwd, status: "ok", details: { id, command } });
-      return toolResult("start_process", { id, pid: child.pid, command, cwd, started_at: item.startedAt }, {
+      await audit({
+        tool: "start_process",
+        action: "start",
+        target: cwd,
+        status: "ok",
+        details: { id, command, sandboxed: processHandle.sandboxed, sandbox_backend: processHandle.backend },
+      });
+      return toolResult("start_process", {
+        id,
+        pid: child.pid,
+        command,
+        cwd,
+        started_at: item.startedAt,
+        sandboxed: processHandle.sandboxed,
+        sandbox_backend: processHandle.backend,
+      }, {
         summary: `started ${id}`,
       });
     }
@@ -352,6 +344,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           exit_code: p.exitCode,
           signal: p.signal,
           error: p.spawnError,
+          sandboxed: p.processHandle.sandboxed,
+          sandbox_backend: p.processHandle.backend,
         }));
       return toolResult("process_status", { processes: processes_list }, { summary: `${processes_list.length} process(es)` });
     }

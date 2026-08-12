@@ -34,6 +34,11 @@ import { envIntegerOrThrow } from "./lib/env-utils.js";
 import { getManagedProcessStats, shutdownManagedProcesses } from "./tools/shell.js";
 import { ensureShellBootstrap, flushShellPersistence } from "./lib/persistent-shell.js";
 import {
+  areAgentProcessesOsSandboxed,
+  getProcessSecurityStatus,
+  initializeProcessSecurity,
+} from "./lib/process-executor.js";
+import {
   getMcpDispatchDiagnostics,
   recordMcpExecuted,
   recordMcpReached,
@@ -70,6 +75,13 @@ const workspaceRoots = resolveWorkspaceRoots();
 const workspaceRoot = workspaceRoots[0] || process.cwd();
 setDefaultCwd(workspaceRoot);
 setWorkspaceRoots(workspaceRoots);
+const processSecurity = await initializeProcessSecurity();
+if (processSecurity.process_sandbox_mode === "required") {
+  const detail = processSecurity.sandbox_self_test === "passed"
+    ? `${processSecurity.sandbox_backend} ${processSecurity.process_filesystem_scope}`
+    : `${processSecurity.sandbox_backend} FAILED: ${processSecurity.sandbox_error || "unknown error"}`;
+  console.log(`${formatLogTime()} [Security] Process sandbox: ${detail}`);
+}
 // Restore durable shell cwd/history once at process startup. Per-MCP-session
 // server creation only observes this already-resolved promise, avoiding repeated
 // disk reads and stale async writes under ChatGPT transport churn.
@@ -209,6 +221,7 @@ app.get("/health", async (_req, res) => {
   // fixture must surface as mcp_contract: null (health stays up; the startup
   // drift guard already failed closed on this process).
   const mcpContract = await getContractFingerprint().catch(() => null);
+  const processSecurity = getProcessSecurityStatus();
   res.json({
     status: "ok",
     name: "codex-mcp-server",
@@ -217,7 +230,10 @@ app.get("/health", async (_req, res) => {
     fullMachineAccess: getFullDiskAccess(),
     fullDiskAccess: getFullDiskAccess(),
     pathSandboxEnabled: !getFullDiskAccess(),
-    shellCommandsOsSandboxed: false,
+    shellCommandsOsSandboxed: areAgentProcessesOsSandboxed(),
+    process_security: processSecurity,
+    host_action_permission: "unobservable",
+    host_not_invoked_semantics: "externally_inferred_only",
     activeSessions: counts.registered,
     connectedSessions: counts.connected,
     buildingSessions: counts.building ?? 0,
@@ -497,7 +513,10 @@ const server = app.listen(PORT, "127.0.0.1", () => {
   console.log(`  ${ts} Admin UI:  http://127.0.0.1:${ADMIN_PORT}/ui`);
   console.log(`  ${ts} Default cwd: ${workspaceRoot}`);
   console.log(`  ${ts} Path-aware access: ${getFullDiskAccess() ? "FULL DISK" : "WORKSPACE ROOTS"}`);
-  console.log(`  ${ts} Shell OS sandbox: OFF (native commands)`);
+  const processSecurity = getProcessSecurityStatus();
+  console.log(
+    `  ${ts} Process execution: ${processSecurity.process_sandbox_mode === "required" ? `${processSecurity.sandbox_backend} (${processSecurity.sandbox_self_test})` : "NATIVE TRUSTED"}`
+  );
   console.log(`  ${ts} Session recovery: ON (automatic)`);
   console.log(`  ${ts} PID:       ${process.pid}`);
   console.log("========================================");

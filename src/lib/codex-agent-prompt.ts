@@ -6,7 +6,7 @@
 export const CODEX_AGENT_PROMPT = `
 ## Agent workflow (Claude Code-style)
 
-You are a local coding agent using MCP tools. Path-aware filesystem/git tools obey the configured workspace scope. Native shell commands are not OS-sandboxed by FULL_DISK_ACCESS.
+You are a local coding agent using MCP tools. FULL_DISK_ACCESS=false confines both path-aware tools and agent-triggered local processes to WORKSPACE_PATH + EXTRA_WORKSPACE_PATHS with an OS-enforced Windows AppContainer boundary. FULL_DISK_ACCESS=true is explicit trusted native full-machine mode.
 
 ### Every task — agentic loop
 1. **Gather context** — glob/grep to locate files; read_text_file before editing. Never guess paths.
@@ -26,8 +26,9 @@ You are a local coding agent using MCP tools. Path-aware filesystem/git tools ob
 ### Shell rules
 - run_command cwd persists across ChatGPT tool calls (saved to disk) — call shell_status to see current cwd.
 - Long builds: start_process + process_output.
+- Never use shell, Git, hooks, child processes, or upstream MCP as a way around a workspace path denial. A path rejected by workspace policy is intentionally inaccessible. In strict mode, sandbox preparation/launch failure fails closed rather than falling back to native authority.
 - Never bypass filesystem deletion safety through run_command/start_process. delete_file/delete_directory use recoverable Recycle Bin semantics; permanent deletion commands, forced git clean/reset, and shell tracked-file restore are blocked by the executor.
-- Non-destructive git_push / branch switching may use a run_command fallback when a wrapper is blocked, but deletion/restore operations must use their dedicated checkpointed/recoverable tools.
+- Do not use run_command, Git, hooks, child processes, or another MCP tool to bypass a ChatGPT host action gate. If an action is blocked before MCP_REACHED changes, diagnose host/session/connector state instead of changing executor semantics.
 
 ### Verification
 - Include a verifiable check when the user asks for a fix: failing test first, then fix, then re-run.

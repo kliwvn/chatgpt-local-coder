@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 
 import { restoreToCheckpoint } from "../dist/lib/checkpoint.js";
@@ -12,6 +11,10 @@ import {
   setWorkspaceRoots,
 } from "../dist/lib/path-security.js";
 import { registerGitTools } from "../dist/tools/git.js";
+import {
+  initializeProcessSecurity,
+  resetProcessSecurityForTests,
+} from "../dist/lib/process-executor.js";
 
 function git(cwd, ...args) {
   const result = spawnSync("git", args, { cwd, windowsHide: true, encoding: "utf8", timeout: 15_000 });
@@ -27,7 +30,12 @@ const oldFullDisk = process.env.FULL_DISK_ACCESS;
 const oldCheckpointEnabled = process.env.CHECKPOINT_ENABLED;
 const oldCheckpointPath = process.env.CHECKPOINT_PATH;
 const oldCheckpointMaxFileBytes = process.env.CHECKPOINT_MAX_FILE_BYTES;
-const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-git-safety-"));
+const oldInstanceId = process.env.LOCAL_CODER_INSTANCE_ID;
+const oldSandboxProfile = process.env.CLC_SANDBOX_PROFILE_NAME;
+const oldSandboxStateDir = process.env.CLC_SANDBOX_STATE_DIR;
+const oldSandboxNetworkMode = process.env.SANDBOX_NETWORK_MODE;
+const testBase = path.resolve(process.env.WORKSPACE_PATH?.trim() || path.dirname(process.cwd()));
+const root = await fs.mkdtemp(path.join(testBase, "clc-git-safety-"));
 const repo = path.join(root, "repo");
 
 try {
@@ -46,6 +54,17 @@ try {
   process.env.CHECKPOINT_ENABLED = "true";
   process.env.CHECKPOINT_PATH = path.join(root, "checkpoints");
   process.env.CHECKPOINT_MAX_FILE_BYTES = "5242880";
+  process.env.LOCAL_CODER_INSTANCE_ID = "tests";
+  process.env.CLC_SANDBOX_PROFILE_NAME = "ChatGPTLocalCoder.tests";
+  process.env.CLC_SANDBOX_STATE_DIR = path.join(root, ".sandbox-state");
+  process.env.SANDBOX_NETWORK_MODE = "none";
+  resetProcessSecurityForTests();
+  const sandbox = await initializeProcessSecurity();
+  assert.equal(
+    sandbox.sandbox_self_test,
+    "passed",
+    `strict Git sandbox unavailable: ${sandbox.sandbox_error || sandbox.sandbox_self_test}`,
+  );
 
   const handlers = new Map();
   const definitions = new Map();
@@ -190,5 +209,14 @@ try {
   else process.env.CHECKPOINT_PATH = oldCheckpointPath;
   if (oldCheckpointMaxFileBytes === undefined) delete process.env.CHECKPOINT_MAX_FILE_BYTES;
   else process.env.CHECKPOINT_MAX_FILE_BYTES = oldCheckpointMaxFileBytes;
+  if (oldInstanceId === undefined) delete process.env.LOCAL_CODER_INSTANCE_ID;
+  else process.env.LOCAL_CODER_INSTANCE_ID = oldInstanceId;
+  if (oldSandboxProfile === undefined) delete process.env.CLC_SANDBOX_PROFILE_NAME;
+  else process.env.CLC_SANDBOX_PROFILE_NAME = oldSandboxProfile;
+  if (oldSandboxStateDir === undefined) delete process.env.CLC_SANDBOX_STATE_DIR;
+  else process.env.CLC_SANDBOX_STATE_DIR = oldSandboxStateDir;
+  if (oldSandboxNetworkMode === undefined) delete process.env.SANDBOX_NETWORK_MODE;
+  else process.env.SANDBOX_NETWORK_MODE = oldSandboxNetworkMode;
+  resetProcessSecurityForTests();
   await fs.rm(root, { recursive: true, force: true });
 }

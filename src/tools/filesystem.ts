@@ -20,6 +20,7 @@ import { readUtf8FileBounded } from "../lib/bounded-file.js";
 import { globToRegExp, matchesCompiledGlob } from "../lib/glob-match.js";
 import { regexLineMatches, regexReplace } from "../lib/regex-guard.js";
 import { safeDelete } from "../lib/safe-delete.js";
+import { areAgentProcessesOsSandboxed } from "../lib/process-executor.js";
 
 const MAX_PARTIAL_TEXT_LINES = 100_000;
 const TAIL_READ_CHUNK_BYTES = 64 * 1024;
@@ -909,7 +910,7 @@ export function registerFilesystemTools(server: McpServer): void {
     return toolResult("list_allowed_directories", {
       full_machine_access: getFullDiskAccess(),
       path_sandbox_enabled: !getFullDiskAccess(),
-      shell_commands_os_sandboxed: false,
+      shell_commands_os_sandboxed: areAgentProcessesOsSandboxed(),
       permission: describePermissionProfile(),
       default_cwd: getDefaultCwd(),
       machine_roots: machineRoots,

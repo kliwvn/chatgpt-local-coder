@@ -37,7 +37,10 @@ async function run(name, fn) {
 await fs.mkdir(tmpDir, { recursive: true });
 
 await run("glob finds typescript files", async () => {
-  const matches = await globFiles(root, "src/**/*.ts", 50);
+  // This is an inventory smoke test, not a pagination test. Keep the limit above
+  // the repository's src file count so adding a legitimate library file cannot
+  // make filesystem.ts disappear from the first page and create a false failure.
+  const matches = await globFiles(root, "src/**/*.ts", 500);
   if (!matches.some((m) => m.path.endsWith("filesystem.ts"))) throw new Error("filesystem.ts not found");
 });
 

@@ -13,6 +13,7 @@ import {
 } from "../lib/mcp-upstream-config.js";
 import { getDefaultCwd, getFullDiskAccess } from "../lib/path-security.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
+import { areAgentProcessesOsSandboxed, getProcessSecurityStatus } from "../lib/process-executor.js";
 import { atomicWriteFile } from "../lib/atomic-write.js";
 import { readUtf8FileBounded } from "../lib/bounded-file.js";
 import {
@@ -244,6 +245,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     // reconnect/touch every upstream every few seconds and defeat idle_timeout.
     const upstream = await manager.listStatuses({ probe: false });
     const counts = sessionCounts();
+    const processSecurity = getProcessSecurityStatus();
     res.json({
       status: "ok",
       name: "codex-mcp-admin",
@@ -258,7 +260,9 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       default_cwd: getDefaultCwd(),
       full_disk_access: getFullDiskAccess(),
       path_sandbox_enabled: !getFullDiskAccess(),
-      shell_commands_os_sandboxed: false,
+      shell_commands_os_sandboxed: areAgentProcessesOsSandboxed(),
+      process_security: processSecurity,
+      host_action_permission: "unobservable",
       upstream,
       checkpoint: getCheckpointConfig(),
       instructions: options.instructionSummary?.() ?? null,

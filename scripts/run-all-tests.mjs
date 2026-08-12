@@ -67,9 +67,15 @@ const unitScripts = [
   "scripts/test-state-concurrency.mjs",
   "scripts/test-filesystem-safety.mjs",
   "scripts/test-destructive-safety.mjs",
+  "scripts/test-windows-appcontainer-sandbox.mjs",
+  "scripts/test-process-security-boundary.mjs",
+  "scripts/test-start-process-sandbox.mjs",
+  "scripts/test-git-appcontainer-compat.mjs",
   "scripts/test-git-safety.mjs",
+  "scripts/test-git-sandbox-boundary.mjs",
   "scripts/test-output-budget.mjs",
   "scripts/test-post-edit-hooks.mjs",
+  "scripts/test-post-edit-hook-sandbox.mjs",
   "scripts/test-manager-log-utils.mjs",
   "scripts/test-manager-fs-utils.mjs",
   "scripts/test-manager-env-redaction.mjs",
@@ -129,6 +135,11 @@ const server = spawn(process.execPath, ["dist/index.js"], {
     PORT: String(mcpPort),
     ADMIN_PORT: String(adminPort),
     CHATGPT_TOOL_PROFILE: "slim",
+    FULL_DISK_ACCESS: "false",
+    LOCAL_CODER_INSTANCE_ID: "tests",
+    CLC_SANDBOX_PROFILE_NAME: "ChatGPTLocalCoder.tests",
+    CLC_SANDBOX_STATE_DIR: path.join(integrationStateDir, "sandbox-state"),
+    SANDBOX_NETWORK_MODE: "none",
     // The repo .env ships a template WORKSPACE_PATH that does not exist; the
     // isolated server must override it or every shell spawn fails with ENOENT.
     WORKSPACE_PATH: root,
@@ -168,10 +179,24 @@ try {
   if (health.mcp_contract.dynamic_tools !== false || health.mcp_contract.list_changed !== false) {
     throw new Error(`slim health must be non-dynamic: ${JSON.stringify(health.mcp_contract)}`);
   }
+  if (health.host_action_permission !== "unobservable" || health.host_not_invoked_semantics !== "externally_inferred_only") {
+    throw new Error(`health host-permission semantics invalid: ${JSON.stringify({ host_action_permission: health.host_action_permission, host_not_invoked_semantics: health.host_not_invoked_semantics })}`);
+  }
+  if (
+    health.process_security?.process_sandbox_mode !== "required" ||
+    health.process_security?.sandbox_backend !== "windows_appcontainer" ||
+    health.process_security?.sandbox_self_test !== "passed" ||
+    health.shellCommandsOsSandboxed !== true
+  ) {
+    throw new Error(`health process sandbox invalid: ${JSON.stringify(health.process_security)}`);
+  }
   console.log(`OK  health: profile=${health.instructions.tool_profile}, contract=v${health.mcp_contract.version} hash=${health.mcp_contract.hash.slice(0, 12)}…, memory=${health.instructions.memory_files?.length ?? 0} files`);
 
   const admin = await waitFor(`http://127.0.0.1:${adminPort}/health`);
   if (!admin.instructions) throw new Error("admin health missing instructions");
+  if (admin.process_security?.sandbox_self_test !== "passed" || admin.host_action_permission !== "unobservable") {
+    throw new Error(`admin health security status invalid: ${JSON.stringify(admin.process_security)}`);
+  }
   console.log("OK  admin health");
 
   // No-auth MCP servers follow tunnel-client's documented sample behavior: all
