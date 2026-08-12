@@ -9,17 +9,17 @@ MCP server local giống Codex: đọc/ghi file, chạy lệnh, git. Dùng với
 
 ## Quyền truy cập
 
-- `FULL_DISK_ACCESS` chỉ điều khiển scope của **path-aware tools**: `false` = workspace roots; `true` = path toàn máy.
+- `FULL_DISK_ACCESS` là security mode: `false` = path-aware tools chỉ trong workspace roots và arbitrary/project-controlled process trees phải qua Windows AppContainer (local stdio upstream bị block); `true` = explicit trusted native/full-machine mode. Fixed host mediators chỉ được phép thực hiện operation hẹp đã định nghĩa, không nhận arbitrary command text.
 - **Destructive-command guard luôn bật**, không phụ thuộc `FULL_DISK_ACCESS`: shell không được dùng để permanent-delete, `git clean -f*`, `git reset --hard`, hoặc bypass restore/delete safety.
 - `WORKSPACE_PATH` chỉ là thư mục mặc định cho path tương đối và shell/git
 
-## ChatGPT: tránh popup + lỗi "Luôn cho phép phải kết nối lại"
+## ChatGPT connector lifecycle / approval state
 
 ### Cách đúng (làm TRƯỚC khi chat)
 
 1. **Settings → Apps → Connectors** → chọn connector **Codex Local**
 2. Đặt quyền app: **Chỉ hỏi trước thay đổi quan trọng** hoặc **Hỏi trước khi thay đổi**
-3. Bấm **Refresh** connector (sau mỗi lần update server)
+3. Chỉ bấm **Refresh** khi public MCP contract version thay đổi hoặc connector snapshot thực tế không khớp `mcp_contract.version/hash`; internal implementation update không đổi ABI thì không Refresh.
 4. Mở chat mới, chọn connector, rồi mới gửi prompt
 
 ### KHÔNG bấm "Luôn cho phép" trên popup
@@ -37,7 +37,7 @@ Bình thường khi:
 - ChatGPT đóng stream SSE sau khi đổi quyền
 - Tunnel URL đổi (chạy lại `tunnel.bat` cloudflared) mà chưa update Connector URL
 
-**Fix:** Giữ server + tunnel chạy ổn định, không restart giữa chừng. Nếu restart → Refresh connector + chat mới.
+**Fix:** Giữ server + tunnel chạy ổn định, không restart giữa chừng. Sau restart nội bộ, reconnect/new chat nếu transport cần; chỉ Refresh connector khi public ABI version/snapshot thực sự đổi.
 
 **Khuyến nghị:** Dùng `openai-tunnel.bat` (OpenAI Secure MCP Tunnel) — `tunnel_id` cố định, không cần đổi URL connector mỗi lần.
 
@@ -85,12 +85,7 @@ Bình thường khi:
 
 ## ChatGPT safety layer — tool bị chặn ngẫu nhiên
 
-Một số tool wrapper đôi khi có thể bị lớp an toàn của client chặn. Chỉ được dùng `run_command` fallback cho thao tác **không phá hủy**. **Không bao giờ bypass delete/restore bằng shell.** Executor MCP chặn permanent-delete độc lập với hướng dẫn của agent.
-
-| Tool hay bị chặn | Fallback `run_command` |
-|---|---|
-| `git_push` | `git push -u origin <branch>` |
-| `git_checkout` | `git switch <branch>` |
+Một số tool wrapper có thể bị lớp an toàn của ChatGPT host chặn **trước khi request tới Local Coder**. Không dùng `run_command`, Git hoặc tool khác để bypass một MCP action đang bị host chặn. Xác định layer bằng `agent_status.mcp_dispatch`: nếu host báo lỗi nhưng `MCP_REACHED.write_total` không tăng thì `HOST_NOT_INVOKED` chỉ được **suy ra bên ngoài server**; Local Coder không được tạo fake event này. Nếu `MCP_REJECTED.write_total` tăng thì debug transport/session gate local.
 
 `git_restore` phải dùng tool `git_restore` để tạo checkpoint trước khi ghi đè. `delete_file` / `delete_directory` phải dùng tool tương ứng để chuyển target vào Recycle Bin. Không dùng `rm`, `Remove-Item`, `rmdir`, `del`, script Python/Node delete, `git clean -f*` hoặc `git reset --hard` làm fallback.
 
@@ -105,9 +100,7 @@ tool nội bộ:
   description, input schema, annotations. Canonical document:
   `scripts/fixtures/chatgpt-public-contract-v1.json` (SHA-256
   `afd98bd3…39e6`).
-- **Internal executor changes không được đổi ABI public**: thêm/đổi tool nội bộ
-  chỉ được phép nếu không làm đổi `tools/list` slim (contract test sẽ fail nếu
-  drift). Đổi ABI là thao tác explicit: bump
+- **Internal executor changes không được đổi ABI public**: process sandbox, checkpoint, atomic write, logging, Git/hook/upstream hardening không được làm đổi `tools/list` slim (contract test sẽ fail nếu drift). Đổi ABI là thao tác explicit: bump
   `CHATGPT_PUBLIC_CONTRACT_VERSION` → `npm run build && node scripts/generate-contract-fixture.mjs`
   → cập nhật test expected → commit fixture mới.
   Startup fail-closed: nếu live registration lệch fixture → server từ chối
@@ -115,11 +108,8 @@ tool nội bộ:
   `CHATGPT_PUBLIC_CONTRACT_DRIFT_OVERRIDE=1`, dev-only).
 - **Refresh connector**: chỉ cần khi **contract version đổi**. Không refresh sau
   mỗi update implementation nội bộ — ABI không đổi thì connector không cần đụng.
-- **Chẩn đoán layer chặn write**: `agent_status` trả `mcp_contract` (version,
-  hash, tool_count, dynamic flags), `boot.boot_id`, và tách bạch
-  `local_executor_profile`/`local_write_allowed` (local executor) vs
-  `host_action_permission: "unobservable"` (host ChatGPT gate — server không thể
-  biết). `/health` cũng expose `boot_id` + `mcp_contract`.
+- **Chẩn đoán layer chặn write**: `agent_status` trả `mcp_contract` (version, hash, tool_count, dynamic flags), `boot.boot_id`, `process_security`, và tách `local_executor_profile`/`local_write_allowed` khỏi `host_action_permission: "unobservable"`. `/health` cũng expose contract + sandbox health.
+- **Security invariant**: `FULL_DISK_ACCESS=false` phải confine path-aware tools và arbitrary/project-controlled process trees vào workspace roots bằng Windows AppContainer; local stdio upstream bị block trước spawn. Shell/Git/hooks/child process/upstream không được dùng để vượt path denial. Sandbox prepare/hash/ACL/self-test failure → fail closed; không native fallback. `FULL_DISK_ACCESS=true` mới là explicit trusted native full-machine mode. Fixed host mediators (AppContainer control, Recycle Bin operation, explicit setup helper) chỉ nhận input hẹp, không arbitrary command. `SANDBOX_EXEC_ROOTS` là privileged RX policy: nếu approved roots đổi, runtime phải fail closed cho tới khi `npm run setup:sandbox` revoke grants cũ + grant roots mới; agent command không bao giờ chạy elevated.
 
 ## Format `apply_patch` (Codex-style)
 

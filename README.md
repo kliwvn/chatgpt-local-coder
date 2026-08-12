@@ -44,7 +44,7 @@ No desktop app. No vendor lock-in. Run one Node process on your PC, expose it th
 | Multi-workspace | — | ✅ Manager dashboard, mỗi workspace 1 server + tunnel + connector |
 | Session recovery | — | ✅ Auto-recover after server restart |
 
-Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/developer-mode)** with optimized tool annotations (fewer permission popups) and **[OpenAI Secure MCP Tunnel](https://platform.openai.com/docs/guides/secure-mcp-tunnel)** support (stable URL, no connector re-wiring every restart).
+Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/developer-mode)** with semantically audited, fixture-locked MCP tool annotations and **[OpenAI Secure MCP Tunnel](https://platform.openai.com/docs/guides/secure-mcp-tunnel)** support (stable URL, no connector re-wiring every restart). Local metadata describes real effects; it is not tuned to bypass ChatGPT host approval.
 
 ## 🚀 Quick Start
 
@@ -157,7 +157,7 @@ Example prompts (after tagging):
 - *"Run npm test and fix any failures"*
 - *"Find all TODO comments with grep and summarize"*
 
-> **Tip:** After server updates or restarts → **Refresh** the connector and start a **new chat** (re-tag the connector).  
+> **Connector ABI rule:** restart/update implementation nội bộ **không cần Refresh** nếu `mcp_contract.version/hash` không đổi. Chỉ Refresh connector khi public contract version được chủ động bump; transport recovery riêng có thể cần reconnect nhưng không phải ABI migration.  
 > **Avoid** clicking **"Always allow"** on permission popups — it can reset the MCP session. Configure permissions in **Settings → Apps** instead.
 
 ## 🌐 Tunnel options
@@ -274,6 +274,11 @@ FULL_DISK_ACCESS=false
 # Workspace bổ sung (phân cách bằng ; trên Windows)
 # EXTRA_WORKSPACE_PATHS=D:\Coding\other-repo
 
+# Strict-process sandbox (FULL_DISK_ACCESS=false)
+SANDBOX_NETWORK_MODE=none
+# SANDBOX_ENV_ALLOWLIST=NODE_ENV;CI;MY_PROJECT_SETTING
+# SANDBOX_EXEC_ROOTS=C:\Tools\custom-bin
+
 # Checkpoint / rewind (Claude Code-style code undo)
 CHECKPOINT_ENABLED=true
 CHECKPOINT_MAX_FILE_BYTES=5242880
@@ -297,7 +302,10 @@ OPENAI_TUNNEL_API_KEY=
 | `WORKSPACE_PATH` | `cwd` | **Your project root** (like `cd` before `claude`). Auto-loads `CLAUDE.md` / `AGENTS.md` into MCP instructions |
 | `EXTRA_WORKSPACE_PATHS` | — | Thêm workspace bổ sung (`;`-separated) — server được phép truy cập tất cả các root này |
 | `WORKSPACE_PATHS` / `ALLOWED_WORKSPACE_PATHS` | — | Aliases của `EXTRA_WORKSPACE_PATHS` (đọc thêm nếu có) |
-| `FULL_DISK_ACCESS` | `false` | Scope cho **path-aware filesystem/git/config tools**. `false` = chỉ path canonical trong `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`); `true` = cho phép path toàn máy. Không phải OS sandbox cho native shell |
+| `FULL_DISK_ACCESS` | `false` | Security mode. `false` = canonical workspace roots **và** arbitrary/project-controlled local process trees chạy trong Windows AppContainer; local stdio upstream bị block; sandbox unavailable/self-test fail → process execution fail closed. Fixed host mediators chỉ thực hiện operation đã định nghĩa (ví dụ Recycle Bin broker) và không nhận arbitrary command text. `true` = explicit trusted native OS-user/full-machine mode. |
+| `SANDBOX_NETWORK_MODE` | `none` | Strict process network: `none` (default) hoặc `internet`; không silently grant loopback/LAN. |
+| `SANDBOX_ENV_ALLOWLIST` | — | Env bổ sung (`;`-separated) cho sandbox. Secret-like names vẫn bị deny mặc định; HOME/TEMP/AppData dùng sandbox profile. |
+| `SANDBOX_EXEC_ROOTS` | — | Toolchain roots bổ sung được cấp read/execute-only bằng `npm run setup:sandbox`; không writable. Node/npm/Git roots được auto-discover. Nếu danh sách approved RX roots đổi, runtime **fail closed** thay vì giữ ACL cũ; chạy lại `npm run setup:sandbox` để revoke grants cũ + grant roots mới rồi restart Local Coder. |
 | `MCP_SESSION_TTL_MS` | `120000` | Xóa session **idle** sau 2 phút. Session đang SSE-connected hoặc đang chạy tool không bị evict; stale POST được auto-recover |
 | `MCP_SESSION_CLEANUP_MS` | `15000` | Chu kỳ cleanup session idle (15 giây) |
 | `MCP_SESSION_DELETE_GRACE_MS` | `45000` | **Fallback grace** cho transport close ngoài explicit DELETE. Explicit DELETE đã serialize sau các POST/tool call trước đó nên được dispose ngay khi op chain drain xong, tránh giữ session churn thêm 45s không cần thiết |
@@ -324,9 +332,9 @@ OPENAI_TUNNEL_API_KEY=
 | `ADMIN_PORT` | `3001` | Admin GUI localhost-only (proxy qua manager) |
 | `ADMIN_TOKEN` | — | Tùy chọn bảo vệ **Admin API**. Static `/ui/` vẫn chỉ localhost và tải được; khi API trả 401, UI hỏi token và chỉ giữ trong `sessionStorage` (scope theo instance khi qua Manager) + gửi `Authorization: Bearer`, không đưa token vào URL/localStorage. Activity Live dùng authenticated polling khi token được bật |
 
-> **Path sandbox fail-closed mặc định.** `FULL_DISK_ACCESS=false` → các tool có path argument canonicalize path thật (`realpath`/nearest existing ancestor) rồi chặn `..\..`, symlink/junction và multi-file patch escape ra ngoài workspace roots. Recursive `glob`/`grep`/search không follow symlink entries. Project-controlled `CLAUDE.md`/rules imports cũng không được vượt workspace roots. **`run_command` / `start_process` là native shell và không được OS-sandbox bởi setting này**; chỉ working directory của chúng được kiểm tra. Chỉ chạy connector trên máy/code bạn tin cậy.
+> **Hard workspace boundary mặc định trên Windows.** `FULL_DISK_ACCESS=false` → path tools canonicalize/reject escape và arbitrary/project-controlled local process (`run_command`, `start_process`, typed Git/Git descendants, post-edit hooks) phải chạy dưới Windows AppContainer; local stdio upstream bị block trước spawn. AppContainer chỉ nhận RW cho `WORKSPACE_PATH` + `EXTRA_WORKSPACE_PATHS`; approved toolchain roots là RX-only; HOME/TEMP/AppData và environment được sanitize. Junction/symlink tới target ngoài root vẫn bị OS deny. Nếu broker/ACL/helper-hash/self-test không đạt, process execution trả `OS_SANDBOX_*` và **không fallback native**. Lần đầu trên Windows chạy `npm run setup:sandbox` cho compatibility grants tối thiểu (NUL kernel object, traverse-only ancestry metadata, RX toolchain). Nếu approved RX roots đổi, chạy lại setup: script revoke SID grants cũ trước khi grant roots mới; runtime sẽ fail closed cho tới khi policy được reconcile.
 
-> **Destructive filesystem safety:** `FULL_DISK_ACCESS=true` **không** tắt destructive guard. Slim profile luôn expose `delete_file` / `delete_directory` để removal hợp lệ đi qua recoverable Recycle Bin semantics; multi-file patch rollback, cross-volume move rollback và Manager Delete Instance cũng tránh permanent-delete user paths. Drive/workspace/repo/home roots, workspace ancestors và symlink/junction/reparse aliases bị từ chối. Nếu không thể bảo đảm Recycle Bin semantics, thao tác fail closed thay vì fallback sang permanent delete. `run_command` / `start_process` / post-edit hooks chặn trước spawn các known destructive/mass-overwrite primitives, nested shell/interpreter forms, disk-wipe/mirror commands và destructive Git ref/refspec operations; typed Git tools còn reject option/refspec injection và bind reset refs về immutable commit SHA. Đây vẫn là application-level guard, **không phải OS sandbox cho arbitrary permitted binaries/scripts**.
+> **Destructive filesystem safety:** `FULL_DISK_ACCESS=true` **không** tắt destructive guard. Slim profile luôn expose `delete_file` / `delete_directory` để removal hợp lệ đi qua recoverable Recycle Bin semantics; multi-file patch rollback, cross-volume move rollback và Manager Delete Instance cũng tránh permanent-delete user paths. `requireCommandAllowed()` và typed-Git guards tiếp tục là defense-in-depth cho thao tác nguy hiểm **bên trong root được cấp**. Với `FULL_DISK_ACCESS=false`, hard confidentiality/integrity boundary cho outside roots là AppContainer OS policy, không phải regex parser.
 
 > **Về session initialize liên tục:** ChatGPT connector có thể tạo MCP transport session mới rất thường xuyên, thậm chí gần một session mỗi tool call. Đây **không phải** model conversation context và **không reset/xóa lịch sử chat, reasoning context hay chất lượng model trực tiếp**. Chi phí thật nằm ở transport handshake, object allocation/tool registration và state/lifecycle nếu server thiết kế sai. Local Coder giữ upstream MCP connections/cache dùng chung, tự recover stale session, và giới hạn retention bằng TTL + hard cap ở trên. Console/server log chỉ sample `openai-mcp` initialize theo **counter riêng của client ở mốc 25/50/75/...**, nên warm-up/tunnel/recovery không làm lệch nhịp 1/25; dòng sample giữ cả global `initialized=` và `clientInitialized=` để diagnostics mà không spam log. Shell state bootstrap từ disk **một lần mỗi process/workspace** thay vì mỗi transport. `run_command.working_directory` là one-off isolation boundary: command và `cd`/`Set-Location`/`pushd` bên trong chỉ tác động child invocation đó, không mutate hay ghi vào persistent default-shell cwd/history; chỉ call không truyền `working_directory` hoặc `shell_reset` mới dùng state mặc định. Stale-session recovery loopback có timeout nội bộ và chỉ drain tối đa một response prefix nhỏ trước khi cancel, nên wrong/local streaming endpoint không thể làm recovery giữ body trong RAM hoặc chờ stream vô hạn. Explicit DELETE chạy trong cùng per-session op chain với POST, nên phải chờ tool call trước đó hoàn tất rồi session được dispose ngay; `MCP_SESSION_DELETE_GRACE_MS` chỉ còn là fallback cho transport-close ngoài explicit DELETE. Các state bền vững khác (checkpoint index, auto-memory, `.env`/manager config) được serialize/ghi atomic và keyed queue tự giải phóng key sau khi settle. Initialize response vẫn mang đúng một MCP instruction document (không double-wrap). Vì vậy initialize churn hiện có thể tốn CPU/GC/I/O nhỏ, nhưng không làm mất model context; ảnh hưởng gián tiếp tới tool context đã được tách khỏi transport lifecycle.
 
@@ -414,9 +422,9 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 
 ## 🔒 Security
 
-**Path sandbox fail-closed mặc định:** `FULL_DISK_ACCESS=false` giới hạn các path-aware filesystem/git/config operations trong `WORKSPACE_PATH` + `EXTRA_WORKSPACE_PATHS`, với canonical-path checks chống `..`, symlink/junction và patch-path escape. Source mutations trên cùng/overlapping path được serialize và source writes/copies dùng atomic replace để tránh lost-update/partial-write khi nhiều MCP transport chạy song song.
+**Security modes:** `FULL_DISK_ACCESS=false` là hard workspace mode trên Windows: canonical path checks bảo vệ path-aware APIs và Windows AppContainer bảo vệ arbitrary/project-controlled process trees. `run_command`, `start_process`, typed Git/Git descendants và post-edit hooks đều đi qua central ProcessExecutor; local stdio upstream bị block trước spawn; outside-root read/write bị OS deny, setup failure fail closed, và Job Object `KILL_ON_JOB_CLOSE` quản lý descendants. Fixed host mediators (AppContainer broker control, recoverable Recycle Bin operation, explicit setup helper) có operation/input hẹp và không phải arbitrary command execution. `FULL_DISK_ACCESS=true` là explicit trusted native mode với ordinary OS-user authority.
 
-**Native shell caveat:** `run_command` và `start_process` chạy shell/process thật của OS. `FULL_DISK_ACCESS=false` **không** biến chúng thành OS sandbox và không thể ngăn một command được phép tự truy cập path khác. Setting này là path boundary cho các tool mà server tự kiểm soát path, không phải VM/container/process isolation.
+**Strict upstream policy:** local stdio upstream bị block trước spawn; loopback/private/link-local HTTP upstream bị block trước connect vì có thể là host-authority escape. Public `mcp_servers` / `mcp_tools` / `mcp_call` vẫn tồn tại để ABI không đổi. Remote public HTTP upstream là trust dimension riêng. `npm run setup:sandbox` chỉ làm one-time Windows compatibility setup; nó không chạy agent command elevated.
 
 - Server chỉ nghe `127.0.0.1` — không phơi ra mạng nội bộ
 - Manager + admin GUI localhost-only; CORS hẹp
@@ -431,12 +439,12 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 | Problem | Fix |
 |---------|-----|
 | **"Error in message stream"** / **"Lỗi trong luồng tin nhắn"** right after *"Looking for tools"* — **no server log** | You did **not tag the connector**. New chat → **+** → **More** → enable connector, or type **`@Local Coder`** in the message. Then retry. |
-| **Resource not found** on tool call | Refresh connector + new chat. Server auto-recovers sessions — ensure latest build is running. |
+| **Resource not found** on tool call | Kiểm tra server/session và latest build trước. Chỉ Refresh connector nếu `mcp_contract.version` được chủ động thay đổi; same-ABI implementation restart không tự yêu cầu Refresh. |
 | **Connection failed** | Check `.\start.ps1` + tunnel are both running. URL must be HTTPS. |
 | **502 from tunnel during restart** | The tunnel can remain up while the local server is restarting; a brief 502 means `127.0.0.1:3000` was temporarily unavailable. Manager now drains MCP sessions with bounded graceful close before force fallback, reducing this window. |
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
-| **`MCP write action is temporarily disabled`** | Xem `/health` → `mcpDispatch` (hoặc `agent_status.mcp_dispatch`). Nếu `MCP_REACHED.write_total` không tăng khi lỗi xảy ra thì request bị chặn **trước Local Coder** (`HOST_NOT_INVOKED`): Refresh/re-approve connector và kiểm tra Action control phía ChatGPT. Nếu `MCP_REJECTED.write_total` tăng thì request đã tới Local Coder nhưng bị transport/session gate từ chối; xem `last_write_reason` và `reasons`. `MCP_IN_FLIGHT.write_total` chỉ là write request đang xử lý. Chỉ khi request đã tới MCP mà không settle đúng vào `MCP_EXECUTED` hoặc `MCP_REJECTED` mới coi là lỗi/hang runtime cần debug. |
-| **Tool blocked by client safety** | Chỉ dùng `run_command` fallback cho thao tác **không phá hủy** như `git push` / branch switch. Không bypass `delete_file`, `delete_directory` hoặc `git_restore` bằng shell; destructive executor guard sẽ từ chối. |
+| **`MCP write action is temporarily disabled`** | Xem `/health` → `mcpDispatch` (hoặc `agent_status.mcp_dispatch`). Nếu `MCP_REACHED.write_total` không tăng khi lỗi xảy ra thì host **không dispatch action tới Local Coder** (`HOST_NOT_INVOKED` chỉ được suy ra từ host-result + counter delta, server không thể tự log event này). So sánh connector snapshot với `mcp_contract.version/hash` và kiểm tra Action control/approval phía ChatGPT; chỉ Refresh nếu snapshot public ABI cần đổi. Nếu `MCP_REJECTED.write_total` tăng thì request đã tới Local Coder nhưng bị transport/session gate từ chối; xem `last_write_reason`/`reasons`. |
+| **Tool blocked by client safety** | Không dùng shell/Git/tool khác để bypass một MCP action đang bị host chặn. Xác định layer bằng `mcpDispatch`; sửa host/session/contract state nếu request chưa tới server. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
 | **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.bat`). |
 | **Access denied — "Path nằm ngoài workspace"** | Path sandbox mặc định (`FULL_DISK_ACCESS=false`). Mở rộng `EXTRA_WORKSPACE_PATHS` hoặc bật `FULL_DISK_ACCESS=true` trong `.env` instance, restart server trong manager. |
@@ -483,7 +491,7 @@ npm install && npm run build
 
 Mở **http://127.0.0.1:3300**: manager tự cài đặt, cấu hình workspace (folder picker), start server + tunnel, nút mở **Cài Đặt Connector**, **log viewer** (lọc Chỉ MCP), nút **Hướng Dẫn Sử Dụng** — không cần chạy terminal tay.
 
-**Path sandbox:** mặc định `FULL_DISK_ACCESS=false` — các tool có path argument chỉ đọc/ghi trong canonical `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`) và chặn symlink/junction/patch escape. `run_command` / `start_process` vẫn là native shell, **không** được OS-sandbox bởi setting này. Bật `true` chỉ mở scope của path-aware tools ra toàn máy; **không tắt destructive-command guard**. `delete_file` / `delete_directory` chuyển target vào Recycle Bin trên fixed local Windows drive và fail closed với protected root/alias/unsupported volume; không còn fallback `Remove-Item -Recurse -Force`.
+**Path/process sandbox:** mặc định `FULL_DISK_ACCESS=false` — các tool có path argument chỉ đọc/ghi trong canonical `WORKSPACE_PATH` (+ `EXTRA_WORKSPACE_PATHS`) và chặn symlink/junction/patch escape; `run_command`, `start_process`, typed Git và project-controlled hooks chạy dưới Windows AppContainer với cùng workspace boundary. Local stdio upstream bị block thay vì native-spawn. Bật `FULL_DISK_ACCESS=true` chuyển sang explicit trusted native/full-machine mode nhưng **không tắt destructive-command guard**. `delete_file` / `delete_directory` dùng fixed Recycle Bin mediator trên local Windows drive và fail closed với protected root/alias/unsupported volume; mediator không nhận arbitrary shell command và không có fallback `Remove-Item -Recurse -Force`.
 
 Chạy thủ công (không dùng manager):
 
@@ -498,6 +506,6 @@ Chạy thủ công (không dùng manager):
 
 **WORKSPACE_PATH:** đặt đúng thư mục project (không phải thư mục `chatgpt-local-coder`). Server tự đọc `CLAUDE.md` / `AGENTS.md` giống Claude Code.
 
-**Lưu ý:** Không bấm **"Luôn cho phép"** trên popup — cấu hình quyền ở Settings → Apps. Sau khi restart server: Refresh connector + mở chat mới + tag lại connector.
+**Lưu ý:** Không bấm **"Luôn cho phép"** trên popup — cấu hình quyền ở Settings → Apps. Restart/internal update giữ cùng `mcp_contract.version/hash` thì không Refresh vì ABI; chỉ Refresh khi public contract version chủ động đổi. Reconnect transport/session nếu client thực tế yêu cầu là việc riêng.
 
 Chi tiết cho AI agent: [AGENTS.md](AGENTS.md)
