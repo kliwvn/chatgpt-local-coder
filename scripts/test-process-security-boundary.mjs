@@ -56,6 +56,7 @@ try {
   assert.equal(security.process_sandbox_mode, "required");
   assert.equal(security.sandbox_backend, "windows_appcontainer");
   assert.equal(security.sandbox_self_test, "passed", security.sandbox_error);
+  assert.equal(security.sandbox_policy_reused, false, "first initialization must prepare the policy once");
   // Copy only after the inheritable AppContainer ACE is prepared so the probe
   // executable itself is launchable by the sandbox identity.
   await fs.copyFile(compiledChildProbe, childProbe);
@@ -96,7 +97,14 @@ try {
     "const [inside,childInside,childResult,outsideRead,outsideWrite]=process.argv.slice(2);",
     "function access(){ let r='denied',w='denied'; try{fs.readFileSync(outsideRead);r='escape'}catch(e){if(!['EACCES','EPERM'].includes(e.code))r='error:'+e.code} try{fs.writeFileSync(outsideWrite,'escape');w='escape'}catch(e){if(!['EACCES','EPERM'].includes(e.code))w='error:'+e.code} return {r,w}; }",
     "if(process.env.CLC_NODE_CHILD==='1'){fs.writeFileSync(childInside,'child-ok'); const x=access(); fs.writeFileSync(childResult,JSON.stringify(x)); process.exit(x.r==='denied'&&x.w==='denied'?0:31)}",
-    "fs.writeFileSync(inside,'parent-ok'); const x=access(); const child=cp.spawnSync(process.execPath,[__filename,inside,childInside,childResult,outsideRead,outsideWrite],{env:{...process.env,CLC_NODE_CHILD:'1'},stdio:'ignore',timeout:5000}); const childData=JSON.parse(fs.readFileSync(childResult,'utf8')); console.log('node_read='+x.r+' node_write='+x.w+' child_exit='+child.status); console.log('child_read='+childData.r+' child_write='+childData.w); process.exit(x.r==='denied'&&x.w==='denied'&&child.status===0&&childData.r==='denied'&&childData.w==='denied'?0:32);",
+    // stdio:'inherit' is the ONLY reliable nested-spawn mode inside an
+    // AppContainer: 'ignore' opens NUL (EPERM without the elevated
+    // `npm run setup:sandbox` NUL grant) and any anonymous-pipe stdio hangs
+    // node's CreateProcess. The property under test is nested-child
+    // AppContainer inheritance, which inherit proves just as strictly: the
+    // child runs with the same container token and must still be denied the
+    // outside paths.
+    "fs.writeFileSync(inside,'parent-ok'); const x=access(); const child=cp.spawnSync(process.execPath,[__filename,inside,childInside,childResult,outsideRead,outsideWrite],{env:{...process.env,CLC_NODE_CHILD:'1'},stdio:'inherit',timeout:20000}); const childData=JSON.parse(fs.readFileSync(childResult,'utf8')); console.log('node_read='+x.r+' node_write='+x.w+' child_exit='+child.status); console.log('child_read='+childData.r+' child_write='+childData.w); process.exit(x.r==='denied'&&x.w==='denied'&&child.status===0&&childData.r==='denied'&&childData.w==='denied'?0:32);",
   ].join("\n"), "utf8");
   const nodeRun = await shell.execInShellSession(
     `node ${ps(nodeProbe)} ${ps(nodeInside)} ${ps(nodeChildInside)} ${ps(nodeChildResult)} ${ps(outsideSecret)} ${ps(nodeOutsideWrite)}`,
@@ -111,7 +119,11 @@ try {
   assert.equal((await fs.readFile(nodeChildInside, "utf8")).trim(), "child-ok");
   await assert.rejects(fs.stat(nodeOutsideWrite));
 
-  const npmRun = await shell.execInShellSession("npm.cmd --version", allowed, 15_000, allowed);
+  // Bare `npm` (not npm.cmd): PowerShell's PATH resolution of the .ps1/.cmd
+  // command must pass the AuthorizationManager check, which fails in an
+  // AppContainer unless the shell launches with -ExecutionPolicy Bypass
+  // (persistent-shell.ts). This locks in the Bypass launch args.
+  const npmRun = await shell.execInShellSession("npm --version", allowed, 15_000, allowed);
   assert.equal(npmRun.exit_code, 0, JSON.stringify(npmRun));
   assert.match(npmRun.stdout.trim(), /^\d+\.\d+\.\d+/);
 
@@ -162,21 +174,32 @@ try {
   assert.equal(restoredExecPolicy.sandbox_self_test, "passed", restoredExecPolicy.sandbox_error);
   assert.equal(processExecutor.areAgentProcessesOsSandboxed(), true);
 
-  // Force sandbox preparation failure and prove there is no native fallback.
+  // Exact same policy on a later boot must not recursively rewrite ACLs again.
+  // The prepare-only seam would fail if startup attempted the mutating path.
   process.env.CLC_TEST_FORCE_SANDBOX_FAILURE = "prepare";
   processExecutor.resetProcessSecurityForTests();
-  shell.resetShellSession(allowed);
+  const reusedPolicy = await processExecutor.initializeProcessSecurity();
+  assert.equal(reusedPolicy.sandbox_self_test, "passed", reusedPolicy.sandbox_error);
+  assert.equal(reusedPolicy.sandbox_policy_reused, true, "unchanged policy was not reused non-mutatingly");
+  delete process.env.CLC_TEST_FORCE_SANDBOX_FAILURE;
+
+  // A changed RW policy still requires real reconciliation. Force that prepare
+  // path to fail and prove there is no native fallback.
+  const changedRwRoot = path.join(allowed, "changed-rw-root");
+  await fs.mkdir(changedRwRoot);
+  pathSecurity.setWorkspaceRoots([changedRwRoot]);
+  process.env.CLC_TEST_FORCE_SANDBOX_FAILURE = "prepare";
+  processExecutor.resetProcessSecurityForTests();
+  shell.resetShellSession(changedRwRoot);
   const failed = await processExecutor.initializeProcessSecurity();
   assert.equal(failed.sandbox_self_test, "failed");
   assert.equal(processExecutor.areAgentProcessesOsSandboxed(), false);
   await assert.rejects(
-    shell.execInShellSession(
-      `Start-Process -FilePath ${ps(childProbe)} -ArgumentList ${ps(failClosedMarker)},${ps(outsideSecret)},${ps(outsideWrite)} ` +
-        `-WorkingDirectory ${ps(allowed)} -NoNewWindow -Wait`,
-      allowed,
-      5_000,
-      allowed
-    ),
+    processExecutor.spawnProcess({
+      executable: process.execPath,
+      args: ["-e", "process.exit(0)"],
+      cwd: changedRwRoot,
+    }),
     /OS_SANDBOX_(?:PREPARE_FAILED|UNAVAILABLE)/
   );
   await assert.rejects(fs.stat(failClosedMarker));
@@ -184,6 +207,7 @@ try {
   // Explicit trusted mode remains native and can reach the temp outside root.
   delete process.env.CLC_TEST_FORCE_SANDBOX_FAILURE;
   process.env.FULL_DISK_ACCESS = "true";
+  pathSecurity.setWorkspaceRoots([allowed]);
   processExecutor.resetProcessSecurityForTests();
   shell.resetShellSession(allowed);
   const nativeWrite = path.join(outside, "trusted-mode.txt");

@@ -11,7 +11,7 @@ MCP server local giống Codex: đọc/ghi file, chạy lệnh, git. Dùng với
 
 - `FULL_DISK_ACCESS` là security mode: `false` = path-aware tools chỉ trong workspace roots và arbitrary/project-controlled process trees phải qua Windows AppContainer (local stdio upstream bị block); `true` = explicit trusted native/full-machine mode. Fixed host mediators chỉ được phép thực hiện operation hẹp đã định nghĩa, không nhận arbitrary command text.
 - **Destructive-command guard luôn bật**, không phụ thuộc `FULL_DISK_ACCESS`: shell không được dùng để permanent-delete, `git clean -f*`, `git reset --hard`, hoặc bypass restore/delete safety.
-- `WORKSPACE_PATH` chỉ là thư mục mặc định cho path tương đối và shell/git
+- `WORKSPACE_PATH` bắt buộc xác định **đúng một primary project root** và là default cwd/context ổn định; không derive ngầm từ `process.cwd()` và không nhét nhiều root bằng `;`. Root bổ sung chỉ qua `EXTRA_WORKSPACE_PATHS`. Khi `FULL_DISK_ACCESS=false`, các root này còn là hard workspace authority; khi `true`, collection parent có thể dùng làm context vì filesystem authority đã explicit full-machine.
 
 ## ChatGPT connector lifecycle / approval state
 

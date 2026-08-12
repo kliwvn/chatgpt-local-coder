@@ -82,8 +82,19 @@ try {
   for (const args of commands) {
     const result = await collect(await executor.spawnProcess({ executable: "git", args, cwd: sandboxCwd, timeoutMs: 15_000 }));
     console.log(JSON.stringify({ args, ...result }));
-    if (result.code !== 0) break;
+    // Previously this loop only logged and `break` on nonzero, so every git
+    // sandbox failure (e.g. MSYS /dev/null -> NUL denied) passed silently.
+    // Each compat command must now exit 0 and produce the expected output.
+    assert.equal(result.code, 0, `git ${args.join(" ")} failed in sandbox: ${result.stderr || result.stdout}`);
   }
+  const version = await collect(await executor.spawnProcess({ executable: "git", args: ["--version"], cwd: sandboxCwd, timeoutMs: 15_000 }));
+  assert.equal(version.code, 0, `git --version failed in sandbox: ${version.stderr || version.stdout}`);
+  assert.match(version.stdout, /^git version /, "sandboxed git --version output missing");
+  assert.equal(
+    (await fs.readFile(path.join(repo, "a.txt"), "utf8")).replace(/\r\n/g, "\n"),
+    "one\n",
+    "sandboxed git restore did not restore committed content",
+  );
 } finally {
   for (const [name, value] of Object.entries(old)) {
     if (value === undefined) delete process.env[name]; else process.env[name] = value;

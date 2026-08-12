@@ -7,7 +7,7 @@
  */
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -17,7 +17,11 @@ import { getDefaultCwd, getWorkspaceRoots, setDefaultCwd, setWorkspaceRoots } fr
 const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
 const oldCwd = getDefaultCwd();
 const oldRoots = getWorkspaceRoots();
-const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-legacy-compat-"));
+// Strict-mode workspace must not live under os.tmpdir() (C:\Users is not
+// traversable by the sandbox; git_status would fail with "Invalid path
+// 'C:/Users'"). Derive from the repo parent like the other sandbox tests.
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const temp = await fs.mkdtemp(path.join(path.resolve(repoRoot, ".."), "clc-legacy-compat-"));
 
 let passed = 0;
 let failed = 0;

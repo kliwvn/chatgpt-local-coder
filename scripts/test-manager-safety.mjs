@@ -34,21 +34,43 @@ const adminPort = await freePort();
 const restartServerPort = await freePort();
 const restartAdminPort = await freePort();
 const restartHealthPort = await freePort();
+const legacyNoIdPort = await freePort();
+const legacyNoIdAdminPort = await freePort();
+const legacyNoIdHealthPort = await freePort();
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-manager-safety-"));
 const instances = path.join(root, "instances");
 const stateDir = path.join(root, "state");
 const demo = path.join(instances, "demo");
 const restartDemo = path.join(instances, "restart-demo");
+const legacyNoId = path.join(instances, "legacy-no-id");
 await fs.mkdir(demo, { recursive: true });
 await fs.mkdir(restartDemo, { recursive: true });
+await fs.mkdir(legacyNoId, { recursive: true });
 
 const fakeServer = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", name: "codex-mcp-server" })); // missing expected workspace: must not be trusted
+    res.end(JSON.stringify({
+      status: "ok",
+      name: "codex-mcp-server",
+      instance_id: "different-managed-instance",
+      workspace: process.cwd(),
+    })); // matching workspace but wrong managed identity: must not be trusted
     return;
   }
   res.end("fake");
+});
+const legacyNoIdServer = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      status: "ok",
+      name: "codex-mcp-server",
+      workspace: process.cwd(),
+    })); // legacy-shaped health without instance_id and without Manager PID ledger
+    return;
+  }
+  res.end("legacy-no-id");
 });
 const fakeTunnel = http.createServer((_req, res) => {
   res.writeHead(200, { "content-type": "text/html" });
@@ -65,6 +87,7 @@ const fakeAdmin = http.createServer((req, res) => {
   res.end(JSON.stringify({ ok: true, proxied: true }));
 });
 await listen(fakeServer, fakeServerPort);
+await listen(legacyNoIdServer, legacyNoIdPort);
 await listen(fakeTunnel, fakeTunnelPort);
 await listen(createConflict, createConflictPort);
 
@@ -89,6 +112,18 @@ await fs.writeFile(path.join(demo, ".env"), [
   "",
 ].join("\n"));
 await fs.writeFile(path.join(demo, "config.json"), JSON.stringify({ connectorName: "legacy-must-be-removed", healthPort: fakeTunnelPort, autoStart: false }));
+await fs.writeFile(path.join(legacyNoId, ".env"), [
+  `PORT=${legacyNoIdPort}`,
+  `ADMIN_PORT=${legacyNoIdAdminPort}`,
+  `WORKSPACE_PATH=${process.cwd()}`,
+  "OPENAI_TUNNEL_ID=",
+  "OPENAI_TUNNEL_API_KEY=",
+  `OPENAI_TUNNEL_HEALTH_PORT=${legacyNoIdHealthPort}`,
+  "CHATGPT_TOOL_PROFILE=slim",
+  "FULL_DISK_ACCESS=false",
+  "",
+].join("\n"));
+await fs.writeFile(path.join(legacyNoId, "config.json"), JSON.stringify({ healthPort: legacyNoIdHealthPort, autoStart: false }));
 const historicalLogSecret = "historical-manager-log-secret-123456";
 await fs.writeFile(
   path.join(demo, "server.log"),
@@ -162,9 +197,17 @@ try {
   assert.ok(Number.isInteger(managerHealth.pid) && managerHealth.pid > 0);
   assert.ok(item);
   assert.equal(item.server.running, false);
-  assert.equal(item.server.portOccupied, true, "fake MCP-like health must not be trusted as this workspace");
+  assert.equal(item.server.portOccupied, true, "matching workspace with wrong managed instance_id must not be trusted as this instance");
   assert.equal(item.tunnel.running, false);
   assert.equal(item.tunnel.portOccupied, true, "generic HTML must not be trusted as tunnel-client");
+
+  const legacyNoIdItem = (await api("/api/instances")).body.instances.find((x) => x.name === "legacy-no-id");
+  assert.ok(legacyNoIdItem, "legacy-no-id fixture instance must be listed");
+  assert.equal(legacyNoIdItem.server.running, false, "legacy-shaped health without a saved PID ledger must not be adopted as owned");
+  assert.equal(legacyNoIdItem.server.portOccupied, true, "legacy-shaped health without instance_id/PID proof must be treated as an unowned port occupant");
+  const legacyNoIdStop = (await post("/api/instances/legacy-no-id/server/stop")).body;
+  assert.equal(legacyNoIdStop.alreadyStopped, true, "Manager must refuse to stop an unowned legacy-shaped listener");
+  assert.equal(legacyNoIdServer.listening, true, "unowned legacy-shaped listener must remain alive after Manager stop request");
 
   const envResponse = (await api("/api/instances/demo/env")).body;
   const serializedEnv = JSON.stringify(envResponse);
@@ -213,10 +256,11 @@ try {
   const managerApp = await fs.readFile(path.join(process.cwd(), "manager", "app.js"), "utf8");
   const managerCss = await fs.readFile(path.join(process.cwd(), "manager", "styles.css"), "utf8");
   const managerServerSource = await fs.readFile(path.join(process.cwd(), "manager", "server.mjs"), "utf8");
+  const managerRuntimeStateSource = await fs.readFile(path.join(process.cwd(), "manager", "runtime-state.mjs"), "utf8");
   const adminUiSource = await fs.readFile(path.join(process.cwd(), "public", "ui", "app.js"), "utf8");
   const envExampleSource = await fs.readFile(path.join(process.cwd(), ".env.example"), "utf8");
   const runtimeEntrySource = await fs.readFile(path.join(process.cwd(), "src", "index.ts"), "utf8");
-  assert.match(managerHtml, /id="btn-server-restart"[^>]*class="[^"]*btn-green[^"]*"[^>]*>[^<]*Khởi động lại Gateway/, "Gateway restart must use the same green emphasis as Connector");
+  assert.match(managerHtml, /id="btn-server-restart"[^>]*class="[^"]*btn-green[^"]*"[^>]*>[^<]*Khởi động lại Local Coder Server/, "Local Coder Server restart must use the same green emphasis as Connector");
   assert.match(managerHtml, /id="btn-connector"[^>]*class="[^"]*btn-green[^"]*"/, "Connector button must retain the shared green emphasis");
   assert.match(managerHtml, /id="foot-admin"[^>]*class="[^"]*btn-primary[^"]*"/, "Admin UI link must be visually emphasized");
   assert.doesNotMatch(managerHtml, /Focus Server|Focus Tunnel/, "user-facing Manager UI must not expose the ambiguous Focus label");
@@ -257,24 +301,34 @@ try {
   assert.match(managerServerSource, /dừng Server trước khi đổi PORT hoặc ADMIN_PORT/);
   assert.match(managerServerSource, /instanceCreateChain = Promise\.resolve\(\)/, "instance creation must serialize port allocation and persistence");
   assert.match(managerServerSource, /existingManager = await managerHealth\(port\)/, "EADDRINUSE must verify Local Coder Manager identity before treating the port as an existing Manager");
-  assert.match(managerServerSource, /isRuntimeArtifactStale\([\s\S]{0,160}?instructions\?\.loaded_at[\s\S]{0,160}?buildState\.newestArtifactMtimeMs/, "Manager status must compare running Gateway startup time against the newest compiled runtime module");
+  assert.match(managerServerSource, /isRuntimeArtifactStale\([\s\S]{0,160}?instructions\?\.loaded_at[\s\S]{0,160}?buildState\.newestArtifactMtimeMs/, "Manager status must compare running Local Coder Server startup time against the newest compiled runtime module");
   assert.match(managerServerSource, /inspectRuntimeBuildFreshness/, "Manager must compare source freshness against the complete compiled runtime tree");
-  assert.match(managerServerSource, /async function restartServer[\s\S]{0,420}?runtimeBuildStatus\(true\)[\s\S]{0,420}?sourceNewerThanBuild[\s\S]{0,420}?stopServerUnlocked/, "Gateway restart must refuse stale source before stopping the live process");
-  assert.match(managerServerSource, /startTunnelUnlocked[\s\S]{0,1800}?serverState\.buildDrift \|\| serverState\.artifactDrift/, "Tunnel start must refuse to expose a stale Gateway contract");
+  assert.match(managerServerSource, /async function restartServer[\s\S]{0,420}?runtimeBuildStatus\(true\)[\s\S]{0,420}?sourceNewerThanBuild[\s\S]{0,420}?stopServerUnlocked/, "Local Coder Server restart must refuse stale source before stopping the live process");
+  assert.match(managerServerSource, /startTunnelUnlocked[\s\S]{0,1800}?serverState\.buildDrift \|\| serverState\.artifactDrift/, "Tunnel start must refuse to expose a stale Local Coder Server contract");
   assert.match(managerServerSource, /MANAGER_RUNTIME_FILES/, "Manager must track the source modules that require self-restart after modification");
   assert.match(managerServerSource, /managerRuntimeStatus\(\)/, "Manager must expose self artifact drift status");
-  assert.match(managerServerSource, /!st\.portOccupied && !st\.invalidConfig && !st\.artifactDrift && !st\.buildDrift/, "configuration check must not report stale source/build/runtime state as healthy");
+  assert.match(managerServerSource, /!st\.portOccupied && !st\.invalidConfig && !st\.configDrift && !st\.artifactDrift && !st\.buildDrift/, "configuration check must not report stale saved config/source/build/runtime state as healthy");
   assert.match(managerApp, /artifactDrift/, "Manager UI must surface stale runtime artifacts");
+  assert.match(managerApp, /configDrift/, "Manager UI must surface a live server using stale saved configuration");
   assert.match(managerApp, /btn-server-restart"\)\.disabled = busy \|\| !srv\.running \|\| serverConflict \|\| buildDrift/, "UI must disable restart until stale source has been built");
-  assert.match(managerApp, /btn-tunnel"\)\.disabled = busy \|\| tunnelConflict \|\| \(!tun\.running && \(artifactDrift \|\| buildDrift\)\)/, "UI must not allow a stopped Tunnel to expose a stale Gateway");
+  assert.match(managerApp, /btn-tunnel"\)\.disabled = busy \|\| tunnelConflict \|\| \(!tun\.running && \(artifactDrift \|\| buildDrift\)\)/, "UI must not allow a stopped Tunnel to expose a stale Local Coder Server");
   assert.match(managerApp, /buildDrift \? "Source chưa build"/, "workspace card must surface source/build drift instead of showing a false-green server state");
-  assert.match(managerApp, /build mới hơn process/, "Manager UI must tell the user a stale Gateway needs restart");
+  assert.match(managerApp, /build mới hơn process/, "Manager UI must tell the user a stale Local Coder Server needs restart");
   assert.match(managerApp, /Manager source mới hơn process/, "Manager UI must surface Manager self-drift instead of silently serving stale control logic");
+  assert.match(managerHtml, /btn-mgr-restart/, "Manager UI must expose a Restart Manager button in the header");
+  assert.match(managerApp, /btn-mgr-restart/, "Manager frontend must wire the Restart Manager button");
+  assert.match(managerApp, /\/api\/manager\/restart/, "Manager frontend must call the dedicated self-restart API");
+  assert.match(managerServerSource, /p === "\/api\/manager\/restart"/, "Manager must expose POST /api/manager/restart");
+  assert.match(managerServerSource, /--restart/, "Manager self-restart must hand off via a restart token argument");
+  assert.match(managerServerSource, /TUNNEL_CLIENT_VERSION_FILE/, "Manager must track the installed tunnel-client version for auto-upgrade");
+  assert.match(managerServerSource, /tunnel-client-\$\{OPENAI_TUNNEL_VERSION\}\.zip/, "Manager must retain a versioned tunnel-client zip cache instead of deleting it");
+  assert.doesNotMatch(managerServerSource, /fsp\.rm\(tmpZip/, "tunnel-client install must not permanently delete its download");
+  assert.match(managerServerSource, /OPENAI_TUNNEL_VERSION = "v0\.0\.11"/, "Manager must target tunnel-client v0.0.11 (timeout/session fixes)");
   assert.match(managerServerSource, /if \(!srv\.ok\) \{[\s\S]{0,180}?continue;[\s\S]{0,180}?startTunnel\(name\)/, "autostart must not launch Tunnel after Server start fails");
   assert.match(managerServerSource, /Refusing to stop an unowned .*tunnel/i, "Tunnel stop must fail closed for unowned processes");
   assert.doesNotMatch(managerServerSource, /pidsWithCmdLine\(profileFile\)/, "Tunnel cleanup must include an executable identity and never call the process scanner with only a profile path");
   assert.match(managerServerSource, /pidsWithCmdLine\("tunnel-client\.exe", profileFile\)/, "OpenAI tunnel cleanup must scope by executable plus the instance-unique profile");
-  assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.serverPid, null\)/, "failed Gateway startup must preserve PID metadata until the child is confirmed stopped");
+  assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.serverPid, null\)/, "failed Local Coder Server startup must preserve PID metadata until the child is confirmed stopped");
   assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.tunnelPid, null\)/, "failed cloudflared startup must preserve PID metadata until the child is confirmed stopped");
   assert.match(managerApp, /\/server\/restart/);
   assert.match(managerApp, /splitExtraWorkspacePaths/);
@@ -288,11 +342,18 @@ try {
   assert.match(managerCss, /\.inst-ws\s*\{[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*normal/s);
   assert.match(managerServerSource, /"  level: warn"/, "managed OpenAI tunnel must default to warn logging to avoid unbounded INFO churn");
   assert.doesNotMatch(managerServerSource, /HARPOON_ALLOW_PLAINTEXT_HTTP|--harpoon\.allow-plaintext-http/, "managed tunnel must not weaken Harpoon transport policy just to accept local HTTP metadata");
+  assert.match(managerServerSource, /spawnDetached\([\s\S]{0,260}?\.\.\.env,[\s\S]{0,260}?MCP_INSTANCE_NAME:\s*name,[\s\S]{0,120}?LOCAL_CODER_INSTANCE_ID:\s*name/, "Manager must inject instance identity after user env values so .env cannot spoof the managed runtime identity");
+  assert.match(managerServerSource, /function isManagedInstanceHealth[\s\S]{0,620}?instance_id[\s\S]{0,320}?instanceId === name[\s\S]{0,320}?return allowLegacy/, "Manager must verify managed runtime instance_id and make missing identity an explicit legacy-only path");
+  assert.match(managerServerSource, /const legacyOwnedListener = Boolean\(savedPid && portPid === savedPid && isPidAlive\(savedPid\)\)/, "legacy health without instance_id must require persisted PID + live listener proof");
+  assert.match(managerServerSource, /isLocalCoderHealth\(health, env, name, \{ allowLegacy: legacyOwnedListener \}\)/, "configured-port legacy recovery must be gated by the saved-PID listener proof");
+  assert.match(managerServerSource, /waitFor\(async \(\) => isLocalCoderHealth\(await serverHealth\(st\.port\), env, name\), 20000\)/, "newly spawned runtimes must pass strict instance identity without allowLegacy");
+  assert.match(runtimeEntrySource, /instance_id:\s*process\.env\.LOCAL_CODER_INSTANCE_ID \|\| process\.env\.MCP_INSTANCE_NAME \|\| null/, "Local Coder /health must expose the Manager-injected instance identity without inventing one for direct launches");
   assert.match(managerServerSource, /CHECKPOINT_PATH:[^\n]+path\.join\(inst\.dir, "checkpoints"\)/, "managed checkpoint state must live under the instance, not repo root");
   assert.match(managerServerSource, /MCP_SHELL_STATE_DIR:[^\n]+path\.join\(inst\.dir, "shell-state"\)/, "managed shell state must live under the instance, not repo root");
+  assert.match(managerServerSource, /CLC_SANDBOX_STATE_DIR:[^\n]+path\.join\(inst\.dir, "shell-state"\)/, "AppContainer policy state must stay bound to managed shell-state so prior ACL roots remain reconcilable");
   assert.match(managerServerSource, /migrateLegacyRuntimeState/, "default instance must migrate legacy repo-root runtime state before startup");
-  assert.match(managerServerSource, /recycleManagedDirectory\(item\.target, inst\.dir\)/, "cross-volume runtime-state rollback must be recoverable");
-  assert.doesNotMatch(managerServerSource, /fsp\.rm\(item\.target, \{ recursive: true, force: true \}\)/, "runtime-state rollback must never permanently recurse-delete its copy");
+  assert.match(managerRuntimeStateSource, /recycleManagedDirectory\(target, targetParent\)/, "cross-volume runtime-state rollback must be recoverable");
+  assert.doesNotMatch(managerRuntimeStateSource, /fs\.rm\([^\n]*recursive:\s*true/, "runtime-state rollback must never permanently recurse-delete its copy");
   assert.match(managerServerSource, /isLegacyRuntimeStateValue/, "legacy relative runtime-state settings must be recognized instead of treated as custom paths");
   assert.match(managerServerSource, /serializeDotEnv\(\{ \[item\.envKey\]: null \}, rawEnv\)/, "legacy runtime-state settings must be removed after migration to avoid UI/runtime drift");
   assert.match(managerServerSource, /managedRuntimeStatePath\(env\.CHECKPOINT_PATH/, "legacy CHECKPOINT_PATH values must resolve to the managed instance store at spawn time");
@@ -327,49 +388,95 @@ try {
   assert.equal(managedRestart.ok, true, `managed restart failed: ${JSON.stringify(managedRestart)}`);
   assert.equal(managedRestart.restarted, true);
   assert.equal(managedRestart.previousPid, managedStart.pid);
-  assert.equal(managedRestart.previousProcessExited, true, "restart must confirm the previous Gateway process exited");
-  assert.equal(pidAlive(managedStart.pid), false, "replacement Gateway must not start while the previous PID is still alive");
+  assert.equal(managedRestart.previousProcessExited, true, "restart must confirm the previous Local Coder Server process exited");
+  assert.equal(pidAlive(managedStart.pid), false, "replacement Local Coder Server must not start while the previous PID is still alive");
   assert.ok(Number.isInteger(managedRestart.pid) && managedRestart.pid !== managedStart.pid, "restart must replace the gateway PID");
   managedRestartPid = managedRestart.pid;
   await sleep(300);
   const restartLog = await fs.readFile(path.join(restartDemo, "server.log"), "utf8");
-  assert.doesNotMatch(restartLog, /Graceful shutdown timeout/, "isolated restart must not hit the Gateway hard-exit timeout");
+  assert.doesNotMatch(restartLog, /Graceful shutdown timeout/, "isolated restart must not hit the Local Coder Server hard-exit timeout");
   let restartListing;
   for (let attempt = 0; attempt < 10; attempt++) {
     restartListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
     if (restartListing?.server?.running) break;
     await sleep(100);
   }
-  assert.equal(restartListing.server.running, true, `restarted Gateway was not reflected as running: ${JSON.stringify(restartListing.server)}`);
+  assert.equal(restartListing.server.running, true, `restarted Local Coder Server was not reflected as running: ${JSON.stringify(restartListing.server)}`);
   assert.equal(restartListing.server.pid, managedRestart.pid);
+  assert.equal(restartListing.server.health?.instance_id, "restart-demo", "managed runtime health must carry its injected instance identity");
 
-  // Simulate an out-of-band .env edit while the managed Gateway is still live.
-  // Manager must keep tracking the owned PID on its actual old port, refuse a
-  // duplicate start, and still be able to stop that exact process safely.
+  // Same-port workspace drift is the dangerous stale-runtime case: the saved
+  // .env can change while the already-owned child keeps serving the old project
+  // on the same listener. It must remain owned/running (so lifecycle can repair
+  // it), but every health/config surface must report the stale configuration.
   const restartEnvPath = path.join(restartDemo, ".env");
   const restartLiveEnv = await fs.readFile(restartEnvPath, "utf8");
+  const driftWorkspace = path.join(root, "workspace-drift");
+  await fs.mkdir(driftWorkspace, { recursive: true });
+  const workspaceDriftEnv = restartLiveEnv.replace(/^WORKSPACE_PATH=.*$/m, `WORKSPACE_PATH=${driftWorkspace}`);
+  await fs.writeFile(restartEnvPath, workspaceDriftEnv, "utf8");
+  const workspaceDriftListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
+  assert.equal(workspaceDriftListing.server.running, true, "WORKSPACE_PATH drift on the same port must not make the owned server disappear");
+  assert.equal(workspaceDriftListing.server.port, restartServerPort, "same-port workspace drift must report the actual live listener");
+  assert.equal(workspaceDriftListing.server.pid, managedRestart.pid, "same-port workspace drift must retain exact managed PID ownership");
+  assert.equal(workspaceDriftListing.server.health?.instance_id, "restart-demo", "workspace drift must not erase managed instance identity");
+  assert.equal(workspaceDriftListing.server.configDrift, true, "same-port workspace drift must be configuration drift");
+  assert.equal(workspaceDriftListing.server.workspaceDrift, true, "same-port workspace drift must be classified explicitly");
+  assert.equal(workspaceDriftListing.server.portDrift, false, "same-port workspace drift must not be misclassified as PORT drift");
+  const workspaceDriftCheck = (await post("/api/instances/restart-demo/check")).body;
+  assert.equal(workspaceDriftCheck.ok, false, "configuration check must be red while the owned server is running a stale WORKSPACE_PATH");
+  const workspaceDriftServerCheck = workspaceDriftCheck.items.find((item) => item.label === "Server");
+  assert.equal(workspaceDriftServerCheck?.ok, false, "Server config-check item must reject stale WORKSPACE_PATH");
+  assert.match(workspaceDriftServerCheck?.detail || "", /cấu hình process khác|workspace runtime|restart/i);
+  await fs.writeFile(restartEnvPath, restartLiveEnv, "utf8");
+
+  // The Check action also accepts unsaved form overrides. Compare them against
+  // the live process, not only against the still-matching on-disk .env.
+  const proposedWorkspaceDriftCheck = (await post("/api/instances/restart-demo/check", {
+    values: { WORKSPACE_PATH: driftWorkspace },
+  })).body;
+  assert.equal(proposedWorkspaceDriftCheck.ok, false, "unsaved WORKSPACE_PATH drift must not be reported healthy");
+  const proposedWorkspaceServerCheck = proposedWorkspaceDriftCheck.items.find((item) => item.label === "Server");
+  assert.equal(proposedWorkspaceServerCheck?.ok, false, "Server check must compare against unsaved proposed workspace config");
+  assert.match(proposedWorkspaceServerCheck?.detail || "", /cấu hình process khác|workspace runtime|restart/i);
+
+  // A blank primary workspace is invalid context, never a successful "exists"
+  // result. Keep ownership of the already-running process so restart/stop remains
+  // possible, but surface both workspaceMissing and configuration drift.
+  const missingWorkspaceEnv = restartLiveEnv.replace(/^WORKSPACE_PATH=.*$/m, "WORKSPACE_PATH=");
+  await fs.writeFile(restartEnvPath, missingWorkspaceEnv, "utf8");
+  const missingWorkspaceListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
+  assert.equal(missingWorkspaceListing.workspaceMissing, true, "blank WORKSPACE_PATH must be surfaced as missing");
+  assert.equal(missingWorkspaceListing.server.running, true, "blank saved workspace must not lose ownership of the live managed PID");
+  assert.equal(missingWorkspaceListing.server.configDrift, true, "blank saved workspace must be classified as config drift");
+  assert.equal(missingWorkspaceListing.server.workspaceDrift, true, "blank saved workspace must be classified as workspace drift");
+  await fs.writeFile(restartEnvPath, restartLiveEnv, "utf8");
+
+  // Simulate an out-of-band PORT edit while the managed Local Coder Server is still live.
+  // Manager must keep tracking the owned PID on its actual old port, refuse a
+  // duplicate start, and still be able to stop that exact process safely.
   const driftConfiguredPort = await freePort();
   await fs.writeFile(restartEnvPath, restartLiveEnv.replace(/^PORT=.*$/m, `PORT=${driftConfiguredPort}`), "utf8");
   const driftListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
-  assert.equal(driftListing.server.running, true, "PORT drift must not make an owned live Gateway disappear");
+  assert.equal(driftListing.server.running, true, "PORT drift must not make an owned live Local Coder Server disappear");
   assert.equal(driftListing.server.port, restartServerPort, "status must report the actual live port during config drift");
   assert.equal(driftListing.server.configuredPort, driftConfiguredPort);
   assert.equal(driftListing.server.configDrift, true);
   assert.equal(driftListing.server.pid, managedRestart.pid);
   const driftDuplicateStart = (await post("/api/instances/restart-demo/server/start")).body;
-  assert.equal(driftDuplicateStart.ok, false, "PORT drift must fail closed instead of starting a duplicate Gateway");
+  assert.equal(driftDuplicateStart.ok, false, "PORT drift must fail closed instead of starting a duplicate Local Coder Server");
   assert.match(driftDuplicateStart.error, /still running|PORT|configuration/i);
   const driftTunnelStart = (await post("/api/instances/restart-demo/tunnel/start")).body;
-  assert.equal(driftTunnelStart.ok, false, "Tunnel must not start against a Gateway with PORT drift");
+  assert.equal(driftTunnelStart.ok, false, "Tunnel must not start against a Local Coder Server with PORT drift");
   assert.match(driftTunnelStart.error, /old PORT|running|configuration|drift/i);
   const managedStop = (await post("/api/instances/restart-demo/server/stop")).body;
   assert.equal(managedStop.ok, true, `managed server stop failed: ${JSON.stringify(managedStop)}`);
-  assert.equal(managedStop.processExited, true, "stop must confirm the Gateway PID fully exited");
-  assert.equal(pidAlive(managedRestart.pid), false, "stopped Gateway PID must no longer be alive");
+  assert.equal(managedStop.processExited, true, "stop must confirm the Local Coder Server PID fully exited");
+  assert.equal(pidAlive(managedRestart.pid), false, "stopped Local Coder Server PID must no longer be alive");
   managedRestartPid = null;
   await fs.writeFile(restartEnvPath, restartLiveEnv, "utf8");
 
-  // Deleting a live instance must first stop its owned Gateway and only then
+  // Deleting a live instance must first stop its owned Local Coder Server and only then
   // remove the instance metadata. This guards against orphaning a process when
   // instance deletion and lifecycle management drift apart.
   const deleteStart = (await post("/api/instances/restart-demo/server/start")).body;
@@ -378,7 +485,7 @@ try {
   managedRestartPid = deleteStart.pid;
   const deleteResult = (await api("/api/instances/restart-demo", { method: "DELETE" })).body;
   assert.equal(deleteResult.ok, true, `live instance delete failed: ${JSON.stringify(deleteResult)}`);
-  assert.equal(pidAlive(deleteStart.pid), false, "instance delete left its Gateway process alive");
+  assert.equal(pidAlive(deleteStart.pid), false, "instance delete left its Local Coder Server process alive");
   assert.equal(await fs.stat(restartDemo).then(() => true, () => false), false, "instance directory survived successful delete");
   managedRestartPid = null;
 
@@ -441,7 +548,7 @@ try {
   assert.equal(log2.unchanged, true);
   assert.equal(log2.log, "");
 
-  console.log("manager-safety: ok (identity, env 20/20, profiles 30/30, port-drift ownership, create serialization, manager-port identity, secret-safe, restart PID swap, conditional log)");
+  console.log("manager-safety: ok (instance identity, legacy-no-id fail-closed, env 20/20, profiles 30/30, workspace/port drift ownership, create serialization, manager-port identity, secret-safe, restart PID swap, conditional log)");
 } finally {
   if (managedRestartPid) {
     if (process.platform === "win32") spawnSync("taskkill", ["/PID", String(managedRestartPid), "/T", "/F"], { windowsHide: true });
@@ -452,6 +559,6 @@ try {
   manager.kill("SIGTERM");
   await sleep(300);
   if (manager.exitCode == null && process.platform === "win32") spawnSync("taskkill", ["/PID", String(manager.pid), "/T", "/F"], { windowsHide: true });
-  for (const server of [fakeServer, fakeTunnel, createConflict, fakeAdmin]) await new Promise((resolve) => server.close(resolve));
+  for (const server of [fakeServer, legacyNoIdServer, fakeTunnel, createConflict, fakeAdmin]) await new Promise((resolve) => server.close(resolve));
   await fs.rm(root, { recursive: true, force: true });
 }

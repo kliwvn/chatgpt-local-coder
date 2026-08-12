@@ -60,7 +60,13 @@ async function callTool(server, name, args) {
 const servers = [];
 let temp;
 try {
-  const testBase = path.resolve(process.env.WORKSPACE_PATH?.trim() || path.dirname(process.cwd()));
+  const configuredWorkspace = String(process.env.WORKSPACE_PATH || "").trim();
+  let testBase = path.resolve(configuredWorkspace || path.dirname(process.cwd()));
+  try {
+    if (!(await fs.stat(testBase)).isDirectory()) testBase = os.tmpdir();
+  } catch {
+    testBase = os.tmpdir();
+  }
   temp = await fs.mkdtemp(path.join(testBase, "clc-diag-"));
   setDefaultCwd(temp);
   setWorkspaceRoots([temp]);
@@ -106,6 +112,9 @@ try {
   check("agent_status AppContainer backend", status.process_security?.sandbox_backend === "windows_appcontainer", `${status.process_security?.sandbox_backend}`);
   check("agent_status sandbox self-test passed", status.process_security?.sandbox_self_test === "passed", `${status.process_security?.sandbox_self_test}`);
   check("shell_commands_os_sandboxed true", status.shell_commands_os_sandboxed === true, `${status.shell_commands_os_sandboxed}`);
+  check("permission description names required AppContainer", /Windows AppContainer workspace sandbox/.test(String(status.permission_description || "")), String(status.permission_description));
+  check("permission description says sandbox failure is fail-closed", /fail closed/i.test(String(status.permission_description || "")), String(status.permission_description));
+  check("strict quickstart does not claim native unsandboxed execution", !/not OS-sandboxed|execute native shell commands/i.test(String(status.quickstart || "")), String(status.quickstart || "").slice(-220));
 
   // --- 3. drift guard: fails closed on corruption --------------------------
   const internal = server._registeredTools;

@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const testBase = path.resolve(process.env.WORKSPACE_PATH?.trim() || path.dirname(process.cwd()));
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Temp base derives from the repo itself, never WORKSPACE_PATH: that env value
+// can be a placeholder or point outside the test's control.
+const testBase = path.resolve(repoRoot, "..");
 const root = await fs.mkdtemp(path.join(testBase, "clc-start-sandbox-"));
 const outside = await fs.mkdtemp(path.join(testBase, "clc-start-outside-"));
 const outsideSecret = path.join(outside, "secret.txt");
@@ -52,7 +56,11 @@ try {
     "function probe(){let r='denied',w='denied';try{fs.readFileSync(outsideRead);r='escape'}catch(e){if(!['EACCES','EPERM'].includes(e.code))r='error:'+e.code}try{fs.writeFileSync(outsideWrite,'escape');w='escape'}catch(e){if(!['EACCES','EPERM'].includes(e.code))w='error:'+e.code}return {r,w};}",
     "if(mode==='child'){const x=probe();fs.writeFileSync(childResult,JSON.stringify(x));setInterval(()=>{},1000);return;}",
     "const x=probe();fs.writeFileSync(parentResult,JSON.stringify(x));",
-    "const child=cp.spawn(process.execPath,[__filename,'child',parentResult,childResult,pidsFile,outsideRead,outsideWrite],{stdio:'ignore'});",
+    // stdio:'inherit': inside an AppContainer 'ignore' fails on the NUL device
+    // and anonymous-pipe stdio hangs node's CreateProcess (see
+    // test-process-security-boundary); inherit still runs the child with the
+    // same container token, which is the property under test.
+    "const child=cp.spawn(process.execPath,[__filename,'child',parentResult,childResult,pidsFile,outsideRead,outsideWrite],{stdio:'inherit'});",
     "fs.writeFileSync(pidsFile,JSON.stringify({parent:process.pid,child:child.pid}));console.log('READY parent='+process.pid+' child='+child.pid);setInterval(()=>{},1000);",
   ].join("\n"), "utf8");
 

@@ -109,7 +109,7 @@ npm start
 | **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel, **WORKSPACE_PATH đầy đủ**, `EXTRA_WORKSPACE_PATHS` gộp trên **một dòng** và ngăn cách bằng `;` (ellipsis khi quá dài, hover xem đủ), `FULL_DISK_ACCESS`, **MCP port + Admin port + PID** |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Tunnel |
 | **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
-| **Autostart ẩn hoàn toàn** | Tự chạy khi đăng nhập Windows qua Startup LNK → `wscript manager-hidden.vbs` → node chạy nền, **không hiện cửa sổ terminal/popup** nào. Bật/tắt trong dashboard (API `/api/autostart`) hoặc `setup.bat` |
+| **Autostart ẩn hoàn toàn** | Tự chạy khi đăng nhập Windows qua Startup LNK → PowerShell hidden launcher `manager-hidden.ps1` → `manager.bat`/node chạy nền. Không phụ thuộc VBScript engine; khi bật lại autostart, Manager tự ghi lại LNK và dọn launcher VBS cũ nếu còn. Bật/tắt trong dashboard (API `/api/autostart`) hoặc `setup.bat` |
 
 Manager và server chạy độc lập: manager quản lý, server xử lý MCP. Tắt manager không làm chết server đang chạy.
 
@@ -299,9 +299,9 @@ OPENAI_TUNNEL_API_KEY=
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WORKSPACE_PATH` | `cwd` | **Your project root** (like `cd` before `claude`). Auto-loads `CLAUDE.md` / `AGENTS.md` into MCP instructions |
+| `WORKSPACE_PATH` | **required** | **Đúng 1 primary project root** (like `cd` before `claude`). Không được để trống và không chứa danh sách `;`; runtime không derive authority/context từ `process.cwd()`. Auto-loads `CLAUDE.md` / `AGENTS.md` into MCP instructions. Với `FULL_DISK_ACCESS=false`, root này còn là một phần hard workspace boundary; với `true`, nó vẫn là deterministic project/default-cwd context. |
 | `EXTRA_WORKSPACE_PATHS` | — | Thêm workspace bổ sung (`;`-separated) — server được phép truy cập tất cả các root này |
-| `WORKSPACE_PATHS` / `ALLOWED_WORKSPACE_PATHS` | — | Aliases của `EXTRA_WORKSPACE_PATHS` (đọc thêm nếu có) |
+| `WORKSPACE_PATHS` / `ALLOWED_WORKSPACE_PATHS` | — | **Obsolete/ignored.** Manager loại các key legacy này khỏi managed `.env`; chỉ `WORKSPACE_PATH` + `EXTRA_WORKSPACE_PATHS` là workspace authority/context SSoT. |
 | `FULL_DISK_ACCESS` | `false` | Security mode. `false` = canonical workspace roots **và** arbitrary/project-controlled local process trees chạy trong Windows AppContainer; local stdio upstream bị block; sandbox unavailable/self-test fail → process execution fail closed. Fixed host mediators chỉ thực hiện operation đã định nghĩa (ví dụ Recycle Bin broker) và không nhận arbitrary command text. `true` = explicit trusted native OS-user/full-machine mode. |
 | `SANDBOX_NETWORK_MODE` | `none` | Strict process network: `none` (default) hoặc `internet`; không silently grant loopback/LAN. |
 | `SANDBOX_ENV_ALLOWLIST` | — | Env bổ sung (`;`-separated) cho sandbox. Secret-like names vẫn bị deny mặc định; HOME/TEMP/AppData dùng sandbox profile. |
@@ -504,7 +504,7 @@ Chạy thủ công (không dùng manager):
 
 **Bắt buộc tag connector mỗi chat:** Chat mới → **+** → **More** → bật connector, hoặc gõ **`@`** + tên connector trong ô chat. Nếu không tag, ChatGPT báo *"Đang tìm các công cụ có sẵn"* rồi *"Lỗi trong luồng tin nhắn"* — **server không có log lỗi** vì MCP chưa được gọi.
 
-**WORKSPACE_PATH:** đặt đúng thư mục project (không phải thư mục `chatgpt-local-coder`). Server tự đọc `CLAUDE.md` / `AGENTS.md` giống Claude Code.
+**WORKSPACE_PATH:** bắt buộc đặt đúng **một** thư mục project (không phải một parent chứa nhiều repo khi strict mode, và không ghép nhiều path bằng `;`). Project bổ sung đi vào `EXTRA_WORKSPACE_PATHS`. Server tự đọc `CLAUDE.md` / `AGENTS.md` giống Claude Code.
 
 **Lưu ý:** Không bấm **"Luôn cho phép"** trên popup — cấu hình quyền ở Settings → Apps. Restart/internal update giữ cùng `mcp_contract.version/hash` thì không Refresh vì ABI; chỉ Refresh khi public contract version chủ động đổi. Reconnect transport/session nếu client thực tế yêu cầu là việc riêng.
 

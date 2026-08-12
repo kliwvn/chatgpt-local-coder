@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -17,7 +18,11 @@ import {
 import { registerGitTools } from "../dist/tools/git.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const testBase = path.resolve(process.env.WORKSPACE_PATH?.trim() || path.dirname(process.cwd()));
+// Strict-mode fixture base derives from the repo itself: os.tmpdir() lives
+// under C:\Users, which the sandbox cannot traverse, so git worktrees there
+// fail with "Invalid path 'C:/Users'". C:\AI_Home is covered by the
+// setup:sandbox traverse grant (ancestors of the workspace root).
+const testBase = path.resolve(repoRoot, "..");
 const root = await fs.mkdtemp(path.join(testBase, "clc-git-sandbox-"));
 const repo = path.join(root, "repo");
 const outside = await fs.mkdtemp(path.join(testBase, "clc-git-outside-"));

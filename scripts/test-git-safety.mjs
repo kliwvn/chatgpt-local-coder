@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import { restoreToCheckpoint } from "../dist/lib/checkpoint.js";
@@ -34,7 +35,12 @@ const oldInstanceId = process.env.LOCAL_CODER_INSTANCE_ID;
 const oldSandboxProfile = process.env.CLC_SANDBOX_PROFILE_NAME;
 const oldSandboxStateDir = process.env.CLC_SANDBOX_STATE_DIR;
 const oldSandboxNetworkMode = process.env.SANDBOX_NETWORK_MODE;
-const testBase = path.resolve(process.env.WORKSPACE_PATH?.trim() || path.dirname(process.cwd()));
+// Strict-mode fixture base derives from the repo itself: os.tmpdir() lives
+// under C:\Users, which the sandbox cannot traverse, so git worktrees there
+// fail with "Invalid path 'C:/Users'". C:\AI_Home is covered by the
+// setup:sandbox traverse grant (ancestors of the workspace root).
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const testBase = path.resolve(repoRoot, "..");
 const root = await fs.mkdtemp(path.join(testBase, "clc-git-safety-"));
 const repo = path.join(root, "repo");
 

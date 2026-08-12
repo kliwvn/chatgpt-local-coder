@@ -44,11 +44,16 @@ const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-manager-redact-"));
 let server;
 try {
   await fs.mkdir(path.join(dir, "instances", "test"), { recursive: true });
+  // Real test-owned workspace root: save-time validation rejects an empty or
+  // missing WORKSPACE_PATH (WORKSPACE_SCOPE_MISSING), and redaction coverage
+  // must not depend on an invalid fixture.
+  const workspaceDir = path.join(dir, "workspace");
+  await fs.mkdir(workspaceDir, { recursive: true });
   // Minimal valid instance .env: no tunnel creds conflicts, unique ports.
   const envText = [
     `PORT=${port + 1}`,
     `ADMIN_PORT=${port + 2}`,
-    "WORKSPACE_PATH=",
+    `WORKSPACE_PATH=${workspaceDir.replaceAll("\\", "/")}`,
     "CHATGPT_TOOL_PROFILE=slim",
     "CHATGPT_AUTO_APPROVE=true",
     "SHELL_TIMEOUT=120",

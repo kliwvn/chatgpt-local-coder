@@ -127,6 +127,11 @@ const hub = spawnNode(path.join(root, "dist/index.js"), {
   PORT: String(mcpPort),
   ADMIN_PORT: String(adminPort),
   MCP_UPSTREAM_CONFIG: configPath,
+  // The upstream under test is a loopback mock; strict mode (FULL_DISK_ACCESS=false)
+  // deliberately blocks local/private upstream addresses (asserted separately in
+  // test-mcp-upstream). The proxy machinery itself is what this test covers, so
+  // it opts into explicit trusted full-disk mode, the documented escape hatch.
+  FULL_DISK_ACCESS: "true",
   // The proxy under test is full-profile machinery (slim freezes its inventory
   // by contract); without this the server defaults to slim and the allowlist
   // proxy can never appear.

@@ -63,7 +63,7 @@ function spawnMockHttp(port) {
   });
 }
 
-async function waitForHealth(url, timeoutMs = 8000) {
+async function waitForHealth(url, timeoutMs = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     try {

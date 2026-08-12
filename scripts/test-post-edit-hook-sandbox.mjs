@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const testBase = path.resolve(process.env.WORKSPACE_PATH?.trim() || path.dirname(process.cwd()));
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+// Temp base derives from the repo itself, never WORKSPACE_PATH: that env value
+// can be a placeholder or point outside the test's control.
+const testBase = path.resolve(repoRoot, "..");
 const root = await fs.mkdtemp(path.join(testBase, "clc-hook-sandbox-"));
 const outside = await fs.mkdtemp(path.join(testBase, "clc-hook-outside-"));
 const target = path.join(root, "edited.txt");

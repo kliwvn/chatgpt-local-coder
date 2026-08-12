@@ -8,8 +8,11 @@ import { atomicWriteFile } from "../dist/lib/atomic-write.js";
 import { withFileMutation, withFileMutations } from "../dist/lib/file-mutation.js";
 import { loadProjectMemory } from "../dist/lib/project-memory.js";
 import {
+  assertWorkspaceRootsUnambiguous,
+  inspectWorkspaceRootScope,
   setDefaultCwd,
   setWorkspaceRoots,
+  validateConfiguredWorkspaceRoot,
   validatePath,
 } from "../dist/lib/path-security.js";
 
@@ -94,7 +97,44 @@ try {
   const escapeLink = path.join(workspace, "escape");
   await fs.symlink(outsideDir, escapeLink, process.platform === "win32" ? "junction" : "dir");
 
+  // Scope authority: a non-project parent containing even one Git repository
+  // must not silently become authority for that child repository.
+  const collectionRoot = path.join(root, "collection-root");
+  const childRepo = path.join(collectionRoot, "child-repo");
+  await fs.mkdir(path.join(childRepo, ".git"), { recursive: true });
+  const collectionInspection = await inspectWorkspaceRootScope(collectionRoot);
+  assert(collectionInspection.ambiguous_collection_root, "parent/container workspace was not classified as ambiguous");
+  let collectionRejected = false;
+  try {
+    await assertWorkspaceRootsUnambiguous([collectionRoot]);
+  } catch (err) {
+    collectionRejected = /WORKSPACE_SCOPE_AMBIGUOUS/.test(String(err?.message || err));
+  }
+  assert(collectionRejected, "parent/container workspace root was not rejected");
+
+  // A project root that owns its .git marker remains a valid authority, while
+  // project_context-style switching is restricted to exact configured roots.
+  const scopeProject = path.join(root, "scope-project");
+  const scopeDescendant = path.join(scopeProject, "subdir");
+  const scopeExtra = path.join(root, "scope-extra");
+  await fs.mkdir(path.join(scopeProject, ".git"), { recursive: true });
+  await fs.mkdir(scopeDescendant, { recursive: true });
+  await fs.mkdir(path.join(scopeExtra, ".git"), { recursive: true });
+  await assertWorkspaceRootsUnambiguous([scopeProject, scopeExtra]);
   process.env.FULL_DISK_ACCESS = "false";
+  setDefaultCwd(scopeProject);
+  setWorkspaceRoots([scopeProject, scopeExtra]);
+  const exactExtra = await validateConfiguredWorkspaceRoot(scopeExtra);
+  assert(path.normalize(exactExtra) === path.normalize(await fs.realpath(scopeExtra)), "exact configured project root was rejected");
+  await validatePath(scopeDescendant);
+  let descendantContextRejected = false;
+  try {
+    await validateConfiguredWorkspaceRoot(scopeDescendant);
+  } catch (err) {
+    descendantContextRejected = /PROJECT_CONTEXT_SCOPE_DENIED/.test(String(err?.message || err));
+  }
+  assert(descendantContextRejected, "project context accepted an arbitrary descendant instead of an exact configured root");
+
   setDefaultCwd(workspace);
   setWorkspaceRoots([workspace]);
 
@@ -285,12 +325,23 @@ try {
       FULL_DISK_ACCESS: "false",
       CHATGPT_TOOL_PROFILE: "full",
       CHECKPOINT_PATH: path.join(mcpWorkspace, ".checkpoints"),
+      // Isolate the AppContainer policy ledger per test run. The default ledger
+      // lives at the repo root (.mcp-state) and is shared authority state: an
+      // isolated server must never embed ephemeral temp roots into it, or the
+      // next boot that reads it pays a full ACL reconciliation (and can fail
+      // closed once the temp root disappears).
+      CLC_SANDBOX_PROFILE_NAME: "ChatGPTLocalCoder.tests",
+      CLC_SANDBOX_STATE_DIR: path.join(root, "sandbox-state"),
     },
     stdio: "ignore",
   });
 
   try {
-    await waitForHealth(port);
+    // First-time sandbox prepare + self-test on a fresh policy ledger is a real
+    // OS operation and legitimately takes several seconds; give the isolated
+    // server a bounded but realistic window.
+    await waitForHealth(port, 30000);
+
     const [sessionA, sessionB] = await Promise.all([initialize(port, 1), initialize(port, 2)]);
     await Promise.all([
       callTool(port, sessionA, 11, "edit_file", { path: raceFile, old_text: "A", new_text: "AA" }),
