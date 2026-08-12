@@ -198,7 +198,11 @@ async function runOnce(command: string, cwd: string, timeoutMs: number): Promise
     return Promise.reject(new Error(`shell cwd does not exist: ${cwd}`));
   }
   const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-  const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
+  // ExecutionPolicy Bypass: inside an AppContainer the default AuthorizationManager
+  // check fails (PSSecurityException) for PATH-resolved script commands (npm,
+  // *.ps1), so every agent shell would error. Bypass only affects this process,
+  // which already executes arbitrary agent commands by design.
+  const args = process.platform === "win32" ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command] : ["-lc", command];
   // The sync response deadline starts BEFORE spawn() so slow spawns (Windows AV
   // scanning can stall powershell.exe ~2.5-3s) count against the budget. The
   // MCP response is resolved AT the deadline; child-tree cleanup (taskkill)
@@ -339,7 +343,7 @@ export async function execInShellSession(
   // An explicit workingDirectory is a fully isolated one-off invocation: cwd
   // directives inside it affect only that child process, and its command/history
   // never enters the process-wide default shell state. This prevents concurrent
-  // agents/workspaces sharing one Gateway from contaminating each other's shell
+  // agents/workspaces sharing one Local Coder Server from contaminating each other's shell
   // cwd/history. Calls without workingDirectory retain the legacy persistent-shell
   // behavior for interactive use.
   if (!isolated) {

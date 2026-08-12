@@ -803,7 +803,10 @@ export function describePermissionProfile(): string {
   const diskScope = getFullDiskAccess()
     ? "path-aware tools have full-disk access"
     : "path-aware tools are limited to workspace roots";
-  return `open commands with a fail-closed known-destructive-command guard; ${diskScope}; permitted child processes are not OS-sandboxed`;
+  const processScope = getFullDiskAccess()
+    ? "permitted child processes run natively in explicit trusted full-machine mode"
+    : "permitted child processes require the Windows AppContainer workspace sandbox and fail closed if its self-test is unhealthy";
+  return `open commands with a fail-closed known-destructive-command guard; ${diskScope}; ${processScope}`;
 }
 
 export function requireWriteAllowed(): void {}
@@ -813,6 +816,6 @@ export function requireCommandAllowed(command: string): void {
   throw new Error(
     "BLOCKED_DESTRUCTIVE_COMMAND: permanent/destructive filesystem or Git mutation is disabled in shell. " +
       "Use delete_file/delete_directory for recoverable Trash/Recycle Bin removal, " +
-      "or a checkpointed Git tool for tracked-file restoration. Native shell is not an OS sandbox, so do not bypass this guard through scripts."
+      "or a checkpointed Git tool for tracked-file restoration. Do not bypass this guard through scripts or nested command interpreters."
   );
 }

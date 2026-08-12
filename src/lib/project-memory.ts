@@ -360,7 +360,7 @@ export function formatProjectMemoryForInstructions(bundle: ProjectMemoryBundle):
       "## Project memory",
       `No CLAUDE.md or AGENTS.md at ${bundle.root}.`,
       "Create CLAUDE.md in the project root (run /init in Claude Code or write manually).",
-      "For another repo: call project_context(path) with the absolute project path.",
+      "Stay within the primary project authority unless the current request explicitly targets another exact configured workspace root.",
       bundle.workspace_roots.length > 1
         ? `Configured workspace roots:\n${bundle.workspace_roots.map((r) => `- ${r}`).join("\n")}`
         : "",

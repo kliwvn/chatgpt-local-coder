@@ -528,6 +528,24 @@ namespace ChatGptLocalCoder.SandboxRunner
                     }
                     return 0;
                 }
+                if (op == "identity")
+                {
+                    // Non-mutating startup fast path. Report the already-prepared
+                    // AppContainer identity without touching filesystem ACLs.
+                    using (AppContainerIdentity identity = OpenIdentity(request.profileName))
+                    {
+                        WriteResponse(new BrokerResponse
+                        {
+                            ok = true,
+                            operation = "identity",
+                            backend = "windows_appcontainer",
+                            profileName = identity.Name,
+                            sid = identity.SidString,
+                            profilePath = identity.ProfilePath
+                        });
+                    }
+                    return 0;
+                }
                 if (op == "cleanup")
                 {
                     using (AppContainerIdentity identity = OpenIdentity(request.profileName))

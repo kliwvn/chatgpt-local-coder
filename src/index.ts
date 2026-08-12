@@ -11,6 +11,7 @@ import {
   getDefaultCwd,
   getFullDiskAccess,
   setWorkspaceRoots,
+  assertWorkspaceRootsUnambiguous,
 } from "./lib/path-security.js";
 import {
   consumeSessionTransportError,
@@ -60,18 +61,34 @@ function splitWorkspaceEnv(value: string | undefined): string[] {
 }
 
 function resolveWorkspaceRoots(): string[] {
-  const configuredRoots = [
-    ...splitWorkspaceEnv(process.env.WORKSPACE_PATH || process.cwd()),
-    ...splitWorkspaceEnv(process.env.EXTRA_WORKSPACE_PATHS),
-    ...splitWorkspaceEnv(process.env.WORKSPACE_PATHS),
-    ...splitWorkspaceEnv(process.env.ALLOWED_WORKSPACE_PATHS),
-  ];
+  const primary = splitWorkspaceEnv(process.env.WORKSPACE_PATH);
+  if (primary.length === 0) {
+    throw new Error(
+      "WORKSPACE_SCOPE_MISSING: WORKSPACE_PATH must explicitly identify one primary project root; " +
+        "refusing to derive project context from process.cwd()."
+    );
+  }
+  if (primary.length !== 1) {
+    throw new Error(
+      "WORKSPACE_SCOPE_INVALID: WORKSPACE_PATH must identify exactly one primary project root; " +
+        "use EXTRA_WORKSPACE_PATHS for additional explicitly intended roots."
+    );
+  }
 
+  const configuredRoots = [
+    primary[0],
+    ...splitWorkspaceEnv(process.env.EXTRA_WORKSPACE_PATHS),
+  ];
   const roots = configuredRoots.map((p) => path.resolve(p));
   return [...new Set(roots)];
 }
 
 const workspaceRoots = resolveWorkspaceRoots();
+// Exact project roots are a security invariant only while workspace roots define
+// the actual process/filesystem boundary. In explicit FULL_DISK_ACCESS=true mode
+// a broad parent is merely the default project/cwd context and grants no new
+// authority beyond the already trusted full-machine mode.
+if (!getFullDiskAccess()) await assertWorkspaceRootsUnambiguous(workspaceRoots);
 const workspaceRoot = workspaceRoots[0] || process.cwd();
 setDefaultCwd(workspaceRoot);
 setWorkspaceRoots(workspaceRoots);
@@ -225,6 +242,10 @@ app.get("/health", async (_req, res) => {
   res.json({
     status: "ok",
     name: "codex-mcp-server",
+    // Manager injects this per managed instance. It is intentionally separate
+    // from workspace so an owned process can still be identified after the
+    // saved WORKSPACE_PATH changes and before the process is restarted.
+    instance_id: process.env.LOCAL_CODER_INSTANCE_ID || process.env.MCP_INSTANCE_NAME || null,
     workspace: workspaceRoot,
     defaultCwd: getDefaultCwd(),
     fullMachineAccess: getFullDiskAccess(),

@@ -2,7 +2,7 @@ import fs from "fs/promises";
 import path from "path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { validatePath } from "../lib/path-security.js";
+import { validateConfiguredWorkspaceRoot, validatePath } from "../lib/path-security.js";
 import { audit, getAuditPath } from "../lib/audit.js";
 import { describePermissionProfile, getPermissionProfile } from "../lib/permissions.js";
 import { getDefaultCwd, getFullDiskAccess, getMachineRoots } from "../lib/path-security.js";
@@ -97,7 +97,12 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       annotations: toolAnnotations("read"),
     },
     async ({ path: projectPath, max_depth, max_files, max_bytes_per_file }) => {
-      const root = await validatePath(projectPath || workspaceRoot);
+      // Keep the public v1 tool schema/description frozen, but enforce a tighter
+      // execution contract: explicit context switches must target an exact
+      // configured workspace root, never an arbitrary descendant of a broad root.
+      const root = projectPath
+        ? await validateConfiguredWorkspaceRoot(projectPath)
+        : await validatePath(workspaceRoot);
       const files = await findContextFiles(root, max_depth, max_files);
       const fileContents: Array<{ path: string; content: string; truncated: boolean }> = [];
 

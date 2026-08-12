@@ -158,7 +158,7 @@ export function formatEnvironmentForInstructions(opts: {
     opts.workspaceRoots.length > 1
       ? `Additional workspace roots:\n${opts.workspaceRoots.slice(1).map((r) => `- ${r}`).join("\n")}`
       : "",
-    "Relative paths resolve from default cwd. Use absolute paths when working outside it.",
+    "Relative paths resolve from default cwd. Absolute paths are allowed only when they remain inside an explicitly configured workspace root.",
   ]
     .filter(Boolean)
     .join("\n");

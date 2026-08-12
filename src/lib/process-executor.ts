@@ -28,6 +28,9 @@ export interface ProcessSecurityStatus {
   sandbox_profile_path?: string;
   sandbox_rw_roots: string[];
   sandbox_exec_roots: string[];
+  /** True only when startup reused an already-recorded exact ACL policy and
+   * verified it non-mutatingly before the normal OS boundary self-test. */
+  sandbox_policy_reused: boolean;
   sandbox_error?: string;
 }
 
@@ -98,6 +101,7 @@ function buildInitialStatus(): ProcessSecurityStatus {
     sandbox_self_test: full ? "native" : "uninitialized",
     sandbox_rw_roots: full ? [] : getWorkspaceRoots(),
     sandbox_exec_roots: [],
+    sandbox_policy_reused: false,
   };
 }
 
@@ -142,7 +146,7 @@ function sameCanonicalPathSet(left: string[], right: string[]): boolean {
 }
 
 function instanceId(): string {
-  return (process.env.LOCAL_CODER_INSTANCE_ID || "default")
+  return (process.env.LOCAL_CODER_INSTANCE_ID || process.env.MCP_INSTANCE_NAME || "default")
     .replace(/[^A-Za-z0-9_.-]/g, "_")
     .slice(0, 24) || "default";
 }
@@ -163,8 +167,9 @@ export function getExpectedSandboxProfileName(): string {
 }
 
 function sandboxPolicyStatePath(): string {
-  const dir = process.env.CLC_SANDBOX_STATE_DIR?.trim()
-    ? path.resolve(process.env.CLC_SANDBOX_STATE_DIR)
+  const configuredStateDir = process.env.CLC_SANDBOX_STATE_DIR?.trim() || process.env.MCP_SHELL_STATE_DIR?.trim();
+  const dir = configuredStateDir
+    ? path.resolve(configuredStateDir)
     : path.join(repoRoot, ".mcp-state");
   return path.join(dir, `sandbox-policy-${instanceId()}.json`);
 }
@@ -290,6 +295,25 @@ async function prepareSandboxPolicy(
   const response = JSON.parse(prepare.stdout.trim()) as BrokerPrepareResponse;
   if (!response.ok || !response.sid || !response.profilePath) {
     throw new Error(`${OS_SANDBOX_PREPARE_FAILED}: broker returned incomplete prepare response`);
+  }
+  return response;
+}
+
+async function openSandboxIdentity(
+  runnerPath: string,
+  profileName: string
+): Promise<BrokerPrepareResponse> {
+  const opened = await invokeBrokerControl(runnerPath, {
+    operation: "identity",
+    profileName,
+  });
+  if (opened.exitCode !== 0) {
+    const reason = opened.stderr.trim() || opened.stdout.trim() || `exit ${opened.exitCode}`;
+    throw new Error(`${OS_SANDBOX_PREPARE_FAILED}: ${reason}`);
+  }
+  const response = JSON.parse(opened.stdout.trim()) as BrokerPrepareResponse;
+  if (!response.ok || !response.sid || !response.profilePath || response.profileName !== profileName) {
+    throw new Error(`${OS_SANDBOX_PREPARE_FAILED}: broker returned incomplete identity response`);
   }
   return response;
 }
@@ -510,9 +534,6 @@ export async function initializeProcessSecurity(): Promise<ProcessSecurityStatus
     }
 
     try {
-      if (process.env.CLC_TEST_FORCE_SANDBOX_FAILURE === "prepare") {
-        throw new Error(`${OS_SANDBOX_PREPARE_FAILED}: forced failure test seam`);
-      }
       const runnerPath = sandboxHelperPath();
       await assertHelperIntegrity(runnerPath);
       await assertHelperIntegrity(defaultChildProbePath);
@@ -523,12 +544,16 @@ export async function initializeProcessSecurity(): Promise<ProcessSecurityStatus
       const profileName = profileNameFor();
       const previous = await readPolicyManifest();
 
-      // Identity is stable per Local Coder instance. If an explicit profile name
-      // changed, remove only the old sandbox SID ACEs recorded in the manifest;
-      // never retain a broader historic policy after configuration changes.
+      // Identity is stable per Local Coder instance. Never auto-delete a
+      // different historic identity here: older manager builds could make
+      // multiple instances share ChatGPTLocalCoder.default, so silently cleaning
+      // that SID could remove ACLs still owned by another live instance.
       if (previous && previous.profileName !== profileName) {
-        await cleanupSandboxPolicy(runnerPath, previous);
-        await deletePolicyManifest();
+        throw new Error(
+          `${OS_SANDBOX_PREPARE_FAILED}: sandbox identity changed from ${previous.profileName} to ${profileName}. ` +
+            "Refusing automatic ACL cleanup because ownership of the previous AppContainer identity is not provably exclusive. " +
+            "Run the explicit sandbox setup/reconciliation workflow, then restart Local Coder."
+        );
       }
       const previousSameProfile = previous?.profileName === profileName ? previous : null;
       if (previousSameProfile && !sameCanonicalPathSet(previousSameProfile.execRoots, execRoots)) {
@@ -541,17 +566,24 @@ export async function initializeProcessSecurity(): Promise<ProcessSecurityStatus
         ? [...previousSameProfile.rwRoots]
         : [];
 
-      let preparedCurrentPolicy = false;
-      try {
-        const response = await prepareSandboxPolicy(
-          runnerPath,
-          profileName,
-          rwRoots,
-          execRoots,
-          previousRoots,
-          networkMode
-        );
-        preparedCurrentPolicy = true;
+      const canReusePolicy = Boolean(
+        previousSameProfile &&
+        sameCanonicalPathSet(previousSameProfile.rwRoots, rwRoots) &&
+        sameCanonicalPathSet(previousSameProfile.execRoots, execRoots)
+      );
+
+      if (canReusePolicy && previousSameProfile) {
+        // Durable inherited ACLs do not need recursive reconciliation on every
+        // boot. Re-open the deterministic identity without mutation, verify its
+        // SID against the persisted policy ledger, then run the same real OS
+        // boundary self-test before allowing any agent-triggered process.
+        const response = await openSandboxIdentity(runnerPath, profileName);
+        if (response.sid.toLowerCase() !== previousSameProfile.sid.toLowerCase()) {
+          throw new Error(
+            `${OS_SANDBOX_PREPARE_FAILED}: sandbox SID changed for ${profileName}; ` +
+              `manifest=${previousSameProfile.sid} runtime=${response.sid}. Run explicit sandbox setup/reconciliation.`
+          );
+        }
         sandboxState = {
           profileName,
           sid: response.sid,
@@ -572,6 +604,48 @@ export async function initializeProcessSecurity(): Promise<ProcessSecurityStatus
           sandbox_profile_path: response.profilePath,
           sandbox_rw_roots: [...rwRoots],
           sandbox_exec_roots: [...execRoots],
+          sandbox_policy_reused: true,
+        };
+        await runSandboxSelfTest(sandboxState);
+        status.sandbox_self_test = "passed";
+        return status;
+      }
+
+      let prepareAttempted = false;
+      try {
+        if (process.env.CLC_TEST_FORCE_SANDBOX_FAILURE === "prepare") {
+          throw new Error(`${OS_SANDBOX_PREPARE_FAILED}: forced failure test seam`);
+        }
+        prepareAttempted = true;
+        const response = await prepareSandboxPolicy(
+          runnerPath,
+          profileName,
+          rwRoots,
+          execRoots,
+          previousRoots,
+          networkMode
+        );
+        sandboxState = {
+          profileName,
+          sid: response.sid,
+          profilePath: response.profilePath,
+          rwRoots,
+          execRoots,
+          networkMode,
+          runnerPath,
+        };
+        status = {
+          path_tool_full_disk_access: false,
+          process_sandbox_mode: "required",
+          process_filesystem_scope: "workspace_roots",
+          process_network_mode: networkMode,
+          sandbox_backend: "windows_appcontainer",
+          sandbox_self_test: "preparing",
+          sandbox_identity: profileName,
+          sandbox_profile_path: response.profilePath,
+          sandbox_rw_roots: [...rwRoots],
+          sandbox_exec_roots: [...execRoots],
+          sandbox_policy_reused: false,
         };
         await runSandboxSelfTest(sandboxState);
         await writePolicyManifest({
@@ -589,15 +663,19 @@ export async function initializeProcessSecurity(): Promise<ProcessSecurityStatus
         // previous same-profile grants or remove the newly prepared identity.
         // Rollback failure is appended to the primary error and still fails closed.
         let rollbackError = "";
-        if (preparedCurrentPolicy) {
+        if (prepareAttempted) {
           try {
             if (previousSameProfile) {
+              // A timed-out broker may have changed only part of the ACL before
+              // its process was terminated. Reconcile the union of attempted and
+              // previous roots unconditionally; do not rely on receiving a
+              // successful prepare response as proof that rollback is needed.
               await prepareSandboxPolicy(
                 runnerPath,
                 profileName,
                 previousSameProfile.rwRoots,
                 previousSameProfile.execRoots,
-                [...rwRoots],
+                [...new Set([...rwRoots, ...previousSameProfile.rwRoots])],
                 networkMode
               );
             } else {

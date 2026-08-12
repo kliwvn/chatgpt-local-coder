@@ -85,7 +85,9 @@ async function runHook(command: string, filePath: string, timeoutMs: number): Pr
     });
   }
   const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-  const args = process.platform === "win32" ? ["-NoProfile", "-Command", expanded] : ["-lc", expanded];
+  // ExecutionPolicy Bypass: AppContainer AuthorizationManager fails the default
+  // check for PATH-resolved script commands (npm, *.ps1); see persistent-shell.ts.
+  const args = process.platform === "win32" ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", expanded] : ["-lc", expanded];
 
   const { promise, resolve } = Promise.withResolvers<HookRunResult>();
   let processHandle;

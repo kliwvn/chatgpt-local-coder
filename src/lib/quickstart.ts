@@ -1,11 +1,12 @@
 export const MCP_QUICKSTART = `
 ## Tool workflow (when agent_status is called)
 1. Project memory + git state are already in MCP instructions from WORKSPACE_PATH.
-2. Call project_context(path) only for a different repo than WORKSPACE_PATH.
-3. Explore with glob (file names) and grep (content), then read_text_file.
-4. Edit with apply_patch (preferred), multi_edit, or write_file for new files.
-5. Run builds/tests with run_command (short) or start_process + process_output (long).
-6. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
+2. Stay in the primary WORKSPACE_PATH by default. Do not discover or switch to another repo on your own.
+3. project_context(path) may target only an exact configured workspace root; use an extra root only when the user's current request explicitly targets it.
+4. Explore with glob (file names) and grep (content), then read_text_file.
+5. Edit with apply_patch (preferred), multi_edit, or write_file for new files.
+6. Run builds/tests with run_command (short) or start_process + process_output (long).
+7. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
 
 ## Output format
 All tools return JSON: { ok, tool, summary, data }
@@ -37,7 +38,7 @@ All tools return JSON: { ok, tool, summary, data }
 
 ## Paths
 Path-aware tools follow FULL_DISK_ACCESS + workspace roots. Relative paths resolve from default cwd.
-run_command/start_process execute native shell commands and are not OS-sandboxed by FULL_DISK_ACCESS.
+With FULL_DISK_ACCESS=false, agent-triggered shell/Git/hook/child process trees must pass the Windows AppContainer self-test and stay within configured workspace roots; sandbox failure is fail-closed. FULL_DISK_ACCESS=true is explicit trusted native full-machine mode.
 `.trim();
 
 export function buildServerInstructions(
@@ -50,8 +51,8 @@ export function buildServerInstructions(
     "# Codex Local Coder MCP",
     `Default project: ${workspaceRoot}`,
     fullDiskAccess
-      ? "Path-aware tool access: full disk. Native shell commands are not OS-sandboxed."
-      : "Path-aware tool access: workspace roots only. Native shell commands are not OS-sandboxed by FULL_DISK_ACCESS.",
+      ? "Path-aware/process access: explicit trusted native full-machine mode."
+      : "Path-aware access: exact workspace roots only. Agent-triggered local process trees require the Windows AppContainer sandbox and fail closed if its self-test is unhealthy.",
     "Tag this connector in ChatGPT before every task.",
   ].join("\n");
 
@@ -59,7 +60,7 @@ export function buildServerInstructions(
     "## Quick pointers",
     `Workspace roots: ${workspaceRoots.join("; ")}`,
     "agent_status — full tool cheat sheet + apply_patch format",
-    "project_context(path) — load CLAUDE.md from another repo",
+    "project_context(path) — load context only from an exact configured workspace root; never auto-switch projects",
   ].join("\n");
 
   const body = contextBlock?.trim();

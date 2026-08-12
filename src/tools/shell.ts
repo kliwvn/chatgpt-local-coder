@@ -238,7 +238,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       annotations: toolAnnotations("command"),
     },
     async ({ command, working_directory }) => {
-      if (managedProcessShutdownStarted) throw new Error("Gateway is shutting down; cannot start a background process");
+      if (managedProcessShutdownStarted) throw new Error("Local Coder Server is shutting down; cannot start a background process");
       pruneFinishedProcesses();
       const runningCount = [...processes.values()].filter(isRunning).length;
       if (runningCount >= MAX_RUNNING_PROCESSES) {
@@ -247,7 +247,9 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       requireCommandAllowed(command);
       const cwd = await validatePath(working_directory ? working_directory : getShellStatus().cwd || defaultCwd);
       const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-      const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
+      // ExecutionPolicy Bypass: AppContainer AuthorizationManager fails the default
+      // check for PATH-resolved script commands (npm, *.ps1); see persistent-shell.ts.
+      const args = process.platform === "win32" ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command] : ["-lc", command];
       const processHandle = await spawnProcess({
         executable: shell,
         args,

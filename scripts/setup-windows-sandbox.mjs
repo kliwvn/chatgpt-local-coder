@@ -14,7 +14,7 @@ if (process.platform !== "win32") {
 }
 
 function instanceId() {
-  return (process.env.LOCAL_CODER_INSTANCE_ID || "default")
+  return (process.env.LOCAL_CODER_INSTANCE_ID || process.env.MCP_INSTANCE_NAME || "default")
     .replace(/[^A-Za-z0-9_.-]/g, "_")
     .slice(0, 24) || "default";
 }
@@ -105,8 +105,9 @@ function approvedExecRoots() {
 }
 
 function sandboxPolicyStatePath() {
-  const dir = process.env.CLC_SANDBOX_STATE_DIR?.trim()
-    ? path.resolve(process.env.CLC_SANDBOX_STATE_DIR)
+  const configuredStateDir = process.env.CLC_SANDBOX_STATE_DIR?.trim() || process.env.MCP_SHELL_STATE_DIR?.trim();
+  const dir = configuredStateDir
+    ? path.resolve(configuredStateDir)
     : path.join(repoRoot, ".mcp-state");
   return path.join(dir, `sandbox-policy-${instanceId()}.json`);
 }
@@ -221,7 +222,7 @@ const powershell = path.join(
   "v1.0",
   "powershell.exe"
 );
-const stateDir = path.join(repoRoot, ".mcp-state");
+const stateDir = path.dirname(sandboxPolicyStatePath());
 await fsp.mkdir(stateDir, { recursive: true });
 const elevatedScriptPath = path.join(stateDir, `sandbox-compat-${process.pid}-${Date.now()}.ps1`);
 const elevatedLines = [
