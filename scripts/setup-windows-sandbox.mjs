@@ -6,7 +6,9 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const buildScript = path.join(repoRoot, "scripts", "build-windows-sandbox-helper.mjs");
-const runner = path.join(repoRoot, "native", "windows-sandbox-runner", "bin", "SandboxRunner.exe");
+const sandboxBinRoot = path.join(repoRoot, "native", "windows-sandbox-runner", "bin");
+const runnerPointerPath = path.join(sandboxBinRoot, "SandboxRunner.current");
+const legacyRunnerPath = path.join(sandboxBinRoot, "SandboxRunner.exe");
 
 if (process.platform !== "win32") {
   console.log("Windows AppContainer setup skipped: non-Windows host");
@@ -153,6 +155,19 @@ const build = spawnSync(process.execPath, [buildScript], {
   windowsHide: true,
 });
 if (build.status !== 0) process.exit(build.status ?? 1);
+
+function resolveRunnerPath() {
+  if (!fs.existsSync(runnerPointerPath)) return legacyRunnerPath;
+  const fileName = fs.readFileSync(runnerPointerPath, "utf8").trim();
+  if (!/^SandboxRunner\.[a-f0-9]{16}\.exe$/i.test(fileName) || path.basename(fileName) !== fileName) {
+    throw new Error(`invalid sandbox runner pointer: ${runnerPointerPath}`);
+  }
+  const resolved = path.join(sandboxBinRoot, fileName);
+  if (!fs.existsSync(resolved)) throw new Error(`sandbox runner pointer target is missing: ${resolved}`);
+  return resolved;
+}
+
+const runner = resolveRunnerPath();
 
 const productionProfile = validateProfileName(
   process.env.CLC_SANDBOX_PROFILE_NAME?.trim() || `ChatGPTLocalCoder.${instanceId()}`

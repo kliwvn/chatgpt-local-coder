@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -83,7 +83,9 @@ interface SandboxPolicyManifest {
 const moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(moduleDir, "../..");
 const sandboxNativeRoot = path.join(repoRoot, "native", "windows-sandbox-runner");
-const defaultRunnerPath = path.join(sandboxNativeRoot, "bin", "SandboxRunner.exe");
+const sandboxBinRoot = path.join(sandboxNativeRoot, "bin");
+const legacyRunnerPath = path.join(sandboxBinRoot, "SandboxRunner.exe");
+const runnerPointerPath = path.join(sandboxBinRoot, "SandboxRunner.current");
 const defaultChildProbePath = path.join(sandboxNativeRoot, "bin", "SandboxChildProbe.exe");
 
 let sandboxState: SandboxState | null = null;
@@ -220,7 +222,17 @@ async function deletePolicyManifest(): Promise<void> {
 
 function sandboxHelperPath(): string {
   const override = process.env.CLC_SANDBOX_RUNNER_PATH?.trim();
-  return override ? path.resolve(override) : defaultRunnerPath;
+  if (override) return path.resolve(override);
+  if (!existsSync(runnerPointerPath)) return legacyRunnerPath;
+  const fileName = readFileSync(runnerPointerPath, "utf8").trim();
+  if (!/^SandboxRunner\.[a-f0-9]{16}\.exe$/i.test(fileName) || path.basename(fileName) !== fileName) {
+    throw new Error(`${OS_SANDBOX_UNAVAILABLE}: invalid sandbox runner pointer ${runnerPointerPath}`);
+  }
+  const resolved = path.join(sandboxBinRoot, fileName);
+  if (!existsSync(resolved)) {
+    throw new Error(`${OS_SANDBOX_UNAVAILABLE}: sandbox runner pointer target is missing: ${resolved}`);
+  }
+  return resolved;
 }
 
 async function assertHelperIntegrity(filePath: string): Promise<void> {

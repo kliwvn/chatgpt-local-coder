@@ -8,10 +8,12 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const nativeRoot = path.join(repoRoot, "native", "windows-sandbox-runner");
 const outDir = path.join(nativeRoot, "bin");
+const runnerPointerPath = path.join(outDir, "SandboxRunner.current");
 const targets = [
   {
     source: path.join(nativeRoot, "SandboxRunner.cs"),
     output: path.join(outDir, "SandboxRunner.exe"),
+    versioned: true,
     references: ["System.dll", "System.Core.dll", "System.Web.Extensions.dll"],
   },
   {
@@ -44,6 +46,15 @@ if (!csc) {
 
 await fs.mkdir(outDir, { recursive: true });
 for (const target of targets) {
+  const sourceBytes = await fs.readFile(target.source);
+  const sourceFingerprint = createHash("sha256")
+    .update(sourceBytes)
+    .update("\0", "utf8")
+    .update(target.references.join("\0"), "utf8")
+    .digest("hex");
+  const output = target.versioned
+    ? path.join(outDir, `SandboxRunner.${sourceFingerprint.slice(0, 16)}.exe`)
+    : target.output;
   const args = [
     "/nologo",
     "/target:exe",
@@ -51,23 +62,40 @@ for (const target of targets) {
     "/optimize+",
     "/checked+",
     ...target.references.map((reference) => `/r:${reference}`),
-    `/out:${target.output}`,
+    `/out:${output}`,
     target.source,
   ];
-  const result = spawnSync(csc, args, {
-    cwd: nativeRoot,
-    windowsHide: true,
-    encoding: "utf8",
-    maxBuffer: 4 * 1024 * 1024,
+  // Keep compiler stdio inherited. On Windows 10 AppContainer, Node/libuv
+  // child-process pipe creation can hang before spawn() returns; inherited
+  // handles avoid creating a second IPC pipe layer while the compiler remains
+  // inside the same inherited AppContainer security boundary.
+  const existingHashPath = `${output}.sha256`;
+  const reusable = await Promise.all([
+    fs.readFile(output).catch(() => null),
+    fs.readFile(existingHashPath, "utf8").catch(() => null),
+  ]).then(([bytes, expected]) => {
+    if (!bytes || !expected) return false;
+    const actual = createHash("sha256").update(bytes).digest("hex");
+    return actual === expected.trim().toLowerCase();
   });
-  if (result.stdout) process.stdout.write(result.stdout);
-  if (result.stderr) process.stderr.write(result.stderr);
-  if (result.status !== 0) process.exit(result.status ?? 1);
+  if (!reusable) {
+    const result = spawnSync(csc, args, {
+      cwd: nativeRoot,
+      windowsHide: true,
+      stdio: "inherit",
+    });
+    if (result.status !== 0) process.exit(result.status ?? 1);
+  }
 
-  const bytes = await fs.readFile(target.output);
+  const bytes = await fs.readFile(output);
   const sha256 = createHash("sha256").update(bytes).digest("hex");
-  const hashFile = `${target.output}.sha256`;
+  const hashFile = `${output}.sha256`;
   await fs.writeFile(hashFile, `${sha256}\n`, "utf8");
-  console.log(`windows sandbox helper: ${target.output}`);
+  if (target.versioned) {
+    const tempPointer = `${runnerPointerPath}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(tempPointer, `${path.basename(output)}\n`, "utf8");
+    await fs.rename(tempPointer, runnerPointerPath);
+  }
+  console.log(`windows sandbox helper: ${output}`);
   console.log(`windows sandbox helper sha256: ${sha256}`);
 }

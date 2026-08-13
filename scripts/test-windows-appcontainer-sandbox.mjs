@@ -1,11 +1,25 @@
 import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const helper = path.join(repoRoot, "native", "windows-sandbox-runner", "bin", "SandboxRunner.exe");
+const sandboxBinRoot = path.join(repoRoot, "native", "windows-sandbox-runner", "bin");
+const runnerPointerPath = path.join(sandboxBinRoot, "SandboxRunner.current");
+const legacyRunnerPath = path.join(sandboxBinRoot, "SandboxRunner.exe");
+function resolveRunnerPath() {
+  if (!existsSync(runnerPointerPath)) return legacyRunnerPath;
+  const fileName = readFileSync(runnerPointerPath, "utf8").trim();
+  if (!/^SandboxRunner\.[a-f0-9]{16}\.exe$/i.test(fileName) || path.basename(fileName) !== fileName) {
+    throw new Error(`invalid sandbox runner pointer: ${runnerPointerPath}`);
+  }
+  const resolved = path.join(sandboxBinRoot, fileName);
+  if (!existsSync(resolved)) throw new Error(`sandbox runner pointer target is missing: ${resolved}`);
+  return resolved;
+}
+const helper = resolveRunnerPath();
 const compiledChildProbe = path.join(repoRoot, "native", "windows-sandbox-runner", "bin", "SandboxChildProbe.exe");
 const allowedRoot = path.join(repoRoot, ".sandbox-proof");
 const outsideRoot = path.resolve(repoRoot, "..", "clc-sandbox-proof-outside");
