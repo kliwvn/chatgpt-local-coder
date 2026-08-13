@@ -10,6 +10,7 @@ import { toolResult } from "../lib/tool-result.js";
 import { envBoundedInteger } from "../lib/env-utils.js";
 import { clampSyncTimeoutMs, getSyncResponseBudgetMs } from "../lib/sync-response-budget.js";
 import {
+  buildShellProcessInvocation,
   execInShellSession,
   getShellStatus,
   resetShellSession,
@@ -246,13 +247,10 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       }
       requireCommandAllowed(command);
       const cwd = await validatePath(working_directory ? working_directory : getShellStatus().cwd || defaultCwd);
-      const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-      // ExecutionPolicy Bypass: AppContainer AuthorizationManager fails the default
-      // check for PATH-resolved script commands (npm, *.ps1); see persistent-shell.ts.
-      const args = process.platform === "win32" ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command] : ["-lc", command];
+      const invocation = buildShellProcessInvocation(command);
       const processHandle = await spawnProcess({
-        executable: shell,
-        args,
+        executable: invocation.executable,
+        args: invocation.args,
         cwd,
         env: process.env,
         detached: process.platform !== "win32",

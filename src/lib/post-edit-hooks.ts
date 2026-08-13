@@ -6,6 +6,7 @@ import { globToRegExp, matchesCompiledGlob } from "./glob-match.js";
 import { clampSyncTimeoutMs, getSyncResponseBudgetMs } from "./sync-response-budget.js";
 import { requireCommandAllowed } from "./permissions.js";
 import { spawnProcess } from "./process-executor.js";
+import { buildShellProcessInvocation } from "./persistent-shell.js";
 
 export interface PostEditHook {
   glob: string;
@@ -84,17 +85,14 @@ async function runHook(command: string, filePath: string, timeoutMs: number): Pr
       stderr_truncated: false,
     });
   }
-  const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-  // ExecutionPolicy Bypass: AppContainer AuthorizationManager fails the default
-  // check for PATH-resolved script commands (npm, *.ps1); see persistent-shell.ts.
-  const args = process.platform === "win32" ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", expanded] : ["-lc", expanded];
+  const invocation = buildShellProcessInvocation(expanded);
 
   const { promise, resolve } = Promise.withResolvers<HookRunResult>();
   let processHandle;
   try {
     processHandle = await spawnProcess({
-      executable: shell,
-      args,
+      executable: invocation.executable,
+      args: invocation.args,
       cwd: path.dirname(filePath),
       timeoutMs,
     });

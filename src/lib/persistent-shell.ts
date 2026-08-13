@@ -3,7 +3,7 @@ import { appendBoundedTail, SHELL_OUTPUT_MAX_CHARS } from "./output-budget.js";
 import { redactSensitiveText } from "./redaction.js";
 import { requireCommandAllowed } from "./permissions.js";
 import { existsSync } from "node:fs";
-import { validatePath } from "./path-security.js";
+import { getFullDiskAccess, validatePath } from "./path-security.js";
 import { spawnProcess } from "./process-executor.js";
 
 export interface ShellExecResult {
@@ -190,6 +190,32 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
   return { cwd, command: rest || "pwd", changed };
 }
 
+export function buildShellProcessInvocation(command: string): { executable: string; args: string[] } {
+  const executable = process.platform === "win32" ? "powershell.exe" : "bash";
+  // Git for Windows/MSYS resolves getcwd() by enumerating path ancestry. A
+  // strict AppContainer intentionally grants workspace ancestors only traverse
+  // metadata, so launching git.exe directly with the workspace as process cwd
+  // fails before Git can parse -C/--git-dir. Keep the filesystem boundary
+  // narrow and shim ordinary PowerShell `git ...` calls: launch the real Git
+  // process from the drive root, then point Git back at the caller's validated
+  // current directory with -C. The child still inherits the AppContainer token.
+  const gitCompatPrelude = process.platform === "win32" && !getFullDiskAccess()
+    ? [
+        "$script:__clcRealGit=(Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)",
+        "if ($script:__clcRealGit) { function global:git { $target=(Get-Location).ProviderPath; $drive=[IO.Path]::GetPathRoot($target); Push-Location $drive; try { & $script:__clcRealGit -C $target @args } finally { Pop-Location } } }",
+      ].join("; ")
+    : "";
+  const shellCommand = gitCompatPrelude ? `${gitCompatPrelude}; ${command}` : command;
+  // ExecutionPolicy Bypass: inside an AppContainer the default AuthorizationManager
+  // check fails (PSSecurityException) for PATH-resolved script commands (npm,
+  // *.ps1), so every agent shell would error. Bypass only affects this process,
+  // which already executes arbitrary agent commands by design.
+  const args = process.platform === "win32"
+    ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", shellCommand]
+    : ["-lc", command];
+  return { executable, args };
+}
+
 async function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
   const { promise, resolve, reject } = Promise.withResolvers<ShellExecResult>();
   // spawn() reports a missing cwd as "spawn powershell.exe ENOENT", hiding the
@@ -197,20 +223,15 @@ async function runOnce(command: string, cwd: string, timeoutMs: number): Promise
   if (!existsSync(cwd)) {
     return Promise.reject(new Error(`shell cwd does not exist: ${cwd}`));
   }
-  const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-  // ExecutionPolicy Bypass: inside an AppContainer the default AuthorizationManager
-  // check fails (PSSecurityException) for PATH-resolved script commands (npm,
-  // *.ps1), so every agent shell would error. Bypass only affects this process,
-  // which already executes arbitrary agent commands by design.
-  const args = process.platform === "win32" ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command] : ["-lc", command];
+  const invocation = buildShellProcessInvocation(command);
   // The sync response deadline starts BEFORE spawn() so slow spawns (Windows AV
   // scanning can stall powershell.exe ~2.5-3s) count against the budget. The
   // MCP response is resolved AT the deadline; child-tree cleanup (taskkill)
   // continues in the background and must not delay the response.
   const startedAt = Date.now();
   const handle = await spawnProcess({
-    executable: shell,
-    args,
+    executable: invocation.executable,
+    args: invocation.args,
     cwd,
     env: process.env,
     timeoutMs,
