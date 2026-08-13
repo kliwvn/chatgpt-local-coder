@@ -767,23 +767,28 @@ await run("strict mode blocks stdio upstream before process spawn", async () => 
   }
 });
 
-await run("strict mode blocks loopback/private HTTP upstream before connect", async () => {
+await run("strict mode blocks every native HTTP upstream before connect", async () => {
   const previous = process.env.FULL_DISK_ACCESS;
   process.env.FULL_DISK_ACCESS = "false";
   const strictPath = path.join(tmpDir, "strict-http-upstream.json");
   const manager = new McpUpstreamManager(strictPath);
   try {
     await manager.init();
-    for (const [id, url, pattern] of [
-      ["loopback-name", "http://localhost:65534/mcp", /UPSTREAM_LOCAL_ACCESS_BLOCKED: loopback upstream/],
-      ["loopback-ip", "http://127.0.0.1:65534/mcp", /UPSTREAM_LOCAL_ACCESS_BLOCKED: non-public upstream address/],
-      ["private-ip", "http://192.168.1.1:65534/mcp", /UPSTREAM_LOCAL_ACCESS_BLOCKED: non-public upstream address/],
+    for (const [id, url] of [
+      ["loopback-name", "http://localhost:65534/mcp"],
+      ["loopback-ip", "http://127.0.0.1:65534/mcp"],
+      ["private-ip", "http://192.168.1.1:65534/mcp"],
+      ["public-ip", "http://93.184.216.34:65534/mcp"],
+      ["public-name", "https://example.com/mcp"],
     ]) {
       await manager.updateConfig({
         version: 1,
         servers: [{ id, name: id, enabled: true, transport: "http", url, expose: "meta_only" }],
       });
-      await assert.rejects(() => manager.listTools(id), pattern);
+      await assert.rejects(
+        () => manager.listTools(id),
+        /UPSTREAM_LOCAL_ACCESS_BLOCKED: native HTTP upstream/,
+      );
     }
   } finally {
     await manager.shutdown();

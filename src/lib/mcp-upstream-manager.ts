@@ -1,6 +1,4 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import dns from "node:dns/promises";
-import net from "node:net";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -62,33 +60,6 @@ const UPSTREAM_LOCAL_ACCESS_BLOCKED = "UPSTREAM_LOCAL_ACCESS_BLOCKED";
 
 let singleton: McpUpstreamManager | null = null;
 
-function isPrivateIpv4(address: string): boolean {
-  const parts = address.split(".").map(Number);
-  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
-  const [a, b] = parts;
-  return (
-    a === 0 || a === 10 || a === 127 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 198 && (b === 18 || b === 19)) ||
-    a >= 224
-  );
-}
-
-function isPrivateIp(address: string): boolean {
-  const version = net.isIP(address);
-  if (version === 4) return isPrivateIpv4(address);
-  if (version !== 6) return true;
-  const normalized = address.toLowerCase().split("%")[0];
-  if (normalized === "::" || normalized === "::1") return true;
-  if (normalized.startsWith("fc") || normalized.startsWith("fd")) return true;
-  if (/^fe[89ab]/.test(normalized)) return true;
-  const mapped = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  return mapped ? isPrivateIpv4(mapped[1]) : false;
-}
-
 async function assertStrictUpstreamAllowed(config: UpstreamServerConfig): Promise<void> {
   if (getFullDiskAccess()) return;
   if (config.transport === "stdio") {
@@ -97,41 +68,16 @@ async function assertStrictUpstreamAllowed(config: UpstreamServerConfig): Promis
       "run it through a sandbox-managed transport or use explicit trusted full-disk mode"
     );
   }
-
-  const url = new URL(config.url!);
-  const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  if (hostname === "localhost" || hostname.endsWith(".localhost")) {
-    throw new Error(`${UPSTREAM_LOCAL_ACCESS_BLOCKED}: loopback upstream '${config.id}' is blocked in strict mode`);
-  }
-
-  const literalVersion = net.isIP(hostname);
-  if (literalVersion) {
-    if (isPrivateIp(hostname)) {
-      throw new Error(`${UPSTREAM_LOCAL_ACCESS_BLOCKED}: non-public upstream address ${hostname} is blocked in strict mode`);
-    }
-    return;
-  }
-
-  let addresses: Array<{ address: string; family: number }>;
-  try {
-    addresses = await Promise.race([
-      dns.lookup(hostname, { all: true, verbatim: true }),
-      new Promise<never>((_, reject) => {
-        const timer = setTimeout(() => reject(new Error(`DNS policy lookup timed out for ${hostname}`)), 5000);
-        timer.unref?.();
-      }),
-    ]);
-  } catch (error) {
-    throw new Error(
-      `${UPSTREAM_LOCAL_ACCESS_BLOCKED}: cannot verify upstream '${config.id}' resolves only to public addresses: ` +
-      `${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-  if (!addresses.length || addresses.some((entry) => isPrivateIp(entry.address))) {
-    throw new Error(
-      `${UPSTREAM_LOCAL_ACCESS_BLOCKED}: upstream '${config.id}' resolves to a local/private/non-public address in strict mode`
-    );
-  }
+  // The SDK HTTP transport executes in the native Local Coder process. A DNS
+  // preflight is not an OS boundary: the transport can resolve the hostname
+  // again (DNS rebinding), and redirects can target loopback/private services
+  // after a seemingly-public first hop. Until HTTP upstream traffic is moved
+  // into a sandbox-managed/pinned transport, strict mode must refuse it rather
+  // than let mcp_tools/mcp_call become an indirection around workspace authority.
+  throw new Error(
+    `${UPSTREAM_LOCAL_ACCESS_BLOCKED}: native HTTP upstream '${config.id}' is disabled while FULL_DISK_ACCESS=false; ` +
+      "use a sandbox-managed upstream transport or explicit trusted full-disk mode"
+  );
 }
 
 export class McpUpstreamManager {
