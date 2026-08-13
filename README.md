@@ -53,10 +53,10 @@ Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/dev
 ```powershell
 git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
-.\setup.bat          # TỰ ĐỘNG: cài Node deps + build + autostart + mở dashboard
+.\chatgpt-local-coder.bat  # TỰ ĐỘNG: cài Node deps + build + autostart + mở dashboard
 ```
 
-> **`setup.bat` = một chạm duy nhất.** Kiểm tra Node 22+, tự `npm install` + `npm run build` nếu thiếu, cài autostart (Startup folder) để manager tự chạy khi đăng nhập, khởi động manager nếu chưa chạy, và **mở dashboard http://127.0.0.1:3300**. Chạy lại bất cứ lúc nào (idempotent — bỏ qua bước đã xong).
+> **`chatgpt-local-coder.bat` = một chạm duy nhất** (không tham số = setup). Kiểm tra Node 22+, tự `npm install` + `npm run build` nếu thiếu, cài autostart (Startup folder) để manager tự chạy khi đăng nhập, khởi động manager nếu chưa chạy, và **mở dashboard http://127.0.0.1:3300**. Chạy lại bất cứ lúc nào (idempotent — bỏ qua bước đã xong). Các lệnh con: `start` / `stop` (dừng Manager, giữ Server + Tunnel), `status`, `autostart [off]`, `tunnel start|stop`, `install`, `help`.
 
 Cài thủ công từng bước:
 
@@ -66,7 +66,7 @@ cd chatgpt-local-coder
 copy .env.example .env          # edit WORKSPACE_PATH
 npm install
 npm run build
-.\manager.bat                   # manager dashboard (http://127.0.0.1:3300) — chạy server + tunnel + connector cho bạn
+.\chatgpt-local-coder.bat start       # manager dashboard (http://127.0.0.1:3300) — chạy server + tunnel + connector cho bạn
 ```
 
 Muốn chạy thủ công (không dùng manager):
@@ -77,7 +77,7 @@ cd chatgpt-local-coder
 copy .env.example .env          # edit WORKSPACE_PATH
 npm install
 npm run build
-.\start.ps1
+.\chatgpt-local-coder.bat start
 ```
 
 Server runs at `http://localhost:3000` — health check: `http://localhost:3000/health`
@@ -97,7 +97,7 @@ npm start
 
 ## 🖥️ Manager Dashboard
 
-`manager.bat` mở **manager** tại `http://127.0.0.1:3300` — giao diện quản lý toàn bộ (Windows; chạy được trên mọi nền tảng bằng `node manager/server.mjs`):
+`chatgpt-local-coder.bat start` mở **manager** tại `http://127.0.0.1:3300` — giao diện quản lý toàn bộ (Windows; chạy được trên mọi nền tảng bằng `node manager/server.mjs`):
 
 | Tính năng | Mô tả |
 |-----------|-------|
@@ -109,7 +109,7 @@ npm start
 | **Workspace sidebar** | Cột trái liệt kê từng workspace: tên + trạng thái server/tunnel, **WORKSPACE_PATH đầy đủ**, `EXTRA_WORKSPACE_PATHS` gộp trên **một dòng** và ngăn cách bằng `;` (ellipsis khi quá dài, hover xem đủ), `FULL_DISK_ACCESS`, **MCP port + Admin port + PID** |
 | **Nút mở Cài Đặt Connector** | Mở thẳng `https://chatgpt.com/settings/connectors` từ card Tunnel |
 | **Hướng dẫn sử dụng** | Modal 4 bước: cài đặt → cấu hình → tunnel → tag `@connector` trong chat |
-| **Autostart ẩn hoàn toàn** | Tự chạy khi đăng nhập Windows qua Startup LNK → PowerShell hidden launcher `manager-hidden.ps1` → `manager.bat`/node chạy nền. Không phụ thuộc VBScript engine; khi bật lại autostart, Manager tự ghi lại LNK và dọn launcher VBS cũ nếu còn. Bật/tắt trong dashboard (API `/api/autostart`) hoặc `setup.bat` |
+| **Autostart ẩn hoàn toàn** | Tự chạy khi đăng nhập Windows qua Startup LNK → PowerShell ẩn chạy `chatgpt-local-coder.bat start` (file launcher duy nhất của repo). Không phụ thuộc VBScript engine; khi bật lại autostart, Manager tự ghi lại LNK và dọn launcher VBS cũ nếu còn. Bật/tắt trong dashboard (API `/api/autostart`) hoặc `chatgpt-local-coder.bat autostart [off]` |
 
 Manager và server chạy độc lập: manager quản lý, server xử lý MCP. Tắt manager không làm chết server đang chạy.
 
@@ -168,13 +168,10 @@ Stable tunnel ID — connector URL never changes.
 
 ```powershell
 # Terminal 1
-.\start.ps1 -Force
+.\chatgpt-local-coder.bat start
 
-# Terminal 2 — first time only
-.\openai-tunnel-init.bat    # enter tunnel_id + Runtime API key from OpenAI Platform
-
-# Every time after
-.\openai-tunnel.bat
+# Terminal 2 — first time only: nhập tunnel_id + Runtime API key từ OpenAI Platform
+.\chatgpt-local-coder.bat tunnel start   # (sẽ hỏi nếu thiếu OPENAI_TUNNEL_ID / API key)
 ```
 
 Get credentials: [OpenAI Platform → Tunnels](https://platform.openai.com/settings/organization/tunnels)
@@ -187,10 +184,10 @@ Free, but URL changes on every restart (update connector each time).
 
 ```powershell
 # Terminal 1
-.\start.bat
+.\chatgpt-local-coder.bat start
 
 # Terminal 2
-.\tunnel.bat    # copy https://….trycloudflare.com into connector URL
+.\chatgpt-local-coder.bat tunnel start   # copy https://….trycloudflare.com vào connector URL
 ```
 
 Install cloudflared: `winget install Cloudflare.cloudflared`
@@ -440,15 +437,15 @@ node scripts/test-mcp-session.mjs   # integration test (server must be running)
 |---------|-----|
 | **"Error in message stream"** / **"Lỗi trong luồng tin nhắn"** right after *"Looking for tools"* — **no server log** | You did **not tag the connector**. New chat → **+** → **More** → enable connector, or type **`@Local Coder`** in the message. Then retry. |
 | **Resource not found** on tool call | Kiểm tra server/session và latest build trước. Chỉ Refresh connector nếu `mcp_contract.version` được chủ động thay đổi; same-ABI implementation restart không tự yêu cầu Refresh. |
-| **Connection failed** | Check `.\start.ps1` + tunnel are both running. URL must be HTTPS. |
+| **Connection failed** | Check `chatgpt-local-coder.bat status` — Manager + Server + Tunnel phải chạy. URL must be HTTPS. |
 | **502 from tunnel during restart** | The tunnel can remain up while the local server is restarting; a brief 502 means `127.0.0.1:3000` was temporarily unavailable. Manager now drains MCP sessions with bounded graceful close before force fallback, reducing this window. |
 | **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
 | **`MCP write action is temporarily disabled`** | Xem `/health` → `mcpDispatch` (hoặc `agent_status.mcp_dispatch`). Nếu `MCP_REACHED.write_total` không tăng khi lỗi xảy ra thì host **không dispatch action tới Local Coder** (`HOST_NOT_INVOKED` chỉ được suy ra từ host-result + counter delta, server không thể tự log event này). So sánh connector snapshot với `mcp_contract.version/hash` và kiểm tra Action control/approval phía ChatGPT; chỉ Refresh nếu snapshot public ABI cần đổi. Nếu `MCP_REJECTED.write_total` tăng thì request đã tới Local Coder nhưng bị transport/session gate từ chối; xem `last_write_reason`/`reasons`. |
 | **Tool blocked by client safety** | Không dùng shell/Git/tool khác để bypass một MCP action đang bị host chặn. Xác định layer bằng `mcpDispatch`; sửa host/session/contract state nếu request chưa tới server. |
 | **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
-| **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.bat`). |
+| **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel: `chatgpt-local-coder.bat tunnel start` (URL cố định theo OPENAI_TUNNEL_ID). |
 | **Access denied — "Path nằm ngoài workspace"** | Path sandbox mặc định (`FULL_DISK_ACCESS=false`). Mở rộng `EXTRA_WORKSPACE_PATHS` hoặc bật `FULL_DISK_ACCESS=true` trong `.env` instance, restart server trong manager. |
-| **Không thấy manager / 3300** | Chạy `manager.bat` (hoặc `node manager/server.mjs`) — dashboard tại http://127.0.0.1:3300. Nếu đã có manager chạy, mở thẳng URL. |
+| **Không thấy manager / 3300** | Chạy `chatgpt-local-coder.bat start` (hoặc `node manager/server.mjs`) — dashboard tại http://127.0.0.1:3300. Nếu đã có manager chạy, mở thẳng URL. |
 | **git not found** | Install [Git](https://git-scm.com). |
 
 See also [AGENTS.md](AGENTS.md) for agent onboarding and `apply_patch` format.
@@ -477,7 +474,7 @@ If this saves you time, **star the repo** — it helps others find it.
 ```powershell
 git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
-.\setup.bat                    # MỘT CHẠM: cài deps + build + autostart + mở dashboard
+.\chatgpt-local-coder.bat      # MỘT CHẠM: cài deps + build + autostart + mở dashboard
 ```
 
 Cài thủ công từng bước:
@@ -486,7 +483,7 @@ git clone https://github.com/kliwvn/chatgpt-local-coder.git
 cd chatgpt-local-coder
 copy .env.example .env
 npm install && npm run build
-.\manager.bat                  # dashboard quản lý tại http://127.0.0.1:3300
+.\chatgpt-local-coder.bat start  # dashboard quản lý tại http://127.0.0.1:3300
 ```
 
 Mở **http://127.0.0.1:3300**: manager tự cài đặt, cấu hình workspace (folder picker), start server + tunnel, nút mở **Cài Đặt Connector**, **log viewer** (lọc Chỉ MCP), nút **Hướng Dẫn Sử Dụng** — không cần chạy terminal tay.
@@ -496,8 +493,8 @@ Mở **http://127.0.0.1:3300**: manager tự cài đặt, cấu hình workspace 
 Chạy thủ công (không dùng manager):
 
 ```powershell
-.\start.ps1                    # terminal 1
-.\openai-tunnel.bat            # terminal 2 (tunnel cố định)
+.\chatgpt-local-coder.bat start   # terminal 1 (manager — tự quản server/tunnel)
+.\chatgpt-local-coder.bat tunnel start   # terminal 2 (tunnel cố định)
 ```
 
 **ChatGPT:** Settings → Connectors → tạo connector → chọn tunnel → Refresh → chat mới.

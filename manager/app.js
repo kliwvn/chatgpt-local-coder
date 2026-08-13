@@ -329,7 +329,9 @@ async function loadInstances(initial) {
           : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`;
         const wsWarn = i.workspaceMissing
           ? `<div class="inst-warn" title="${esc(i.env.WORKSPACE_PATH || "")}">⚠ WORKSPACE_PATH không tồn tại trên máy này — sửa trong Cấu hình</div>`
-          : "";
+          : !i.workspaceScope || !i.workspaceScope.ok
+            ? `<div class="inst-warn" title="${esc((i.workspaceScope && i.workspaceScope.error) || "")}">⚠ WORKSPACE_PATH không hợp lệ — sửa trong Cấu hình</div>`
+            : "";
         return (
           `<li class="inst-item${active}" data-name="${esc(i.name)}">` +
           `<div class="inst-main">` +
@@ -372,7 +374,7 @@ async function loadInstances(initial) {
     setDot("tunnel-dot", false, "Mất kết nối manager");
     setDot("inst-server-dot", false, "Server: —");
     setDot("inst-tunnel-dot", false, "Tunnel: —");
-    $("mgr-version").textContent = "Manager không phản hồi — kiểm tra cửa sổ manager.bat";
+    $("mgr-version").textContent = "Manager không phản hồi — chạy chatgpt-local-coder.bat start";
     if (initial) setBusy(false);
     console.error(err);
   } finally {
@@ -633,7 +635,7 @@ async function restartManager() {
       toast(`Manager đã khởi động lại (PID ${back.pid})`, "ok");
       location.reload();
     } else {
-      toast("Manager chưa phản hồi — kiểm tra cửa sổ manager.bat", "err");
+      toast("Manager chưa phản hồi — chạy chatgpt-local-coder.bat start", "err");
       setBusy(false);
     }
   } catch (err) {

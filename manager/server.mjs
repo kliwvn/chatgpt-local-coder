@@ -17,7 +17,7 @@
  * Usage:
  *   node manager/server.mjs            # start + auto-open browser
  *   node manager/server.mjs --no-open  # start without opening browser
- *   manager.bat                        # Windows launcher
+ *   chatgpt-local-coder.bat start      # Windows launcher (file duy nhất)
  */
 import http from "node:http";
 import fs from "node:fs";
@@ -82,10 +82,9 @@ const HELPER_OUTPUT_MAX_CHARS = 16 * 1024;
 const MAX_MANAGED_INSTANCES = 256;
 const MANAGED_LOG_SWEEP_MS = 60 * 1000;
 const IS_WIN = process.platform === "win32";
-const REPO_ROOT = ROOT; // thư mục repo (manager.bat nằm ở đây)
-const MANAGER_BAT = path.join(ROOT, "manager.bat");
-const MANAGER_HIDDEN_VBS = path.join(STATE_DIR, "manager-hidden.vbs");
-const MANAGER_HIDDEN_PS1 = path.join(STATE_DIR, "manager-hidden.ps1");
+const REPO_ROOT = ROOT; // thư mục repo (chatgpt-local-coder.bat nằm ở đây)
+const LAUNCHER_BAT = path.join(ROOT, "chatgpt-local-coder.bat");
+const MANAGER_HIDDEN_VBS = path.join(STATE_DIR, "manager-hidden.vbs"); // chỉ dọn legacy
 const STARTUP_LNK = IS_WIN
   ? path.join(
       process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"),
@@ -2111,10 +2110,23 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
   const chk = includeCheck
     ? await checkConfig(name).catch((e) => ({ ok: false, items: [], error: String((e && e.message) || e) }))
     : null;
+  // Tự phát hiện scope lỗi: bundle nào cũng kèm kết quả validate để UI hiển thị
+  // ngay (workspaceMissing / container root) thay vì chỉ lộ ra lúc save/start.
+  let workspaceScope;
+  try {
+    workspaceScope = await validateManagedWorkspaceScope(env);
+  } catch (err) {
+    workspaceScope = { ok: false, workspaceMissing: false, error: String((err && err.message) || err) };
+  }
   return {
     name,
     node: process.version,
     workspaceMissing: !wsResolved.exists,
+    workspaceScope: {
+      ok: Boolean(workspaceScope.ok),
+      workspaceMissing: workspaceScope.workspaceMissing === true,
+      error: workspaceScope.error || "",
+    },
     env: {
       PORT: env.PORT || "3000",
       ADMIN_PORT: env.ADMIN_PORT || "3001",
@@ -2823,41 +2835,46 @@ async function handleApi(req, res, url, body) {
     if (req.method === "POST") {
       const enable = Boolean(body && body.enabled);
       if (enable) {
-        // Luôn ghi lại launcher + shortcut (ghi đè LNK cũ kể cả khi đã tồn tại):
-        // LNK từ bản cũ có thể trỏ manager-hidden.vbs (VBScript engine không
-        // đăng ký sẵn trên nhiều Windows) — bật lại autostart phải tự sửa chữa.
+        // Luôn ghi lại shortcut (ghi đè LNK cũ kể cả khi đã tồn tại): LNK từ bản
+        // cũ có thể trỏ manager-hidden.vbs hoặc launcher ps1 đời cũ — bật lại autostart
+        // phải tự sửa chữa. Launcher duy nhất giờ là chatgpt-local-coder.bat.
         {
-          // Tạo shortcut .lnk trỏ manager-hidden.ps1 chạy bằng PowerShell ẩn
-          // khi đăng nhập. KHÔNG dùng VBS/wscript: VBScript engine không
-          // đăng ký sẵn trên nhiều Windows hiện đại ("There is no script
-          // engine for file extension '.vbs'"), làm chết toàn bộ autostart.
-          const ps1Body =
-            '$proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/d", "/c", "`"' +
-            MANAGER_BAT +
-            '`"" -WorkingDirectory "' + REPO_ROOT + '" -WindowStyle Hidden -PassThru\n' +
-            "Start-Sleep -Seconds 2\n" +
-            "if ($proc.HasExited) { exit 1 }\n";
-          await fsp.writeFile(MANAGER_HIDDEN_PS1, ps1Body, "utf8");
-          const ps1Make =
-            'param([string]$LnkPath, [string]$Launcher, [string]$WorkDir)\n' +
-            '$ws = New-Object -ComObject WScript.Shell\n' +
-            '$s = $ws.CreateShortcut($LnkPath)\n' +
-            '$s.TargetPath = Join-Path $env:SystemRoot "System32\\WindowsPowerShell\\v1.0\\powershell.exe"\n' +
-            '$s.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"" + $Launcher + "`""\n' +
-            '$s.WorkingDirectory = $WorkDir\n' +
-            '$s.WindowStyle = 7\n' +
-            '$s.Description = "ChatGPT Local Coder Manager (multi-instance, hidden)"\n' +
-            "$s.Save()\n";
-          const makePath = path.join(STATE_DIR, "make-startup-lnk.ps1");
-          await fsp.writeFile(makePath, ps1Make, "utf8");
+          // Tạo shortcut .lnk trỏ powershell.exe ẩn chạy:
+          //   & '<repo>\chatgpt-local-coder.bat' start
+          // KHÔNG dùng VBS/wscript (VBScript engine không đăng ký sẵn trên nhiều
+          // Windows hiện đại: "There is no script engine for file extension
+          // '.vbs'") và không tạo thêm file launcher phụ trong manager/state/.
           const psExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+          const psCode =
+            "$ws = New-Object -ComObject WScript.Shell\n" +
+            "$s = $ws.CreateShortcut('" + STARTUP_LNK + "')\n" +
+            "$s.TargetPath = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'\n" +
+            "$s.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"& ' + [char]39 + '" + LAUNCHER_BAT + "' + [char]39 + ' start\"'\n" +
+            "$s.WorkingDirectory = '" + REPO_ROOT + "'\n" +
+            "$s.WindowStyle = 7\n" +
+            "$s.Description = 'ChatGPT Local Coder Manager (hidden)'\n" +
+            "$s.Save()\n";
           const r = spawnSync(
             psExe,
-            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", makePath, "-LnkPath", STARTUP_LNK, "-Launcher", MANAGER_HIDDEN_PS1, "-WorkDir", REPO_ROOT],
+            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCode],
             { encoding: "utf8", windowsHide: true, timeout: 30000, maxBuffer: HELPER_OUTPUT_MAX_CHARS }
           );
           if (r.status !== 0) {
             return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: " + (r.stderr || r.stdout || "").trim().slice(-200) });
+          }
+          // Đọc ngược LNK: phải trỏ đúng chatgpt-local-coder.bat (chống false-green
+          // khi LNK cũ còn sót lại mà lệnh tạo mới thất bại âm thầm).
+          const verifyCode =
+            "$w = New-Object -ComObject WScript.Shell; " +
+            "$s = $w.CreateShortcut('" + STARTUP_LNK + "'); " +
+            "if ($s.Arguments -notmatch 'chatgpt-local-coder\\.bat') { exit 1 }";
+          const v = spawnSync(
+            psExe,
+            ["-NoProfile", "-Command", verifyCode],
+            { encoding: "utf8", windowsHide: true, timeout: 30000, maxBuffer: HELPER_OUTPUT_MAX_CHARS }
+          );
+          if (v.status !== 0) {
+            return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: LNK không trỏ tới chatgpt-local-coder.bat" });
           }
           // Dọn VBS cũ nếu còn (phiên bản cũ từng tạo) để không còn shortcut chết.
           try {

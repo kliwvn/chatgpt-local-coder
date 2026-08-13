@@ -33,13 +33,13 @@ Thay vào đó:
 ### Lỗi tunnel `stream canceled by remote`
 
 Bình thường khi:
-- Server restart (`stop.ps1` / `start.ps1`) trong lúc ChatGPT đang kết nối
+- Server restart (dùng `chatgpt-local-coder.bat stop` / `start` hoặc nút Restart trong manager) trong lúc ChatGPT đang kết nối
 - ChatGPT đóng stream SSE sau khi đổi quyền
-- Tunnel URL đổi (chạy lại `tunnel.bat` cloudflared) mà chưa update Connector URL
+- Tunnel URL đổi (chạy lại `chatgpt-local-coder.bat tunnel start` kiểu cloudflared) mà chưa update Connector URL
 
 **Fix:** Giữ server + tunnel chạy ổn định, không restart giữa chừng. Sau restart nội bộ, reconnect/new chat nếu transport cần; chỉ Refresh connector khi public ABI version/snapshot thực sự đổi.
 
-**Khuyến nghị:** Dùng `openai-tunnel.bat` (OpenAI Secure MCP Tunnel) — `tunnel_id` cố định, không cần đổi URL connector mỗi lần.
+**Khuyến nghị:** Dùng OpenAI Secure MCP Tunnel (`chatgpt-local-coder.bat tunnel start`) — `tunnel_id` cố định, không cần đổi URL connector mỗi lần.
 
 ## Mapping Claude Code ↔ Codex MCP
 
@@ -143,15 +143,15 @@ Dùng `dry_run: true` để xem diff trước khi ghi.
 
 ```powershell
 cd codex-mcp-server
-.\start.ps1 -Force          # Terminal 1: MCP server
-.\openai-tunnel.bat         # Terminal 2: OpenAI tunnel (URL cố định)
+.\chatgpt-local-coder.bat start  # Terminal 1: Manager (tự quản MCP server + tunnel)
+.\chatgpt-local-coder.bat tunnel start   # Terminal 2: OpenAI tunnel (URL cố định)
 ```
 
-**Lần đầu:** chạy `.\openai-tunnel-init.bat` → nhập `tunnel_id` + Runtime API key từ [Platform Tunnels](https://platform.openai.com/settings/organization/tunnels).
+**Lần đầu:** chạy `chatgpt-local-coder.bat tunnel start` → nhập `tunnel_id` + Runtime API key từ [Platform Tunnels](https://platform.openai.com/settings/organization/tunnels) (lưu vào instance `.env` qua manager UI nếu chưa có).
 
 **ChatGPT:** [Settings → Connectors](https://chatgpt.com/#settings/Connectors) → chọn tunnel (không cần dán URL thủ công).
 
-Tunnel cũ (URL đổi mỗi lần): `.\tunnel.bat` (cloudflared).
+Tunnel cũ (URL đổi mỗi lần): `chatgpt-local-coder.bat tunnel start` (cloudflared).
 
 Health check: `http://localhost:3000/health` | Tunnel UI: `http://127.0.0.1:8080/ui`
 
@@ -162,4 +162,4 @@ Health check: `http://localhost:3000/health` | Tunnel UI: `http://127.0.0.1:8080
 | Access denied | Kiểm tra path; bật `FULL_DISK_ACCESS=true` |
 | Patch context not found | Đọc file trước; thêm context lines (dòng bắt đầu bằng space) |
 | ChatGPT hỏi quyền / write action bị disable | Kiểm tra MCP dispatch diagnostics rồi Refresh/re-approve connector. Local MCP annotations không thể auto-approve thay ChatGPT. |
-| Connection failed | Chạy `.\start.ps1` + tunnel; URL phải HTTPS |
+| Connection failed | Chạy `chatgpt-local-coder.bat status` — Manager + Server + Tunnel phải chạy; URL phải HTTPS |

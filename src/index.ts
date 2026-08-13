@@ -551,7 +551,7 @@ server.on("error", (err: NodeJS.ErrnoException) => {
     console.error(`\n[LOI] Port ${PORT} da co server khac dang chay!`);
     console.error("Chay lenh sau de tim process:");
     console.error(`  netstat -ano | findstr ":${PORT}"`);
-    console.error("Hoac dung: .\\stop.bat de tat server cu\n");
+    console.error("Hoac dung: .\\chatgpt-local-coder.bat stop de tat server cu\n");
   } else {
     console.error("\n[LOI] Khong the khoi dong server:", err.message, "\n");
   }

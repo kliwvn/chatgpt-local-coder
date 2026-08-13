@@ -330,6 +330,10 @@ try {
   assert.match(managerServerSource, /pidsWithCmdLine\("tunnel-client\.exe", profileFile\)/, "OpenAI tunnel cleanup must scope by executable plus the instance-unique profile");
   assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.serverPid, null\)/, "failed Local Coder Server startup must preserve PID metadata until the child is confirmed stopped");
   assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.tunnelPid, null\)/, "failed cloudflared startup must preserve PID metadata until the child is confirmed stopped");
+  assert.match(managerServerSource, /chatgpt-local-coder\.bat/, "Manager autostart must reference the single consolidated launcher bat");
+  assert.doesNotMatch(managerServerSource, /make-startup-lnk\.ps1|manager-hidden\.ps1/, "autostart must not create auxiliary PowerShell launcher files");
+  assert.match(managerServerSource, /workspaceScope\.ok/, "instance bundle must expose workspace-scope validation for self-detection");
+  assert.match(managerApp, /!i\.workspaceScope \|\| !i\.workspaceScope\.ok/, "workspace card must surface an invalid workspace scope instead of false-green");
   assert.match(managerApp, /\/server\/restart/);
   assert.match(managerApp, /splitExtraWorkspacePaths/);
   assert.match(managerApp, /\.split\(";"\)/);
