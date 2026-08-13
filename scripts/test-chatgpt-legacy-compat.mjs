@@ -154,8 +154,11 @@ try {
   setWorkspaceRoots(oldRoots);
   if (oldProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
   else process.env.CHATGPT_TOOL_PROFILE = oldProfile;
-  // Temp dir is left for OS-managed cleanup in os.tmpdir(): direct recursive
-  // removal is prohibited by the repo P0 safety policy.
+  // The fixture dir is owned by this test and created just above; remove it on
+  // exit like the sibling git/sandbox tests so runs leave no residue under the
+  // repo parent. The dir never holds user content, so exact-target removal is
+  // safe and matches the established test convention.
+  await fs.rm(temp, { recursive: true, force: true }).catch(() => undefined);
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
