@@ -9,7 +9,7 @@ MCP server local giống Codex: đọc/ghi file, chạy lệnh, git. Dùng với
 
 ## Quyền truy cập
 
-- `FULL_DISK_ACCESS` là security mode: `false` = path-aware tools chỉ trong workspace roots và arbitrary/project-controlled process trees phải qua Windows AppContainer (local stdio upstream bị block); `true` = explicit trusted native/full-machine mode. Fixed host mediators chỉ được phép thực hiện operation hẹp đã định nghĩa, không nhận arbitrary command text.
+- `FULL_DISK_ACCESS` là security mode: `false` = path-aware tools chỉ trong workspace roots và arbitrary/project-controlled process trees phải qua Windows AppContainer. Mọi upstream MCP transport hiện chạy native (`stdio` hoặc HTTP) đều bị block trong strict mode cho tới khi có sandbox-managed/pinned transport; `true` = explicit trusted native/full-machine mode. Fixed host mediators chỉ được phép thực hiện operation hẹp đã định nghĩa, không nhận arbitrary command text.
 - **Destructive-command guard luôn bật**, không phụ thuộc `FULL_DISK_ACCESS`: shell không được dùng để permanent-delete, `git clean -f*`, `git reset --hard`, hoặc bypass restore/delete safety.
 - `WORKSPACE_PATH` bắt buộc xác định **đúng một primary project root** và là default cwd/context ổn định; không derive ngầm từ `process.cwd()` và không nhét nhiều root bằng `;`. Root bổ sung chỉ qua `EXTRA_WORKSPACE_PATHS`. Khi `FULL_DISK_ACCESS=false`, các root này còn là hard workspace authority; khi `true`, collection parent có thể dùng làm context vì filesystem authority đã explicit full-machine.
 
@@ -55,7 +55,7 @@ Bình thường khi:
 | `Bash` | `run_command` | Lệnh ngắn, chờ xong |
 | Background shell | `start_process` + `process_output` | |
 | `Rewind` | `rewind` | `list` / `preview` / `restore` — undo file edits qua checkpoint tự động |
-| — | `mcp_servers`, `mcp_tools`, `mcp_call` | Gọi MCP server khác trên máy (hub) |
+| — | `mcp_servers`, `mcp_tools`, `mcp_call` | Hub MCP; tool luôn tồn tại trong ABI, nhưng strict mode fail-closed cho native stdio/HTTP upstream |
 | — | Admin UI `:3001/ui` | Import MCP từ Cursor / Claude Code / OpenCode |
 | — | `apply_patch` | Codex/OpenAI style (thêm so với Claude) |
 | — | `git_*`, `git_restore` | Git tools riêng (Claude dùng Bash) |
@@ -109,7 +109,7 @@ tool nội bộ:
 - **Refresh connector**: chỉ cần khi **contract version đổi**. Không refresh sau
   mỗi update implementation nội bộ — ABI không đổi thì connector không cần đụng.
 - **Chẩn đoán layer chặn write**: `agent_status` trả `mcp_contract` (version, hash, tool_count, dynamic flags), `boot.boot_id`, `process_security`, và tách `local_executor_profile`/`local_write_allowed` khỏi `host_action_permission: "unobservable"`. `/health` cũng expose contract + sandbox health.
-- **Security invariant**: `FULL_DISK_ACCESS=false` phải confine path-aware tools và arbitrary/project-controlled process trees vào workspace roots bằng Windows AppContainer; local stdio upstream bị block trước spawn. Shell/Git/hooks/child process/upstream không được dùng để vượt path denial. Sandbox prepare/hash/ACL/self-test failure → fail closed; không native fallback. `FULL_DISK_ACCESS=true` mới là explicit trusted native full-machine mode. Fixed host mediators (AppContainer control, Recycle Bin operation, explicit setup helper) chỉ nhận input hẹp, không arbitrary command. `SANDBOX_EXEC_ROOTS` là privileged RX policy: nếu approved roots đổi, runtime phải fail closed cho tới khi `npm run setup:sandbox` revoke grants cũ + grant roots mới; agent command không bao giờ chạy elevated.
+- **Security invariant**: `FULL_DISK_ACCESS=false` phải confine path-aware tools và arbitrary/project-controlled process trees vào workspace roots bằng Windows AppContainer. Native stdio/HTTP upstream đều fail-closed trước transport; DNS preflight đơn thuần không đủ vì rebinding/redirect có thể chạm local host-authority service. Shell/Git/hooks/child process/upstream không được dùng để vượt path denial. Sandbox prepare/hash/ACL/self-test failure → fail closed; không native fallback. `FULL_DISK_ACCESS=true` mới là explicit trusted native full-machine mode. Fixed host mediators (AppContainer control, Recycle Bin operation, explicit setup helper) chỉ nhận input hẹp, không arbitrary command. `SANDBOX_EXEC_ROOTS` là privileged RX policy: nếu approved roots đổi, runtime phải fail closed cho tới khi `npm run setup:sandbox` revoke grants cũ + grant roots mới; agent command không bao giờ chạy elevated.
 
 ## Format `apply_patch` (Codex-style)
 
@@ -159,7 +159,7 @@ Health check: `http://localhost:3000/health` | Tunnel UI: `http://127.0.0.1:8080
 
 | Lỗi | Cách xử lý |
 |---|---|
-| Access denied | Kiểm tra path; bật `FULL_DISK_ACCESS=true` |
+| Access denied | Kiểm tra path và thêm **đúng root cần thiết** vào `EXTRA_WORKSPACE_PATHS`. Chỉ bật `FULL_DISK_ACCESS=true` khi user chủ động chọn trusted full-machine mode, không dùng nó như workaround cho path denial. |
 | Patch context not found | Đọc file trước; thêm context lines (dòng bắt đầu bằng space) |
-| ChatGPT hỏi quyền / write action bị disable | Kiểm tra MCP dispatch diagnostics rồi Refresh/re-approve connector. Local MCP annotations không thể auto-approve thay ChatGPT. |
+| ChatGPT hỏi quyền / write action bị disable | Kiểm tra MCP dispatch diagnostics. Nếu `MCP_REACHED.write_total` không tăng thì host chưa dispatch; kiểm approval/action state và chỉ Refresh khi connector snapshot không khớp public ABI/version. Local MCP annotations không thể auto-approve thay ChatGPT. |
 | Connection failed | Chạy `chatgpt-local-coder.bat status` — Manager + Server + Tunnel phải chạy; URL phải HTTPS |
