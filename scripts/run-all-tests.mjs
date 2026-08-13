@@ -56,9 +56,12 @@ console.log("=== Build ===");
 await runBuild();
 
 const unitScripts = [
+  "scripts/test-sandbox-runner-artifact.mjs",
+  "scripts/test-shell-invocation.mjs",
   "scripts/test-patch.mjs",
   "scripts/test-tools.mjs",
   "scripts/test-checkpoints.mjs",
+  "scripts/test-mcp-upstream-strict-policy.mjs",
   "scripts/test-mcp-upstream.mjs",
   "scripts/test-activity-log.mjs",
   "scripts/test-config-safety.mjs",
