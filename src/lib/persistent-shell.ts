@@ -195,15 +195,67 @@ export function buildShellProcessInvocation(command: string): { executable: stri
   // Git for Windows/MSYS resolves getcwd() by enumerating path ancestry. A
   // strict AppContainer intentionally grants workspace ancestors only traverse
   // metadata, so launching git.exe directly with the workspace as process cwd
-  // fails before Git can parse -C/--git-dir. Keep the filesystem boundary
-  // narrow and shim ordinary PowerShell `git ...` calls: launch the real Git
-  // process from the drive root, then point Git back at the caller's validated
-  // current directory with -C. The child still inherits the AppContainer token.
+  // fails before normal repository discovery. Keep the filesystem boundary
+  // narrow and shim ordinary PowerShell `git ...` calls: resolve the repository
+  // using PowerShell inside the already-validated cwd, then launch the real Git
+  // process from the drive root with explicit --git-dir/--work-tree. PowerShell
+  // tracks $PWD separately from Win32 CurrentDirectory, so both must be moved
+  // for the native Git child. The child still inherits the AppContainer token.
   const gitCompatPrelude = process.platform === "win32" && !getFullDiskAccess()
-    ? [
-        "$script:__clcRealGit=(Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)",
-        "if ($script:__clcRealGit) { function global:git { $target=(Get-Location).ProviderPath; $drive=[IO.Path]::GetPathRoot($target); Push-Location $drive; try { & $script:__clcRealGit -C $target @args } finally { Pop-Location } } }",
-      ].join("; ")
+    ? String.raw`
+$script:__clcRealGit = Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue |
+  Select-Object -First 1 -ExpandProperty Source
+if ($script:__clcRealGit) {
+  function global:git {
+    $target = (Get-Location).ProviderPath
+    $probe = $target
+    $repoRoot = $null
+    $gitDir = $null
+    while ($probe) {
+      $dotGit = Join-Path $probe '.git'
+      if (Test-Path -LiteralPath $dotGit -PathType Container) {
+        $repoRoot = $probe
+        $gitDir = $dotGit
+        break
+      }
+      if (Test-Path -LiteralPath $dotGit -PathType Leaf) {
+        $gitLine = Get-Content -LiteralPath $dotGit -TotalCount 1 -ErrorAction Stop
+        $gitPrefix = 'gitdir:'
+        if ($gitLine.StartsWith($gitPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+          $repoRoot = $probe
+          $raw = $gitLine.Substring($gitPrefix.Length).Trim()
+          if ([IO.Path]::IsPathRooted($raw)) {
+            $gitDir = $raw
+          } else {
+            $gitDir = [IO.Path]::GetFullPath((Join-Path $probe $raw))
+          }
+          break
+        }
+      }
+      $parent = [IO.Directory]::GetParent($probe)
+      if (-not $parent) { break }
+      $next = $parent.FullName
+      if ($next -eq $probe) { break }
+      $probe = $next
+    }
+    if ($repoRoot -and $gitDir) {
+      $drive = [IO.Path]::GetPathRoot($repoRoot)
+      $oldLocation = (Get-Location).ProviderPath
+      $oldCurrent = [Environment]::CurrentDirectory
+      try {
+        Set-Location -LiteralPath $drive
+        [Environment]::CurrentDirectory = $drive
+        & $script:__clcRealGit ('--git-dir=' + $gitDir) ('--work-tree=' + $repoRoot) @args
+      } finally {
+        [Environment]::CurrentDirectory = $oldCurrent
+        Set-Location -LiteralPath $oldLocation
+      }
+    } else {
+      & $script:__clcRealGit @args
+    }
+  }
+}
+`.trim()
     : "";
   const shellCommand = gitCompatPrelude ? `${gitCompatPrelude}; ${command}` : command;
   // ExecutionPolicy Bypass: inside an AppContainer the default AuthorizationManager
