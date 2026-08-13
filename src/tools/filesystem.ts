@@ -526,19 +526,24 @@ export function registerFilesystemTools(server: McpServer): void {
       requireWriteAllowed();
 
       if (isMultiFilePatch(patch)) {
+        // Deletion is outside this tool's contract. Parse once without a base
+        // directory so the operation kind is rejected before any filesystem
+        // canonicalization/stat call. Path validation still happens below for
+        // every permitted operation before execution.
+        const preflightOps = parseMultiFilePatch(patch);
+        if (preflightOps.some((op) => op.operation === "delete")) {
+          throw new Error(
+            "APPLY_PATCH_DELETE_UNSUPPORTED: apply_patch is a non-delete edit action. " +
+              "Use the explicit recoverable removal tools instead."
+          );
+        }
         let baseDir: string | undefined;
         if (filePath) {
           const validPath = await validatePath(filePath);
           const stat = await fs.stat(validPath);
           baseDir = stat.isDirectory() ? validPath : path.dirname(validPath);
         }
-        const parsedOps = parseMultiFilePatch(patch, baseDir);
-        if (parsedOps.some((op) => op.operation === "delete")) {
-          throw new Error(
-            "APPLY_PATCH_DELETE_UNSUPPORTED: apply_patch is a non-delete edit action. " +
-              "Use the explicit recoverable removal tools instead."
-          );
-        }
+        const parsedOps = baseDir ? parseMultiFilePatch(patch, baseDir) : preflightOps;
         const parsedPaths = parsedOps.map((op) => op.path);
         const patchPaths = await Promise.all(parsedPaths.map((patchPath) => validatePath(patchPath)));
         return withFileMutations(patchPaths, async () => {

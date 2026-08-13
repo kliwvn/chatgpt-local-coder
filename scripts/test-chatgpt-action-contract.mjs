@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createMcpServer } from "../dist/server-factory.js";
@@ -21,7 +21,10 @@ import {
 const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
 const oldCwd = getDefaultCwd();
 const oldRoots = getWorkspaceRoots();
-const temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-chatgpt-contract-"));
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const testRoot = path.join(repoRoot, ".tool-test-tmp");
+await fs.mkdir(testRoot, { recursive: true });
+const temp = await fs.mkdtemp(path.join(testRoot, "clc-chatgpt-contract-"));
 
 const expected = {
   write_file: {
@@ -134,8 +137,11 @@ try {
 
   const victim = path.join(temp, "must-survive.txt");
   await fs.writeFile(victim, "survive\n", "utf8");
-  const patch = "*** Begin Patch\n*** Delete File: must-survive.txt\
-*** End Patch";
+  const patch = [
+    "*** Begin Patch",
+    "*** Delete File: must-survive.txt",
+    "*** End Patch",
+  ].join("\n");
   let blocked = false;
   try {
     const result = await client.callTool({ name: "apply_patch", arguments: { path: temp, patch } });
