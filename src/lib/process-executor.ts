@@ -399,6 +399,10 @@ function buildSandboxEnvironment(state: SandboxState): NodeJS.ProcessEnv {
     APPDATA: roamingAppData,
     TEMP: temp,
     TMP: temp,
+    // Internal execution-context marker for child programs. This is not an
+    // authorization signal; it only lets trusted launcher/test code distinguish
+    // a real agent AppContainer from the native Local Coder host process.
+    CLC_OS_SANDBOX: "windows_appcontainer",
   };
 
   const allowSensitive = process.env.SANDBOX_ALLOW_SENSITIVE_ENV === "1";

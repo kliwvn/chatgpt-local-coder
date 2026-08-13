@@ -30,6 +30,18 @@ if "%CMD%"=="" set "CMD=setup"
 
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 
+REM Host lifecycle/persistence must never be initiated from an agent AppContainer.
+REM status/install/help remain allowed because they do not create host processes,
+REM persistence, or tunnel state. A normal user terminal does not carry this
+REM internal marker, so ordinary launcher behavior is unchanged.
+if /i "%CLC_OS_SANDBOX%"=="windows_appcontainer" (
+  if /i "%CMD%"=="setup"     goto :sandbox_host_lifecycle_blocked
+  if /i "%CMD%"=="start"     goto :sandbox_host_lifecycle_blocked
+  if /i "%CMD%"=="stop"      goto :sandbox_host_lifecycle_blocked
+  if /i "%CMD%"=="autostart" goto :sandbox_host_lifecycle_blocked
+  if /i "%CMD%"=="tunnel"    goto :sandbox_host_lifecycle_blocked
+)
+
 REM ---- Manager port tu .env (mac dinh 3300) ----
 set "MGR_PORT=3300"
 for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b /c:"MANAGER_PORT=" ".env" 2^>nul`) do set "MGR_PORT=%%b"
@@ -44,6 +56,11 @@ if /i "%CMD%"=="install"   goto :cmd_install
 if /i "%CMD%"=="tunnel"    goto :cmd_tunnel
 if /i "%CMD%"=="help"      goto :cmd_help
 echo Lenh khong hop le: %CMD%  ^(xem "%~nx0 help"^)
+exit /b 1
+
+:sandbox_host_lifecycle_blocked
+echo [LOI] Host lifecycle bi chan trong Windows AppContainer agent sandbox.
+echo       Chay lenh nay tu terminal Windows cua user/Manager host context.
 exit /b 1
 
 REM =====================================================================

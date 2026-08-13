@@ -57,6 +57,7 @@ await runBuild();
 
 const unitScripts = [
   "scripts/test-sandbox-runner-artifact.mjs",
+  "scripts/test-launcher-safety.mjs",
   "scripts/test-shell-invocation.mjs",
   "scripts/test-patch.mjs",
   "scripts/test-tools.mjs",
