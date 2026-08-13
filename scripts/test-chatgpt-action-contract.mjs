@@ -17,6 +17,7 @@ import {
   recordMcpReached,
   recordMcpRejected,
 } from "../dist/lib/mcp-dispatch-diagnostics.js";
+import { SESSION_NOT_FOUND_MESSAGE } from "../dist/lib/mcp-session-manager.js";
 
 const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
 const oldCwd = getDefaultCwd();
@@ -184,6 +185,10 @@ try {
     diag.stages.MCP_EXECUTED.write_total + diag.stages.MCP_REJECTED.write_total + diag.stages.MCP_IN_FLIGHT.write_total,
     "write dispatch stages must conserve reached requests"
   );
+
+  assert.match(SESSION_NOT_FOUND_MESSAGE, /reconnect or open a new chat/i);
+  assert.match(SESSION_NOT_FOUND_MESSAGE, /only if the public MCP contract version\/hash changed/i);
+  assert.doesNotMatch(SESSION_NOT_FOUND_MESSAGE, /refresh connector and open a new chat/i);
 
   console.log(`chatgpt-action-contract: ok (${Object.keys(expected).length} critical actions locked; apply_patch removal blocked; dispatch terminal states conserved)`);
 } finally {

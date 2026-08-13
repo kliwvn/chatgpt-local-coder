@@ -10,6 +10,8 @@ import { getFullDiskAccess } from "./path-security.js";
 import { envIntegerOrThrow } from "./env-utils.js";
 
 const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
+export const SESSION_NOT_FOUND_MESSAGE =
+  "Session not found. Server restarted or connector session expired — reconnect or open a new chat. Refresh the connector only if the public MCP contract version/hash changed.";
 
 /** Capacity admission failed — all sessions busy (published + in-flight = MAX). */
 export class SessionCapacityError extends Error {
@@ -640,8 +642,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     },
 
     sendSessionNotFound(res: Response, requestId: string | number | null = null) {
-      const message =
-        "Session not found. Server restarted or connector session expired — refresh connector and open a new chat.";
+      const message = SESSION_NOT_FOUND_MESSAGE;
       res.locals.mcpError = message;
       res.status(404).json({
         jsonrpc: "2.0",

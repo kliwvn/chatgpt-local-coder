@@ -32,10 +32,10 @@ function applyToolProfile(server: McpServer): () => void {
     return original(name, ...rest);
   }) as typeof server.registerTool;
   return () => {
-    // The slim profile filters built-in/bridge tools only. Explicit upstream
-    // allowlist/all proxy tools are already controlled by upstream config and
-    // must remain callable, otherwise refreshProxiedTools records NOOP entries
-    // that never appear in tools/list.
+    // Full-profile construction restores raw registration before dynamic
+    // upstream proxy registration. Slim never calls this restore function: its
+    // filter remains attached for the server lifetime as defense in depth, even
+    // though refreshProxiedTools also refuses to run outside the full profile.
     server.registerTool = original as typeof server.registerTool;
   };
 }
