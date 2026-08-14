@@ -10,7 +10,7 @@
  * Instance layout:
  *   manager/instances/<name>/
  *     .env          # PORT, ADMIN_PORT, WORKSPACE_PATH, OPENAI_TUNNEL_ID/KEY...
- *     config.json   # lastTunnelUrl, healthPort, autoStart
+ *     config.json   # public UI config + internal secret-safe tunnel launch evidence
  *     server.pid / tunnel.pid / profile.yaml / server.log / tunnel.log
  *     checkpoints/ / shell-state/  # managed runtime state, isolated from repo root
  *
@@ -30,6 +30,7 @@ import { randomUUID } from "node:crypto";
 import { copyTruncateLogFile, isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
 import { recycleManagedDirectory } from "./safe-delete.mjs";
 import { preserveLegacySandboxPolicyManifest, reconcileLegacyRuntimeDirectory, reconcileLegacyShellStateDirectory } from "./runtime-state.mjs";
+import { evaluateOpenAiTunnelLaunchState, openAiTunnelLaunchFingerprint, waitForTunnelPortRelease } from "./tunnel-state.mjs";
 import { configuredPrimaryWorkspaceRootsFromEnv, configuredWorkspaceRootsFromEnv } from "./workspace-scope.mjs";
 import {
   atomicWriteFile,
@@ -54,6 +55,7 @@ const MANAGER_RUNTIME_FILES = [
   path.join(__dirname, "log-utils.mjs"),
   path.join(__dirname, "safe-delete.mjs"),
   path.join(__dirname, "runtime-state.mjs"),
+  path.join(__dirname, "tunnel-state.mjs"),
   path.join(__dirname, "workspace-scope.mjs"),
 ];
 const ENV_PATH = path.join(ROOT, ".env");
@@ -704,6 +706,14 @@ async function readInstanceConfig(name) {
   });
   delete config.connectorName;
   return config;
+}
+
+function publicInstanceConfig(config) {
+  return {
+    lastTunnelUrl: String(config?.lastTunnelUrl || ""),
+    healthPort: Number(config?.healthPort || 8080),
+    autoStart: config?.autoStart !== false,
+  };
 }
 
 async function writeInstanceConfig(name, config) {
@@ -1558,14 +1568,18 @@ async function restartServer(name) {
 }
 
 
-async function tunnelStatus(name) {
-  const env = await readInstanceEnv(name);
+async function tunnelStatus(name, desiredEnv = null) {
+  const env = desiredEnv || (await readInstanceEnv(name));
   const config = await readInstanceConfig(name);
   const inst = instPaths(name);
   const tunnelId = env.OPENAI_TUNNEL_ID || "";
   const apiKey = env.OPENAI_TUNNEL_API_KEY || "";
   const mode = tunnelId && apiKey ? "openai" : "cloudflare";
-  const healthPort = Number(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 0);
+  const healthPort = Number(
+    desiredEnv
+      ? (env.OPENAI_TUNNEL_HEALTH_PORT || config.healthPort || 0)
+      : (config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 0)
+  );
   const healthPortValid = Number.isInteger(healthPort) && healthPort > 0 && healthPort < 65536;
   const controlPlaneUrl = tunnelId ? `https://api.openai.com/v1/tunnel/${tunnelId}` : null;
   const oaPortOpen = healthPortValid ? await isPortOpen(healthPort) : false;
@@ -1576,6 +1590,19 @@ async function tunnelStatus(name) {
     ? pidsWithCmdLine("cloudflared.exe", `localhost:${serverPort}`)
     : [];
   const savedPid = await readPidFile(inst.tunnelPid);
+  const desiredOaFingerprint = mode === "openai"
+    ? openAiTunnelLaunchFingerprint({ tunnelId, apiKey, healthPort, serverPort })
+    : null;
+  const oaLaunchState = oaPids.length > 0
+    ? evaluateOpenAiTunnelLaunchState({
+        mode,
+        healthy: oaHealthy,
+        processPids: oaPids,
+        savedPid,
+        savedFingerprint: config.openaiTunnelLaunchFingerprint,
+        desiredFingerprint: desiredOaFingerprint,
+      })
+    : null;
   const localCfPids = savedPid ? pidsWithCmdLine("cloudflared.exe", "localhost:") : [];
   const savedCfRunning = Boolean(savedPid && isPidAlive(savedPid) && localCfPids.includes(savedPid));
   const desiredCfPid = desiredCfPids[0] || null;
@@ -1595,6 +1622,8 @@ async function tunnelStatus(name) {
       owned: true,
       configDrift: true,
       ambiguous: true,
+      duplicateProcesses: oaPids.length > 1,
+      pids: oaPids.length > 1 ? oaPids : undefined,
       healthPort,
       cloudflaredExists,
       invalidConfig: !healthPortValid,
@@ -1602,7 +1631,7 @@ async function tunnelStatus(name) {
     };
   }
   if (oaPids.length > 0) {
-    const desired = mode === "openai" && oaHealthy;
+    const desired = oaLaunchState?.desired === true;
     return {
       running: true,
       mode,
@@ -1610,7 +1639,12 @@ async function tunnelStatus(name) {
       kind: "openai",
       pid: oaPids[0],
       owned: true,
-      configDrift: !desired,
+      configDrift: oaLaunchState?.configDrift !== false,
+      ambiguous: oaLaunchState?.ambiguous === true,
+      duplicateProcesses: oaLaunchState?.duplicateProcesses === true,
+      pids: oaLaunchState?.duplicateProcesses ? oaLaunchState.pids : undefined,
+      launchPidMatch: oaLaunchState?.pidMatch === true,
+      launchFingerprintMatch: oaLaunchState?.fingerprintMatch === true,
       healthy: oaHealthy,
       url: desired ? controlPlaneUrl : config.lastTunnelUrl || null,
       healthPort,
@@ -1814,32 +1848,66 @@ async function startTunnelUnlocked(name) {
     ].join("\n");
     await fsp.mkdir(inst.dir, { recursive: true });
     await atomicWriteFile(profileFile, yaml, "utf8");
+    const launchFingerprint = openAiTunnelLaunchFingerprint({
+      tunnelId: env.OPENAI_TUNNEL_ID,
+      apiKey: env.OPENAI_TUNNEL_API_KEY,
+      healthPort,
+      serverPort: port,
+    });
+    await updateInstanceConfig(name, (config) => {
+      config.openaiTunnelLaunchFingerprint = launchFingerprint;
+    });
     await writePidFile(inst.tunnelPid, null);
 
     await fsp.writeFile(inst.tunnelLog, "");
-    spawnDetached(client.path, ["run", "--profile-file", profileFile], inst.tunnelLog, {
+    const pid = spawnDetached(client.path, ["run", "--profile-file", profileFile], inst.tunnelLog, {
       OPENAI_TUNNEL_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_API_KEY: env.OPENAI_TUNNEL_API_KEY,
       CONTROL_PLANE_TUNNEL_ID: env.OPENAI_TUNNEL_ID,
     });
+    if (!Number.isInteger(pid) || pid <= 0) {
+      await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
+      await writePidFile(inst.tunnelPid, null);
+      return { ok: false, error: "OpenAI tunnel process did not return a valid PID; startup was not accepted." };
+    }
+    await writePidFile(inst.tunnelPid, pid);
     invalidateProcessScanCache();
     const up = await waitFor(() => tunnelClientHealth(healthPort), 45000);
     if (!up) {
-      for (const p of pidsWithCmdLine("tunnel-client.exe", profileFile)) killPidTree(p);
+      const targets = pidsWithCmdLine("tunnel-client.exe", profileFile).filter(isPidAlive);
+      for (const p of targets) killPidTree(p);
       invalidateProcessScanCache();
-      await writePidFile(inst.tunnelPid, null);
+      const stopped = await waitFor(() => targets.every((p) => !isPidAlive(p)), 10000, 150);
+      await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
+      if (stopped) {
+        await writePidFile(inst.tunnelPid, null);
+      } else {
+        const survivors = targets.filter(isPidAlive);
+        await writePidFile(inst.tunnelPid, survivors[0] || pid);
+      }
       const tail = await tailFile(inst.tunnelLog);
-      return { ok: false, error: "OpenAI tunnel không khởi động được. Log cuối:\n" + tail.slice(-1500) };
+      return {
+        ok: false,
+        error: "OpenAI tunnel không khởi động được."
+          + (stopped ? "" : " Managed tunnel process is still alive; PID metadata was preserved for a safe stop/retry.")
+          + " Log cuối:\n" + tail.slice(-1500),
+        pid: stopped ? null : (targets.find(isPidAlive) || pid),
+        cleanupFailed: !stopped,
+      };
     }
     const tunnelUrl = `https://api.openai.com/v1/tunnel/${env.OPENAI_TUNNEL_ID}`;
-    await updateInstanceConfig(name, (config) => { config.lastTunnelUrl = tunnelUrl; });
-    return { ok: true, mode: "openai", tunnelId: env.OPENAI_TUNNEL_ID, healthPort, url: tunnelUrl };
+    await updateInstanceConfig(name, (config) => {
+      config.lastTunnelUrl = tunnelUrl;
+      config.openaiTunnelLaunchFingerprint = launchFingerprint;
+    });
+    return { ok: true, mode: "openai", tunnelId: env.OPENAI_TUNNEL_ID, healthPort, url: tunnelUrl, pid };
   }
 
   // cloudflare
   if (!fs.existsSync(CLOUDFLARED)) {
     return { ok: false, error: "NO_CLOUDFLARED", hint: "Chưa có cloudflared — bấm 'Tải cloudflared' trong thẻ Tunnel." };
   }
+  await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
   await fsp.writeFile(inst.tunnelLog, "");
   const pid = spawnDetached(CLOUDFLARED, ["tunnel", "--url", `http://localhost:${port}`], inst.tunnelLog);
   invalidateProcessScanCache();
@@ -1873,8 +1941,12 @@ async function startTunnelUnlocked(name) {
 
 async function stopTunnelUnlocked(name) {
   const st = await tunnelStatus(name);
-  if (!st.running) return { ok: true, alreadyStopped: true, mode: st.mode };
   const inst = instPaths(name);
+  if (!st.running) {
+    await writePidFile(inst.tunnelPid, null);
+    await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
+    return { ok: true, alreadyStopped: true, mode: st.mode };
+  }
   if (!st.owned) {
     return {
       ok: false,
@@ -1895,8 +1967,34 @@ async function stopTunnelUnlocked(name) {
   if (!stopped) {
     return { ok: false, mode: st.mode, stopped: false, error: "Managed Tunnel process did not stop within 10 seconds; PID metadata was preserved for a safe retry." };
   }
+  const needsHealthPortRelease = (st.kind === "openai" || st.kind === "mixed")
+    && Number.isInteger(Number(st.healthPort))
+    && Number(st.healthPort) > 0
+    && Number(st.healthPort) < 65536;
+  const portReleased = !needsHealthPortRelease || await waitForTunnelPortRelease({
+    port: Number(st.healthPort),
+    isPortOpen,
+    timeoutMs: 5000,
+    intervalMs: 100,
+  });
   await writePidFile(inst.tunnelPid, null);
-  return { ok: true, mode: st.mode, kind: st.kind, stopped: true, forced: killed };
+  await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
+  if (!portReleased) {
+    invalidatePortPidCache();
+    const portPid = pidOnPort(Number(st.healthPort));
+    return {
+      ok: false,
+      mode: st.mode,
+      kind: st.kind,
+      stopped: true,
+      forced: killed,
+      portReleased: false,
+      healthPort: Number(st.healthPort),
+      portPid,
+      error: `Managed Tunnel process exited but health port ${st.healthPort} did not release within 5 seconds${portPid ? ` (current listener PID ${portPid})` : ""}; refusing immediate restart.`,
+    };
+  }
+  return { ok: true, mode: st.mode, kind: st.kind, stopped: true, forced: killed, portReleased: true };
 }
 
 async function startTunnel(name) {
@@ -1914,7 +2012,7 @@ async function restartTunnel(name) {
     if (!stopped.ok) return { ...stopped, restarted: false };
     const started = await startTunnelUnlocked(name);
     if (!started.ok) return { ...started, restarted: false, stop: stopped };
-    return { ...started, ok: true, restarted: true, previousMode: before.mode };
+    return { ...started, ok: true, restarted: true, previousMode: before.mode, stop: stopped };
   });
 }
 
@@ -2264,7 +2362,16 @@ async function checkConfig(name, overrides) {
           ? `Cổng ${st.port} đang bị process khác chiếm${st.pid ? ` (PID ${st.pid})` : ""}`
           : `Chưa chạy (cổng ${st.port})`
   );
-  const tun = await tunnelStatus(name);
+  const tun = await tunnelStatus(name, env);
+  if (tun.running && tun.configDrift) {
+    push(
+      false,
+      "Tunnel",
+      tun.ambiguous
+        ? `OpenAI Tunnel có ${tun.pids?.length || 2} process dùng cùng profile — phải dừng và khởi động lại để khôi phục ownership duy nhất.`
+        : "Tunnel đang chạy với launch configuration khác cấu hình đang kiểm tra — cần restart Tunnel sau khi lưu."
+    );
+  }
   if (tun.mode === "openai" && tun.portOccupied) {
     push(false, "Tunnel health port", `Port ${tun.healthPort} đang mở nhưng không phải tunnel-client`);
   }
@@ -2841,13 +2948,15 @@ async function handleApi(req, res, url, body) {
     }
     if (req.method === "PUT" && sub === "/env") return json(res, 200, await saveInstanceEnv(name, body));
 
-    if (req.method === "GET" && sub === "/config") return json(res, 200, { ok: true, ...(await readInstanceConfig(name)) });
+    if (req.method === "GET" && sub === "/config") {
+      return json(res, 200, { ok: true, ...publicInstanceConfig(await readInstanceConfig(name)) });
+    }
     if (req.method === "PUT" && sub === "/config") {
       const config = await updateInstanceConfig(name, (config) => {
         if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
         if (typeof body.autoStart === "boolean") config.autoStart = body.autoStart;
       });
-      return json(res, 200, { ok: true, config });
+      return json(res, 200, { ok: true, config: publicInstanceConfig(config) });
     }
 
     if (req.method === "POST" && sub === "/check") return json(res, 200, await checkConfigRequest(name, body));
@@ -2954,14 +3063,14 @@ async function handleApi(req, res, url, body) {
   }
 
   if (req.method === "GET" && p === "/api/config") {
-    return json(res, 200, { ok: true, ...(await readInstanceConfig(dname)) });
+    return json(res, 200, { ok: true, ...publicInstanceConfig(await readInstanceConfig(dname)) });
   }
 
   if (req.method === "PUT" && p === "/api/config") {
     const config = await updateInstanceConfig(dname, (config) => {
       if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
     });
-    return json(res, 200, { ok: true, config });
+    return json(res, 200, { ok: true, config: publicInstanceConfig(config) });
   }
 
   if (req.method === "GET" && p === "/api/profiles") {

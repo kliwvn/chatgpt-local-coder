@@ -202,12 +202,19 @@ function renderServerTunnel(s) {
   // tunnel
   const tun = s.tunnel;
   const tunnelConflict = Boolean(tun.portOccupied);
-  setDot("tunnel-dot", tun.running, tun.running ? "Đang chạy" : tunnelConflict ? "Xung đột cổng" : "Dừng");
-  setDot("inst-tunnel-dot", tun.running, tun.running ? "Tunnel: chạy" : tunnelConflict ? "Tunnel: xung đột cổng" : "Tunnel: dừng");
+  const tunnelConfigDrift = Boolean(tun.configDrift);
+  const tunnelCurrent = tun.running && !tunnelConfigDrift;
+  setDot("tunnel-dot", tunnelCurrent, tun.running ? (tunnelConfigDrift ? "Đang chạy • cấu hình cũ" : "Đang chạy") : tunnelConflict ? "Xung đột cổng" : "Dừng");
+  setDot("inst-tunnel-dot", tunnelCurrent, tun.running ? (tunnelConfigDrift ? "Tunnel: cấu hình cũ" : "Tunnel: chạy") : tunnelConflict ? "Tunnel: xung đột cổng" : "Tunnel: dừng");
   $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
   $("btn-tunnel").disabled = busy || tunnelConflict || (!tun.running && (artifactDrift || buildDrift));
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
-  if (tun.running && tun.url) {
+  if (tun.running && tunnelConfigDrift) {
+    $("tunnel-detail").textContent = tun.ambiguous
+      ? `${mode} có nhiều process cùng profile — Tắt rồi Bật lại Tunnel để khôi phục ownership duy nhất.`
+      : `${mode} đang chạy bằng cấu hình/launch cũ — Tắt rồi Bật lại Tunnel để áp dụng cấu hình hiện tại.`;
+    $("btn-copy-url").classList.add("hidden");
+  } else if (tun.running && tun.url) {
     $("tunnel-detail").innerHTML = `${esc(mode)} • URL: <b class="mono">${esc(tun.url)}</b>`;
     $("btn-copy-url").classList.remove("hidden");
   } else if (tun.running && tun.mode === "openai") {
@@ -381,9 +388,12 @@ async function loadInstances(initial) {
         const artifactDrift = Boolean(i.server.artifactDrift);
         const buildDrift = Boolean(i.server.buildDrift);
         const configDrift = Boolean(i.server.configDrift);
+        const tunnelConfigDrift = Boolean(i.tunnel.configDrift);
+        const tunnelCurrent = tun && !tunnelConfigDrift;
+        const tunnelState = tun ? (tunnelConfigDrift ? "Tunnel cấu hình cũ" : "Tunnel chạy") : "Tunnel dừng";
         const stateTxt = srv
-          ? `<span class="status-dot ${artifactDrift || buildDrift || configDrift ? "bad" : "ok"}"></span>${buildDrift ? "Source chưa build" : artifactDrift ? "Server cần restart" : configDrift ? "Server cấu hình cũ" : "Server chạy"} <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`
-          : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tun ? "ok" : "bad"}"></span>Tunnel ${tun ? "chạy" : "dừng"}`;
+          ? `<span class="status-dot ${artifactDrift || buildDrift || configDrift ? "bad" : "ok"}"></span>${buildDrift ? "Source chưa build" : artifactDrift ? "Server cần restart" : configDrift ? "Server cấu hình cũ" : "Server chạy"} <span class="status-dot ${tunnelCurrent ? "ok" : "bad"}"></span>${tunnelState}`
+          : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tunnelCurrent ? "ok" : "bad"}"></span>${tunnelState}`;
         const wsWarn = i.workspaceMissing
           ? `<div class="inst-warn" title="${esc(i.env.WORKSPACE_PATH || "")}">⚠ WORKSPACE_PATH không tồn tại trên máy này — sửa trong Cấu hình</div>`
           : !i.workspaceScope || !i.workspaceScope.ok
