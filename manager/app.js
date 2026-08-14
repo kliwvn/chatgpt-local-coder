@@ -203,16 +203,28 @@ function renderServerTunnel(s) {
   const tun = s.tunnel;
   const tunnelConflict = Boolean(tun.portOccupied);
   const tunnelConfigDrift = Boolean(tun.configDrift);
-  const tunnelCurrent = tun.running && !tunnelConfigDrift;
-  setDot("tunnel-dot", tunnelCurrent, tun.running ? (tunnelConfigDrift ? "Đang chạy • cấu hình cũ" : "Đang chạy") : tunnelConflict ? "Xung đột cổng" : "Dừng");
-  setDot("inst-tunnel-dot", tunnelCurrent, tun.running ? (tunnelConfigDrift ? "Tunnel: cấu hình cũ" : "Tunnel: chạy") : tunnelConflict ? "Tunnel: xung đột cổng" : "Tunnel: dừng");
+  const tunnelHealthDrift = Boolean(tun.healthDrift);
+  const tunnelCurrent = tun.running && !tunnelConfigDrift && !tunnelHealthDrift;
+  const tunnelFocusedLabel = tun.running
+    ? (tunnelConfigDrift ? "Đang chạy • cấu hình cũ" : tunnelHealthDrift ? "Đang chạy • health lỗi" : "Đang chạy")
+    : tunnelConflict ? "Xung đột cổng" : "Dừng";
+  const tunnelInstanceLabel = tun.running
+    ? (tunnelConfigDrift ? "Tunnel: cấu hình cũ" : tunnelHealthDrift ? "Tunnel: health lỗi" : "Tunnel: chạy")
+    : tunnelConflict ? "Tunnel: xung đột cổng" : "Tunnel: dừng";
+  setDot("tunnel-dot", tunnelCurrent, tunnelFocusedLabel);
+  setDot("inst-tunnel-dot", tunnelCurrent, tunnelInstanceLabel);
   $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
   $("btn-tunnel").disabled = busy || tunnelConflict || (!tun.running && (artifactDrift || buildDrift));
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
   if (tun.running && tunnelConfigDrift) {
-    $("tunnel-detail").textContent = tun.ambiguous
-      ? `${mode} có nhiều process cùng profile — Tắt rồi Bật lại Tunnel để khôi phục ownership duy nhất.`
-      : `${mode} đang chạy bằng cấu hình/launch cũ — Tắt rồi Bật lại Tunnel để áp dụng cấu hình hiện tại.`;
+    $("tunnel-detail").textContent = tun.kind === "mixed"
+      ? `Phát hiện đồng thời OpenAI tunnel-client và cloudflared — Tắt trạng thái mixed rồi Bật lại Tunnel.`
+      : tun.ambiguous
+        ? `${mode} có nhiều process cùng profile — Tắt rồi Bật lại Tunnel để khôi phục ownership duy nhất.`
+        : `${mode} đang chạy bằng cấu hình/launch cũ — Tắt rồi Bật lại Tunnel để áp dụng cấu hình hiện tại.`;
+    $("btn-copy-url").classList.add("hidden");
+  } else if (tun.running && tunnelHealthDrift) {
+    $("tunnel-detail").textContent = `${mode} đúng launch identity nhưng health endpoint ${tun.healthPort} không phản hồi — kiểm tra/restart Tunnel.`;
     $("btn-copy-url").classList.add("hidden");
   } else if (tun.running && tun.url) {
     $("tunnel-detail").innerHTML = `${esc(mode)} • URL: <b class="mono">${esc(tun.url)}</b>`;
@@ -389,8 +401,11 @@ async function loadInstances(initial) {
         const buildDrift = Boolean(i.server.buildDrift);
         const configDrift = Boolean(i.server.configDrift);
         const tunnelConfigDrift = Boolean(i.tunnel.configDrift);
-        const tunnelCurrent = tun && !tunnelConfigDrift;
-        const tunnelState = tun ? (tunnelConfigDrift ? "Tunnel cấu hình cũ" : "Tunnel chạy") : "Tunnel dừng";
+        const tunnelHealthDrift = Boolean(i.tunnel.healthDrift);
+        const tunnelCurrent = tun && !tunnelConfigDrift && !tunnelHealthDrift;
+        const tunnelState = tun
+          ? (tunnelConfigDrift ? "Tunnel cấu hình cũ" : tunnelHealthDrift ? "Tunnel health lỗi" : "Tunnel chạy")
+          : "Tunnel dừng";
         const stateTxt = srv
           ? `<span class="status-dot ${artifactDrift || buildDrift || configDrift ? "bad" : "ok"}"></span>${buildDrift ? "Source chưa build" : artifactDrift ? "Server cần restart" : configDrift ? "Server cấu hình cũ" : "Server chạy"} <span class="status-dot ${tunnelCurrent ? "ok" : "bad"}"></span>${tunnelState}`
           : `<span class="status-dot bad"></span>Server dừng <span class="status-dot ${tunnelCurrent ? "ok" : "bad"}"></span>${tunnelState}`;

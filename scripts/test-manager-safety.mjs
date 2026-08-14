@@ -125,7 +125,7 @@ await fs.writeFile(path.join(demo, ".env"), [
   "MCP_MAX_SESSIONS=64",
   "",
 ].join("\n"));
-await fs.writeFile(path.join(demo, "config.json"), JSON.stringify({ connectorName: "legacy-must-be-removed", healthPort: fakeTunnelPort, autoStart: false, openaiTunnelLaunchFingerprint: "a".repeat(64) }));
+await fs.writeFile(path.join(demo, "config.json"), JSON.stringify({ connectorName: "legacy-must-be-removed", healthPort: fakeTunnelPort, autoStart: false, openaiTunnelLaunchFingerprint: "a".repeat(64), tunnelProcessStartedAt: "2026-08-14T12:00:00.0000000Z" }));
 await fs.writeFile(path.join(legacyNoId, ".env"), [
   `PORT=${legacyNoIdPort}`,
   `ADMIN_PORT=${legacyNoIdAdminPort}`,
@@ -236,14 +236,19 @@ try {
 
   const instanceConfigGet = (await api("/api/instances/demo/config")).body;
   assert.equal(Object.prototype.hasOwnProperty.call(instanceConfigGet, "openaiTunnelLaunchFingerprint"), false, "instance config GET must not expose internal tunnel launch fingerprint");
+  assert.equal(Object.prototype.hasOwnProperty.call(instanceConfigGet, "tunnelProcessStartedAt"), false, "instance config GET must not expose internal tunnel process identity");
   const legacyConfigGet = (await api("/api/config")).body;
   assert.equal(Object.prototype.hasOwnProperty.call(legacyConfigGet, "openaiTunnelLaunchFingerprint"), false, "legacy config GET must not expose internal tunnel launch fingerprint");
+  assert.equal(Object.prototype.hasOwnProperty.call(legacyConfigGet, "tunnelProcessStartedAt"), false, "legacy config GET must not expose internal tunnel process identity");
   const instanceConfigPut = (await put("/api/instances/demo/config", { autoStart: false })).body;
   assert.equal(Object.prototype.hasOwnProperty.call(instanceConfigPut.config || {}, "openaiTunnelLaunchFingerprint"), false, "instance config PUT response must not expose internal tunnel launch fingerprint");
+  assert.equal(Object.prototype.hasOwnProperty.call(instanceConfigPut.config || {}, "tunnelProcessStartedAt"), false, "instance config PUT response must not expose internal tunnel process identity");
   const legacyConfigPut = (await put("/api/config", { lastTunnelUrl: "" })).body;
   assert.equal(Object.prototype.hasOwnProperty.call(legacyConfigPut.config || {}, "openaiTunnelLaunchFingerprint"), false, "legacy config PUT response must not expose internal tunnel launch fingerprint");
+  assert.equal(Object.prototype.hasOwnProperty.call(legacyConfigPut.config || {}, "tunnelProcessStartedAt"), false, "legacy config PUT response must not expose internal tunnel process identity");
   const internalConfigDisk = JSON.parse(await fs.readFile(path.join(demo, "config.json"), "utf8"));
   assert.equal(internalConfigDisk.openaiTunnelLaunchFingerprint, "a".repeat(64), "public config scrubbing must not destroy internal launch evidence");
+  assert.equal(internalConfigDisk.tunnelProcessStartedAt, "2026-08-14T12:00:00.0000000Z", "public config scrubbing must preserve internal tunnel process identity");
 
   // Emulate the browser Raw editor exactly: all secrets are sent back as the
   // sentinel, while a non-secret value that happens to equal eight stars must
@@ -405,26 +410,58 @@ try {
   assert.match(managerServerSource, /isRuntimeArtifactStale\([\s\S]{0,160}?instructions\?\.loaded_at[\s\S]{0,160}?buildState\.newestArtifactMtimeMs/, "Manager status must compare running Local Coder Server startup time against the newest compiled runtime module");
   assert.match(managerServerSource, /inspectRuntimeBuildFreshness/, "Manager must compare source freshness against the complete compiled runtime tree");
   assert.match(managerServerSource, /async function restartServer[\s\S]{0,420}?runtimeBuildStatus\(true\)[\s\S]{0,420}?sourceNewerThanBuild[\s\S]{0,420}?stopServerUnlocked/, "Local Coder Server restart must refuse stale source before stopping the live process");
-  assert.match(managerServerSource, /startTunnelUnlocked[\s\S]{0,1800}?serverState\.buildDrift \|\| serverState\.artifactDrift/, "Tunnel start must refuse to expose a stale Local Coder Server contract");
+  assert.match(managerServerSource, /const serverState = await serverStatus\(name\);[\s\S]{0,1200}?serverState\.buildDrift \|\| serverState\.artifactDrift/, "Tunnel start must refuse to expose a stale Local Coder Server contract");
   assert.match(managerServerSource, /MANAGER_RUNTIME_FILES/, "Manager must track the source modules that require self-restart after modification");
   assert.match(managerServerSource, /tunnel-state\.mjs/, "Manager self-drift tracking must include tunnel launch-state logic");
   assert.match(managerServerSource, /managerRuntimeStatus\(\)/, "Manager must expose self artifact drift status");
   assert.match(managerServerSource, /!st\.portOccupied && !st\.invalidConfig && !st\.configDrift && !st\.artifactDrift && !st\.buildDrift/, "configuration check must not report stale saved config/source/build/runtime state as healthy");
   assert.match(managerServerSource, /openAiTunnelLaunchFingerprint\(\{[\s\S]{0,220}?tunnelId[\s\S]{0,220}?apiKey[\s\S]{0,220}?healthPort[\s\S]{0,220}?serverPort/, "OpenAI tunnel status/start must bind ID, secret, health port and server port into secret-safe launch evidence");
-  assert.match(managerServerSource, /evaluateOpenAiTunnelLaunchState\(\{[\s\S]{0,260}?processPids:\s*oaPids[\s\S]{0,220}?savedPid[\s\S]{0,220}?savedFingerprint/, "OpenAI tunnel status must require exact process PID plus persisted launch fingerprint");
+  assert.match(managerServerSource, /CreationDate\.ToUniversalTime\(\)\.ToString\('o'\)/, "Manager process scan must capture Windows CreationDate without an additional scan path");
+  assert.match(managerServerSource, /\$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process/, "CIM process identity scan must convert PowerShell non-terminating errors into a failed scan");
+  assert.match(managerServerSource, /result\.error \|\| result\.status !== 0[\s\S]{0,420}?PROCESS_IDENTITY_SCAN_FAILED/, "failed process identity scans must fail closed instead of masquerading as zero matching processes");
+  assert.match(managerServerSource, /catch \(err\) \{[\s\S]{0,140}?PROCESS_IDENTITY_SCAN_FAILED/, "process identity scan exceptions must propagate as an explicit lifecycle/status failure");
+  assert.doesNotMatch(managerServerSource, /catch\s*\{\s*processes\s*=\s*\[\]/, "process identity scan failure must never be cached as an empty successful scan");
+  assert.match(managerServerSource, /evaluateOpenAiTunnelLaunchState\(\{[\s\S]{0,360}?processPids:\s*oaPids[\s\S]{0,220}?processStartedAt:\s*oaProcessStartedAt[\s\S]{0,220}?savedPid[\s\S]{0,220}?savedProcessStartedAt/, "OpenAI tunnel status must bind PID plus process CreationDate before accepting launch ownership");
+  assert.match(managerServerSource, /legacyPidFileMatchesProcessStart\(\{[\s\S]{0,180}?processStartedAt:[\s\S]{0,120}?pidFileMtimeMs/, "previous-contract tunnel ownership must be recoverable only through bounded PID-file mtime versus CreationDate evidence");
+  assert.match(managerServerSource, /legacyOaProcessIdentity = Boolean\([\s\S]{0,700}?openaiTunnelLaunchFingerprint[\s\S]{0,300}?persistedOaFingerprint/, "legacy OpenAI ownership bridge must also require the persisted launch fingerprint to match current saved config");
+  assert.match(managerServerSource, /managedOaPid = exactOaProcessIdentity \|\| legacyOaProcessIdentity \? savedPid : null/, "legacy evidence may grant stop/restart ownership without pretending CreationDate was already persisted");
+  assert.match(managerServerSource, /clearTunnelLaunchEvidence\(config\)[\s\S]{0,360}?config\.openaiTunnelLaunchFingerprint = launchFingerprint[\s\S]{0,600}?spawnDetached\(client\.path/, "OpenAI tunnel start must persist a pending secret-safe fingerprint before spawn so a Manager crash cannot orphan the exact child");
   assert.match(managerServerSource, /const pid = spawnDetached\(client\.path[\s\S]{0,1200}?writePidFile\(inst\.tunnelPid, pid\)/, "OpenAI tunnel start must persist the exact spawned PID instead of relying on profile-path discovery alone");
+  assert.match(managerServerSource, /processesWithCmdLine\("tunnel-client\.exe", profileFile\)[\s\S]{0,320}?\.find\(\(process\) => process\.pid === pid\)[\s\S]{0,220}?processStartedAt = processIdentity\.startedAt/, "OpenAI tunnel start must capture CreationDate for the exact spawned PID");
+  assert.match(managerServerSource, /config\.openaiTunnelLaunchFingerprint = launchFingerprint;[\s\S]{0,120}?config\.tunnelProcessStartedAt = processStartedAt;[\s\S]{0,220}?const up = await waitFor/, "OpenAI tunnel must persist exact fingerprint+CreationDate before waiting for network health");
+  assert.match(managerServerSource, /if \(!up\)[\s\S]{0,900}?if \(stopped\)[\s\S]{0,220}?clearTunnelLaunchEvidence[\s\S]{0,420}?else \{[\s\S]{0,360}?writePidFile\(inst\.tunnelPid, survivors\[0\] \|\| pid\)/, "OpenAI health cleanup must clear identity only after confirmed exit and preserve evidence for a survivor");
+  assert.match(managerServerSource, /processesWithCmdLine\("cloudflared\.exe", `localhost:\$\{port\}`\)[\s\S]{0,320}?\.find\(\(process\) => process\.pid === pid\)[\s\S]{0,220}?processStartedAt = processIdentity\.startedAt/, "Cloudflare tunnel start must capture CreationDate for the exact spawned PID");
+  assert.match(managerServerSource, /config\.tunnelProcessStartedAt = processStartedAt;[\s\S]{0,220}?let url = null;[\s\S]{0,220}?const deadline = Date\.now\(\) \+ 25000/, "Cloudflare must persist CreationDate before waiting for public URL discovery");
+  assert.match(managerServerSource, /if \(!url\)[\s\S]{0,520}?if \(stopped\)[\s\S]{0,220}?clearTunnelLaunchEvidence[\s\S]{0,360}?else \{[\s\S]{0,260}?writePidFile\(inst\.tunnelPid, pid\)/, "Cloudflare URL cleanup must preserve CreationDate/PID evidence for a survivor");
+  assert.ok((managerServerSource.match(/config\.tunnelProcessStartedAt = processStartedAt/g) || []).length >= 2, "successful OpenAI and Cloudflare starts must persist process CreationDate");
+  assert.match(managerServerSource, /const targets = new Set\(\);[\s\S]{0,240}?st\.ownedOpenAiPid[\s\S]{0,240}?st\.ownedCloudflarePid/, "Tunnel stop must target only exact process identities proven owned by Manager state");
+  assert.doesNotMatch(managerServerSource, /const targets = new Set\(pidsWithCmdLine\("tunnel-client\.exe", inst\.profile\)/, "Tunnel stop must never kill every same-profile OpenAI process");
+  assert.match(managerServerSource, /const targets = isPidAlive\(pid\) \? \[pid\] : \[\]/, "failed OpenAI startup cleanup must kill only the exact PID it spawned");
+  assert.match(managerServerSource, /const desiredCfProcesses = Number\.isInteger\(serverPort\)[\s\S]{0,280}?processesWithCmdLine\("cloudflared\.exe", `localhost:\$\{serverPort\}`\)/, "Tunnel status must detect same-port cloudflared even when OpenAI mode is configured");
+  assert.match(managerServerSource, /const cfCandidatePids = \[\.\.\.new Set\(\[[\s\S]{0,220}?\.\.\.desiredCfPids[\s\S]{0,120}?\.\.\.persistedCfPids[\s\S]{0,180}?savedCfProcess/, "mixed detection must include proposed port, persisted port, and exact saved-PID Cloudflare candidates");
+  assert.match(managerServerSource, /if \(oaPids\.length > 0 && cfCandidatePids\.length > 0\)[\s\S]{0,180}?mixedPids[\s\S]{0,420}?kind:\s*"mixed"/, "OpenAI plus any relevant managed/candidate cloudflared process must enter the mixed-process branch");
+  assert.match(managerServerSource, /kind:\s*"mixed"[\s\S]{0,420}?configDrift:\s*true/, "mixed OpenAI/Cloudflare state must always fail closed as configuration drift");
+  assert.match(managerServerSource, /tun\.kind === "mixed"[\s\S]{0,260}?OpenAI tunnel-client và cloudflared/, "Config Check must diagnose mixed OpenAI+Cloudflare state instead of mislabeling it as same-profile duplication");
+  assert.match(managerServerSource, /const remaining = await tunnelStatus\(name\);[\s\S]{0,420}?remainingUnowned:\s*true/, "Tunnel stop must fail closed when an unowned duplicate/candidate remains after the exact owned PID stops");
   assert.match(managerServerSource, /waitForTunnelPortRelease\(\{[\s\S]{0,260}?port:\s*Number\(st\.healthPort\)[\s\S]{0,180}?isPortOpen/, "Tunnel stop must settle the OpenAI health listener after the managed process tree exits before reporting restart-safe success");
   assert.match(managerServerSource, /if \(!portReleased\)[\s\S]{0,600}?stopped:\s*true[\s\S]{0,260}?portReleased:\s*false/, "Tunnel stop must fail closed when the process exited but its health listener did not release");
   assert.match(managerServerSource, /restarted:\s*true[\s\S]{0,120}?stop:\s*stopped/, "successful Tunnel restart must return the stop settlement receipt so callers can verify process/port release");
   assert.match(managerServerSource, /const tun = await tunnelStatus\(name, env\);[\s\S]{0,300}?tun\.running && tun\.configDrift/, "Config Check must compare a running Tunnel against candidate unsaved config instead of the stale on-disk env");
+  assert.match(managerServerSource, /healthDrift:\s*oaLaunchState\?\.healthDrift === true/, "OpenAI tunnel status must expose operational health drift separately from launch/config drift");
+  assert.match(managerServerSource, /if \(st\.running && st\.healthDrift\)[\s\S]{0,360}?health endpoint is not responding/, "Tunnel start must refuse already-running unhealthy transport instead of false-reporting already healthy");
+  assert.match(managerServerSource, /tun\.running && tun\.healthDrift[\s\S]{0,260}?Tunnel health/, "Config Check must diagnose a matching but unhealthy Tunnel as health drift, not stale launch configuration");
+  assert.match(managerServerSource, /The exact same-profile tunnel-client is known[\s\S]{0,180}?portOccupied:\s*false/, "known same-profile OpenAI process health failure must not be mislabeled as an unrelated port occupant");
   assert.match(managerServerSource, /publicInstanceConfig\(await readInstanceConfig\(name\)\)/, "instance config GET must expose only public config fields");
   assert.match(managerServerSource, /config:\s*publicInstanceConfig\(config\)/, "config mutation responses must not leak internal launch fingerprints");
   assert.match(managerApp, /artifactDrift/, "Manager UI must surface stale runtime artifacts");
   assert.match(managerApp, /configDrift/, "Manager UI must surface a live server using stale saved configuration");
   assert.match(managerApp, /const tunnelConfigDrift = Boolean\(tun\.configDrift\)/, "focused Tunnel status must consume backend launch/config drift instead of treating any live process as healthy");
-  assert.match(managerApp, /const tunnelCurrent = tun\.running && !tunnelConfigDrift/, "focused Tunnel dot must be green only for a current launch configuration");
+  assert.match(managerApp, /const tunnelHealthDrift = Boolean\(tun\.healthDrift\)/, "focused Tunnel status must consume operational health drift separately from launch config drift");
+  assert.match(managerApp, /const tunnelCurrent = tun\.running && !tunnelConfigDrift && !tunnelHealthDrift/, "focused Tunnel dot must be green only when launch identity and operational health are both current");
   assert.match(managerApp, /tun\.running && tunnelConfigDrift[\s\S]{0,520}?btn-copy-url[\s\S]{0,120}?classList\.add\("hidden"\)/, "stale/ambiguous Tunnel state must explain restart and hide the copy-URL action");
-  assert.match(managerApp, /const tunnelConfigDrift = Boolean\(i\.tunnel\.configDrift\)[\s\S]{0,260}?Tunnel cấu hình cũ/, "workspace sidebar must surface Tunnel config drift instead of showing a false-green running state");
+  assert.match(managerApp, /tun\.running && tunnelHealthDrift[\s\S]{0,260}?health endpoint[\s\S]{0,160}?btn-copy-url[\s\S]{0,120}?classList\.add\("hidden"\)/, "unhealthy matching Tunnel must show a health-specific warning and hide copy URL");
+  assert.match(managerApp, /tun\.kind === "mixed"[\s\S]{0,220}?OpenAI tunnel-client và cloudflared/, "focused Tunnel UI must distinguish mixed OpenAI+Cloudflare from same-profile duplicate OpenAI processes");
+  assert.match(managerApp, /const tunnelConfigDrift = Boolean\(i\.tunnel\.configDrift\)[\s\S]{0,180}?const tunnelHealthDrift = Boolean\(i\.tunnel\.healthDrift\)[\s\S]{0,260}?Tunnel health lỗi/, "workspace sidebar must surface health drift separately from configuration drift without false-green status");
   assert.match(managerApp, /btn-server-restart"\)\.disabled = busy \|\| !srv\.running \|\| serverConflict \|\| buildDrift/, "UI must disable restart until stale source has been built");
   assert.match(managerApp, /btn-tunnel"\)\.disabled = busy \|\| tunnelConflict \|\| \(!tun\.running && \(artifactDrift \|\| buildDrift\)\)/, "UI must not allow a stopped Tunnel to expose a stale Local Coder Server");
   assert.match(managerApp, /buildDrift \? "Source chưa build"/, "workspace card must surface source/build drift instead of showing a false-green server state");
@@ -442,9 +479,9 @@ try {
   assert.match(managerServerSource, /if \(!srv\.ok\) \{[\s\S]{0,180}?continue;[\s\S]{0,180}?startTunnel\(name\)/, "autostart must not launch Tunnel after Server start fails");
   assert.match(managerServerSource, /Refusing to stop an unowned .*tunnel/i, "Tunnel stop must fail closed for unowned processes");
   assert.doesNotMatch(managerServerSource, /pidsWithCmdLine\(profileFile\)/, "Tunnel cleanup must include an executable identity and never call the process scanner with only a profile path");
-  assert.match(managerServerSource, /pidsWithCmdLine\("tunnel-client\.exe", profileFile\)/, "OpenAI tunnel cleanup must scope by executable plus the instance-unique profile");
+  assert.match(managerServerSource, /processesWithCmdLine\("tunnel-client\.exe", profileFile\)/, "OpenAI tunnel identity lookup must scope by executable plus the instance-unique profile");
   assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.serverPid, null\)/, "failed Local Coder Server startup must preserve PID metadata until the child is confirmed stopped");
-  assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.tunnelPid, null\)/, "failed cloudflared startup must preserve PID metadata until the child is confirmed stopped");
+  assert.match(managerServerSource, /if \(stopped\) \{[\s\S]{0,220}?writePidFile\(inst\.tunnelPid, null\)[\s\S]{0,420}?else \{[\s\S]{0,420}?writePidFile\(inst\.tunnelPid, pid\)/, "failed tunnel startup must clear PID only after confirmed exit and preserve exact PID evidence for a survivor");
   assert.match(managerServerSource, /chatgpt-local-coder\.bat/, "Manager autostart must reference the single consolidated launcher bat");
   assert.doesNotMatch(managerServerSource, /make-startup-lnk\.ps1|manager-hidden\.ps1/, "autostart must not create auxiliary PowerShell launcher files");
   assert.match(managerServerSource, /workspaceScope\.ok/, "instance bundle must expose workspace-scope validation for self-detection");

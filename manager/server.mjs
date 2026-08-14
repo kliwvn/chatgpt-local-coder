@@ -30,7 +30,7 @@ import { randomUUID } from "node:crypto";
 import { copyTruncateLogFile, isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
 import { recycleManagedDirectory } from "./safe-delete.mjs";
 import { preserveLegacySandboxPolicyManifest, reconcileLegacyRuntimeDirectory, reconcileLegacyShellStateDirectory } from "./runtime-state.mjs";
-import { evaluateOpenAiTunnelLaunchState, openAiTunnelLaunchFingerprint, waitForTunnelPortRelease } from "./tunnel-state.mjs";
+import { evaluateOpenAiTunnelLaunchState, legacyPidFileMatchesProcessStart, openAiTunnelLaunchFingerprint, waitForTunnelPortRelease } from "./tunnel-state.mjs";
 import { configuredPrimaryWorkspaceRootsFromEnv, configuredWorkspaceRootsFromEnv } from "./workspace-scope.mjs";
 import {
   atomicWriteFile,
@@ -716,6 +716,11 @@ function publicInstanceConfig(config) {
   };
 }
 
+function clearTunnelLaunchEvidence(config) {
+  delete config.openaiTunnelLaunchFingerprint;
+  delete config.tunnelProcessStartedAt;
+}
+
 async function writeInstanceConfig(name, config) {
   const next = { ...config };
   delete next.connectorName;
@@ -810,36 +815,57 @@ async function ensureInstances() {
 const pidScanCache = new Map();
 const PID_SCAN_TTL_MS = 2000;
 function invalidateProcessScanCache() { pidScanCache.clear(); }
-/** PIDs của process imageName mà command line chứa substring (phân biệt instance). */
-function pidsWithCmdLine(imageName, substring) {
+/** Process identity records for imageName whose command line contains substring. */
+function processesWithCmdLine(imageName, substring) {
   const now = Date.now();
   pruneExpiredCache(pidScanCache, PID_SCAN_TTL_MS, now);
   const key = `${imageName}\u0000${substring}`;
   const hit = pidScanCache.get(key);
-  if (hit) return hit.pids;
-  let pids = [];
+  if (hit) return hit.processes;
+  let processes = [];
   try {
     const needle = String(substring).replace(/'/g, "''");
     const ps = [
       "-NoProfile",
       "-Command",
-      `Get-CimInstance Win32_Process -Filter "Name='${imageName}'" | Where-Object { $_.CommandLine -like '*${needle}*' } | Select-Object -ExpandProperty ProcessId`,
+      `$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter "Name='${imageName}'" | Where-Object { $_.CommandLine -like '*${needle}*' } | ForEach-Object { [string]$_.ProcessId + '|' + $_.CreationDate.ToUniversalTime().ToString('o') }`,
     ];
-    const out = spawnSync("powershell.exe", ps, {
+    const result = spawnSync("powershell.exe", ps, {
       encoding: "utf8",
       windowsHide: true,
       timeout: 15000,
       maxBuffer: 512 * 1024,
-    }).stdout || "";
-    pids = out
+    });
+    if (result.error || result.status !== 0) {
+      const detail = String(result.stderr || result.stdout || result.error?.message || "unknown process-scan error")
+        .trim()
+        .slice(-300);
+      throw new Error(`PROCESS_IDENTITY_SCAN_FAILED: ${detail}`);
+    }
+    const out = result.stdout || "";
+    processes = out
       .split(/\r?\n/)
-      .map((l) => Number(l.trim()))
-      .filter((p) => Number.isInteger(p) && p > 0);
-  } catch {
-    pids = [];
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const [pidRaw, startedAtRaw] = line.split("|", 2);
+        const pid = Number(pidRaw);
+        const startedAt = String(startedAtRaw || "");
+        if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(Date.parse(startedAt))) {
+          throw new Error("malformed PID/CreationDate record");
+        }
+        return { pid, startedAt };
+      });
+  } catch (err) {
+    throw new Error(`PROCESS_IDENTITY_SCAN_FAILED: ${String(err?.message || err)}`);
   }
-  pidScanCache.set(key, { at: now, pids });
-  return pids;
+  pidScanCache.set(key, { at: now, processes });
+  return processes;
+}
+
+/** PIDs của process imageName mà command line chứa substring (phân biệt instance). */
+function pidsWithCmdLine(imageName, substring) {
+  return processesWithCmdLine(imageName, substring).map((process) => process.pid);
 }
 
 async function serverHealth(port) {
@@ -1570,6 +1596,7 @@ async function restartServer(name) {
 
 async function tunnelStatus(name, desiredEnv = null) {
   const env = desiredEnv || (await readInstanceEnv(name));
+  const persistedEnv = desiredEnv ? await readInstanceEnv(name) : env;
   const config = await readInstanceConfig(name);
   const inst = instPaths(name);
   const tunnelId = env.OPENAI_TUNNEL_ID || "";
@@ -1584,12 +1611,61 @@ async function tunnelStatus(name, desiredEnv = null) {
   const controlPlaneUrl = tunnelId ? `https://api.openai.com/v1/tunnel/${tunnelId}` : null;
   const oaPortOpen = healthPortValid ? await isPortOpen(healthPort) : false;
   const oaHealthy = oaPortOpen ? await tunnelClientHealth(healthPort) : false;
-  const oaPids = pidsWithCmdLine("tunnel-client.exe", inst.profile).filter(isPidAlive);
+  const oaProcesses = processesWithCmdLine("tunnel-client.exe", inst.profile)
+    .filter((process) => isPidAlive(process.pid));
+  const oaPids = oaProcesses.map((process) => process.pid);
+  const oaProcessStartedAt = oaProcesses.length === 1 ? oaProcesses[0].startedAt : null;
   const serverPort = Number(env.PORT || 0);
-  const desiredCfPids = mode === "cloudflare" && Number.isInteger(serverPort)
-    ? pidsWithCmdLine("cloudflared.exe", `localhost:${serverPort}`)
+  const persistedTunnelId = persistedEnv.OPENAI_TUNNEL_ID || "";
+  const persistedApiKey = persistedEnv.OPENAI_TUNNEL_API_KEY || "";
+  const persistedMode = persistedTunnelId && persistedApiKey ? "openai" : "cloudflare";
+  const persistedHealthPort = Number(config.healthPort || persistedEnv.OPENAI_TUNNEL_HEALTH_PORT || 0);
+  const persistedServerPort = Number(persistedEnv.PORT || 0);
+  // Always detect cloudflared processes targeting this instance's server port,
+  // even when OpenAI mode is currently configured. Otherwise an old/unowned
+  // Cloudflare tunnel can coexist with OpenAI and escape mixed-process drift.
+  const desiredCfProcesses = Number.isInteger(serverPort) && serverPort > 0 && serverPort < 65536
+    ? processesWithCmdLine("cloudflared.exe", `localhost:${serverPort}`)
+        .filter((process) => isPidAlive(process.pid))
     : [];
+  const desiredCfPids = desiredCfProcesses.map((process) => process.pid);
+  const persistedCfProcesses = persistedServerPort === serverPort
+    ? desiredCfProcesses
+    : Number.isInteger(persistedServerPort) && persistedServerPort > 0 && persistedServerPort < 65536
+      ? processesWithCmdLine("cloudflared.exe", `localhost:${persistedServerPort}`)
+          .filter((process) => isPidAlive(process.pid))
+      : [];
+  const persistedCfPids = persistedCfProcesses.map((process) => process.pid);
   const savedPid = await readPidFile(inst.tunnelPid);
+  const pidFileStat = savedPid ? await fsp.stat(inst.tunnelPid).catch(() => null) : null;
+  const pidFileMtimeMs = Number(pidFileStat?.mtimeMs);
+  const savedOaProcess = savedPid ? oaProcesses.find((process) => process.pid === savedPid) || null : null;
+  const savedProcessStartedAt = String(config.tunnelProcessStartedAt || "");
+  const exactOaProcessIdentity = Boolean(
+    savedOaProcess
+    && savedProcessStartedAt
+    && savedOaProcess.startedAt === savedProcessStartedAt
+  );
+  const persistedOaFingerprint = persistedMode === "openai"
+    ? openAiTunnelLaunchFingerprint({
+        tunnelId: persistedTunnelId,
+        apiKey: persistedApiKey,
+        healthPort: persistedHealthPort,
+        serverPort: persistedServerPort,
+      })
+    : null;
+  const legacyOaProcessIdentity = Boolean(
+    !savedProcessStartedAt
+    && savedOaProcess
+    && legacyPidFileMatchesProcessStart({
+      processStartedAt: savedOaProcess.startedAt,
+      pidFileMtimeMs,
+    })
+    && typeof config.openaiTunnelLaunchFingerprint === "string"
+    && /^[0-9a-f]{64}$/.test(config.openaiTunnelLaunchFingerprint)
+    && config.openaiTunnelLaunchFingerprint === persistedOaFingerprint
+  );
+  const managedOaPid = exactOaProcessIdentity || legacyOaProcessIdentity ? savedPid : null;
   const desiredOaFingerprint = mode === "openai"
     ? openAiTunnelLaunchFingerprint({ tunnelId, apiKey, healthPort, serverPort })
     : null;
@@ -1598,36 +1674,72 @@ async function tunnelStatus(name, desiredEnv = null) {
         mode,
         healthy: oaHealthy,
         processPids: oaPids,
+        processStartedAt: oaProcessStartedAt,
         savedPid,
+        savedProcessStartedAt: config.tunnelProcessStartedAt,
         savedFingerprint: config.openaiTunnelLaunchFingerprint,
         desiredFingerprint: desiredOaFingerprint,
       })
     : null;
-  const localCfPids = savedPid ? pidsWithCmdLine("cloudflared.exe", "localhost:") : [];
-  const savedCfRunning = Boolean(savedPid && isPidAlive(savedPid) && localCfPids.includes(savedPid));
+  const localCfProcesses = savedPid
+    ? processesWithCmdLine("cloudflared.exe", "localhost:")
+        .filter((process) => isPidAlive(process.pid))
+    : [];
+  const savedCfProcess = savedPid
+    ? localCfProcesses.find((process) => process.pid === savedPid) || null
+    : null;
+  const exactCfProcessIdentity = Boolean(
+    savedCfProcess
+    && savedProcessStartedAt
+    && savedCfProcess.startedAt === savedProcessStartedAt
+  );
+  const legacyCfProcessIdentity = Boolean(
+    !savedProcessStartedAt
+    && savedCfProcess
+    && persistedCfPids.includes(savedPid)
+    && legacyPidFileMatchesProcessStart({
+      processStartedAt: savedCfProcess.startedAt,
+      pidFileMtimeMs,
+    })
+  );
+  const managedCfPid = exactCfProcessIdentity || legacyCfProcessIdentity ? savedPid : null;
+  const savedCfRunning = Boolean(savedCfProcess);
   const desiredCfPid = desiredCfPids[0] || null;
-  const desiredCfOwned = Boolean(savedPid && desiredCfPids.includes(savedPid));
+  const desiredCfOwned = Boolean(managedCfPid && desiredCfPids.includes(managedCfPid));
+  // Mixed detection must cover the proposed/destination port, the persisted
+  // current config, and an exact saved-PID cloudflared process that may still
+  // target an older port after out-of-band config drift.
+  const cfCandidatePids = [...new Set([
+    ...desiredCfPids,
+    ...persistedCfPids,
+    ...(savedCfProcess ? [savedCfProcess.pid] : []),
+  ])];
   const cloudflaredExists = fs.existsSync(CLOUDFLARED);
 
-  // The profile path is instance-unique, so a tunnel-client process carrying it
-  // is safely attributable to this instance even if its current .env changed.
-  // Cloudflared has no profile file, therefore ownership additionally requires
-  // the saved PID to still be a cloudflared local-url tunnel process.
-  if (oaPids.length > 0 && savedCfRunning) {
+  // The profile path identifies candidate OpenAI processes, but ownership is
+  // stronger: exact saved PID + process CreationDate. Cloudflared has no profile file,
+  // so its ownership is saved PID + CreationDate + local-url command target.
+  if (oaPids.length > 0 && cfCandidatePids.length > 0) {
+    const mixedPids = [...new Set([...oaPids, ...cfCandidatePids])];
     return {
       running: true,
       mode,
       kind: "mixed",
-      pid: oaPids[0],
-      owned: true,
+      pid: managedOaPid || managedCfPid || mixedPids[0] || null,
+      owned: Boolean(managedOaPid || managedCfPid),
+      ownedOpenAiPid: managedOaPid,
+      ownedCloudflarePid: managedCfPid,
+      legacyProcessIdentity: legacyOaProcessIdentity || legacyCfProcessIdentity,
       configDrift: true,
       ambiguous: true,
-      duplicateProcesses: oaPids.length > 1,
-      pids: oaPids.length > 1 ? oaPids : undefined,
+      duplicateProcesses: mixedPids.length > 1,
+      pids: mixedPids,
       healthPort,
       cloudflaredExists,
       invalidConfig: !healthPortValid,
-      portOccupied: oaPortOpen && !oaHealthy,
+      // A known same-profile tunnel-client exists; a failed /health probe is
+      // operational health drift, not proof that an unrelated process owns the port.
+      portOccupied: false,
     };
   }
   if (oaPids.length > 0) {
@@ -1637,30 +1749,39 @@ async function tunnelStatus(name, desiredEnv = null) {
       mode,
       tunnelId,
       kind: "openai",
-      pid: oaPids[0],
-      owned: true,
+      pid: managedOaPid || oaPids[0],
+      owned: Boolean(managedOaPid),
+      ownedOpenAiPid: managedOaPid,
+      legacyProcessIdentity: legacyOaProcessIdentity,
       configDrift: oaLaunchState?.configDrift !== false,
+      healthDrift: oaLaunchState?.healthDrift === true,
       ambiguous: oaLaunchState?.ambiguous === true,
       duplicateProcesses: oaLaunchState?.duplicateProcesses === true,
       pids: oaLaunchState?.duplicateProcesses ? oaLaunchState.pids : undefined,
       launchPidMatch: oaLaunchState?.pidMatch === true,
+      launchProcessStartedAtMatch: oaLaunchState?.processStartedAtMatch === true,
       launchFingerprintMatch: oaLaunchState?.fingerprintMatch === true,
       healthy: oaHealthy,
       url: desired ? controlPlaneUrl : config.lastTunnelUrl || null,
       healthPort,
       cloudflaredExists,
       invalidConfig: !healthPortValid,
-      portOccupied: oaPortOpen && !oaHealthy,
+      // The exact same-profile tunnel-client is known. A failed health probe is
+      // health drift, not evidence that an unrelated process owns this port.
+      portOccupied: false,
     };
   }
   if (savedCfRunning) {
-    const desired = mode === "cloudflare" && desiredCfOwned;
+    const desired = mode === "cloudflare" && desiredCfOwned && exactCfProcessIdentity;
     return {
       running: true,
       mode,
       kind: "cloudflare",
-      pid: savedPid,
-      owned: true,
+      pid: managedCfPid || savedPid,
+      owned: Boolean(managedCfPid),
+      ownedCloudflarePid: managedCfPid,
+      legacyProcessIdentity: legacyCfProcessIdentity,
+      launchProcessStartedAtMatch: exactCfProcessIdentity,
       configDrift: !desired,
       url: config.lastTunnelUrl || null,
       healthPort,
@@ -1678,7 +1799,7 @@ async function tunnelStatus(name, desiredEnv = null) {
       kind: "cloudflare",
       pid: desiredCfPid,
       owned: false,
-      configDrift: false,
+      configDrift: true,
       url: config.lastTunnelUrl || null,
       healthPort,
       cloudflaredExists,
@@ -1796,6 +1917,13 @@ async function startTunnelUnlocked(name) {
       ...st,
     };
   }
+  if (st.running && st.healthDrift) {
+    return {
+      ok: false,
+      error: "Managed OpenAI Tunnel process matches the saved launch configuration but its health endpoint is not responding; stop/restart Tunnel instead of treating it as already healthy.",
+      ...st,
+    };
+  }
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
   if (st.invalidConfig) return { ok: false, error: "OPENAI_TUNNEL_HEALTH_PORT is invalid; fix configuration before starting Tunnel." };
   if (st.portOccupied) return { ok: false, error: `Tunnel health port ${st.healthPort} is occupied by another process; refusing to start Tunnel.` };
@@ -1855,6 +1983,10 @@ async function startTunnelUnlocked(name) {
       serverPort: port,
     });
     await updateInstanceConfig(name, (config) => {
+      clearTunnelLaunchEvidence(config);
+      // Persist a pending fingerprint before spawn. Without a persisted
+      // CreationDate this can never become a green/desired launch, but it lets
+      // the bounded legacy bridge recover ownership after a Manager/CIM crash.
       config.openaiTunnelLaunchFingerprint = launchFingerprint;
     });
     await writePidFile(inst.tunnelPid, null);
@@ -1866,22 +1998,61 @@ async function startTunnelUnlocked(name) {
       CONTROL_PLANE_TUNNEL_ID: env.OPENAI_TUNNEL_ID,
     });
     if (!Number.isInteger(pid) || pid <= 0) {
-      await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
+      await updateInstanceConfig(name, clearTunnelLaunchEvidence);
       await writePidFile(inst.tunnelPid, null);
       return { ok: false, error: "OpenAI tunnel process did not return a valid PID; startup was not accepted." };
     }
     await writePidFile(inst.tunnelPid, pid);
     invalidateProcessScanCache();
+    let processStartedAt = null;
+    const identityReady = await waitFor(() => {
+      const processIdentity = processesWithCmdLine("tunnel-client.exe", profileFile)
+        .find((process) => process.pid === pid);
+      if (!processIdentity?.startedAt) return false;
+      processStartedAt = processIdentity.startedAt;
+      return true;
+    }, 5000, 250);
+    if (!identityReady || !processStartedAt) {
+      killPidTree(pid);
+      invalidateProcessScanCache();
+      const stopped = await waitFor(() => !isPidAlive(pid), 10000, 150);
+      if (stopped) {
+        await updateInstanceConfig(name, clearTunnelLaunchEvidence);
+        await writePidFile(inst.tunnelPid, null);
+      } else {
+        // Keep the pending fingerprint + exact spawned PID. Once CIM recovers,
+        // the bounded PID-file-mtime bridge can still prove safe stop ownership.
+        await writePidFile(inst.tunnelPid, pid);
+      }
+      return {
+        ok: false,
+        error: "OpenAI tunnel process started but its Windows CreationDate identity could not be captured; refusing to accept unverifiable tunnel ownership."
+          + (stopped ? "" : ` PID ${pid} is still alive; PID metadata was preserved for a safe stop/retry.`),
+        pid: stopped ? null : pid,
+        cleanupFailed: !stopped,
+      };
+    }
+    // As soon as the OS identity is known, persist it before waiting on network
+    // health. A Manager crash during the health window then leaves exact
+    // PID+CreationDate+fingerprint evidence instead of an unowned live process.
+    await updateInstanceConfig(name, (config) => {
+      config.openaiTunnelLaunchFingerprint = launchFingerprint;
+      config.tunnelProcessStartedAt = processStartedAt;
+    });
     const up = await waitFor(() => tunnelClientHealth(healthPort), 45000);
     if (!up) {
-      const targets = pidsWithCmdLine("tunnel-client.exe", profileFile).filter(isPidAlive);
+      // Startup owns only the exact PID it just spawned. A same-profile process
+      // that appears concurrently is not ours and must never be killed as cleanup.
+      const targets = isPidAlive(pid) ? [pid] : [];
       for (const p of targets) killPidTree(p);
       invalidateProcessScanCache();
       const stopped = await waitFor(() => targets.every((p) => !isPidAlive(p)), 10000, 150);
-      await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
       if (stopped) {
+        await updateInstanceConfig(name, clearTunnelLaunchEvidence);
         await writePidFile(inst.tunnelPid, null);
       } else {
+        // Keep exact fingerprint + CreationDate for a survivor. Clearing them
+        // here would turn a failed cleanup into an unowned process deadlock.
         const survivors = targets.filter(isPidAlive);
         await writePidFile(inst.tunnelPid, survivors[0] || pid);
       }
@@ -1899,6 +2070,7 @@ async function startTunnelUnlocked(name) {
     await updateInstanceConfig(name, (config) => {
       config.lastTunnelUrl = tunnelUrl;
       config.openaiTunnelLaunchFingerprint = launchFingerprint;
+      config.tunnelProcessStartedAt = processStartedAt;
     });
     return { ok: true, mode: "openai", tunnelId: env.OPENAI_TUNNEL_ID, healthPort, url: tunnelUrl, pid };
   }
@@ -1907,13 +2079,45 @@ async function startTunnelUnlocked(name) {
   if (!fs.existsSync(CLOUDFLARED)) {
     return { ok: false, error: "NO_CLOUDFLARED", hint: "Chưa có cloudflared — bấm 'Tải cloudflared' trong thẻ Tunnel." };
   }
-  await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
+  await updateInstanceConfig(name, clearTunnelLaunchEvidence);
+  await writePidFile(inst.tunnelPid, null);
   await fsp.writeFile(inst.tunnelLog, "");
   const pid = spawnDetached(CLOUDFLARED, ["tunnel", "--url", `http://localhost:${port}`], inst.tunnelLog);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    await updateInstanceConfig(name, clearTunnelLaunchEvidence);
+    await writePidFile(inst.tunnelPid, null);
+    return { ok: false, error: "cloudflared did not return a valid PID; startup was not accepted." };
+  }
   invalidateProcessScanCache();
   await writePidFile(inst.tunnelPid, pid);
-
-
+  let processStartedAt = null;
+  const identityReady = await waitFor(() => {
+    const processIdentity = processesWithCmdLine("cloudflared.exe", `localhost:${port}`)
+      .find((process) => process.pid === pid);
+    if (!processIdentity?.startedAt) return false;
+    processStartedAt = processIdentity.startedAt;
+    return true;
+  }, 5000, 250);
+  if (!identityReady || !processStartedAt) {
+    killPidTree(pid);
+    invalidateProcessScanCache();
+    const stopped = await waitFor(() => !isPidAlive(pid), 10000, 150);
+    await updateInstanceConfig(name, clearTunnelLaunchEvidence);
+    await writePidFile(inst.tunnelPid, stopped ? null : pid);
+    return {
+      ok: false,
+      error: "cloudflared started but its Windows CreationDate identity could not be captured; refusing to accept unverifiable tunnel ownership."
+        + (stopped ? "" : ` PID ${pid} is still alive; PID metadata was preserved for a safe stop/retry.`),
+      pid: stopped ? null : pid,
+      cleanupFailed: !stopped,
+    };
+  }
+  // Persist the exact OS identity before waiting for the public URL. If the
+  // Manager exits during this window, the surviving cloudflared process stays
+  // exactly owned rather than falling back to weaker legacy evidence.
+  await updateInstanceConfig(name, (config) => {
+    config.tunnelProcessStartedAt = processStartedAt;
+  });
   let url = null;
   const deadline = Date.now() + 25000;
   while (Date.now() < deadline && !url) {
@@ -1926,7 +2130,14 @@ async function startTunnelUnlocked(name) {
     killPidTree(pid);
     invalidateProcessScanCache();
     const stopped = await waitFor(() => !isPidAlive(pid), 5000, 150);
-    if (stopped) await writePidFile(inst.tunnelPid, null);
+    if (stopped) {
+      await updateInstanceConfig(name, clearTunnelLaunchEvidence);
+      await writePidFile(inst.tunnelPid, null);
+    } else {
+      // CreationDate was already persisted before URL discovery. Preserve it
+      // for a survivor so the next stop/retry keeps exact ownership.
+      await writePidFile(inst.tunnelPid, pid);
+    }
     const tail = await tailFile(inst.tunnelLog);
     return {
       ok: false,
@@ -1935,8 +2146,11 @@ async function startTunnelUnlocked(name) {
       cleanupFailed: !stopped,
     };
   }
-  await updateInstanceConfig(name, (config) => { config.lastTunnelUrl = url; });
-  return { ok: true, mode: "cloudflare", url };
+  await updateInstanceConfig(name, (config) => {
+    config.lastTunnelUrl = url;
+    config.tunnelProcessStartedAt = processStartedAt;
+  });
+  return { ok: true, mode: "cloudflare", url, pid };
 }
 
 async function stopTunnelUnlocked(name) {
@@ -1944,7 +2158,7 @@ async function stopTunnelUnlocked(name) {
   const inst = instPaths(name);
   if (!st.running) {
     await writePidFile(inst.tunnelPid, null);
-    await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
+    await updateInstanceConfig(name, clearTunnelLaunchEvidence);
     return { ok: true, alreadyStopped: true, mode: st.mode };
   }
   if (!st.owned) {
@@ -1955,9 +2169,9 @@ async function stopTunnelUnlocked(name) {
       error: `Refusing to stop an unowned ${st.kind || "tunnel"} process${st.pid ? ` (PID ${st.pid})` : ""}.`,
     };
   }
-  const targets = new Set(pidsWithCmdLine("tunnel-client.exe", inst.profile).filter(isPidAlive));
-  const savedPid = await readPidFile(inst.tunnelPid);
-  if (savedPid && pidsWithCmdLine("cloudflared.exe", "localhost:").includes(savedPid) && isPidAlive(savedPid)) targets.add(savedPid);
+  const targets = new Set();
+  if (Number.isInteger(st.ownedOpenAiPid) && isPidAlive(st.ownedOpenAiPid)) targets.add(st.ownedOpenAiPid);
+  if (Number.isInteger(st.ownedCloudflarePid) && isPidAlive(st.ownedCloudflarePid)) targets.add(st.ownedCloudflarePid);
   if (targets.size === 0) return { ok: false, mode: st.mode, stopped: false, error: "Managed Tunnel is reported running but no owned process can be identified safely." };
 
   let killed = false;
@@ -1978,7 +2192,7 @@ async function stopTunnelUnlocked(name) {
     intervalMs: 100,
   });
   await writePidFile(inst.tunnelPid, null);
-  await updateInstanceConfig(name, (config) => { delete config.openaiTunnelLaunchFingerprint; });
+  await updateInstanceConfig(name, clearTunnelLaunchEvidence);
   if (!portReleased) {
     invalidatePortPidCache();
     const portPid = pidOnPort(Number(st.healthPort));
@@ -1992,6 +2206,25 @@ async function stopTunnelUnlocked(name) {
       healthPort: Number(st.healthPort),
       portPid,
       error: `Managed Tunnel process exited but health port ${st.healthPort} did not release within 5 seconds${portPid ? ` (current listener PID ${portPid})` : ""}; refusing immediate restart.`,
+    };
+  }
+  // Re-scan after removing only the exact owned process identities. A duplicate
+  // or otherwise unowned candidate may intentionally remain alive; never call
+  // that a clean stop and never let restart proceed over it.
+  invalidateProcessScanCache();
+  const remaining = await tunnelStatus(name);
+  if (remaining.running) {
+    return {
+      ok: false,
+      mode: st.mode,
+      kind: st.kind,
+      stopped: true,
+      forced: killed,
+      portReleased: true,
+      remainingUnowned: true,
+      remainingKind: remaining.kind,
+      remainingPid: remaining.pid || null,
+      error: `Owned Tunnel process stopped, but an unowned ${remaining.kind || "tunnel"} candidate${remaining.pid ? ` (PID ${remaining.pid})` : ""} is still running; refusing to report a clean stop or restart over it.`,
     };
   }
   return { ok: true, mode: st.mode, kind: st.kind, stopped: true, forced: killed, portReleased: true };
@@ -2367,10 +2600,14 @@ async function checkConfig(name, overrides) {
     push(
       false,
       "Tunnel",
-      tun.ambiguous
-        ? `OpenAI Tunnel có ${tun.pids?.length || 2} process dùng cùng profile — phải dừng và khởi động lại để khôi phục ownership duy nhất.`
-        : "Tunnel đang chạy với launch configuration khác cấu hình đang kiểm tra — cần restart Tunnel sau khi lưu."
+      tun.kind === "mixed"
+        ? `Phát hiện đồng thời OpenAI tunnel-client và cloudflared (${tun.pids?.length || 2} process) — phải dừng trạng thái mixed trước khi khởi động lại Tunnel.`
+        : tun.ambiguous
+          ? `OpenAI Tunnel có ${tun.pids?.length || 2} process dùng cùng profile — phải dừng và khởi động lại để khôi phục ownership duy nhất.`
+          : "Tunnel đang chạy với launch configuration khác cấu hình đang kiểm tra — cần restart Tunnel sau khi lưu."
     );
+  } else if (tun.running && tun.healthDrift) {
+    push(false, "Tunnel health", `OpenAI Tunnel process đúng launch identity nhưng health endpoint ${tun.healthPort} không phản hồi — cần kiểm tra/restart Tunnel.`);
   }
   if (tun.mode === "openai" && tun.portOccupied) {
     push(false, "Tunnel health port", `Port ${tun.healthPort} đang mở nhưng không phải tunnel-client`);

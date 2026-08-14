@@ -24,15 +24,17 @@ export function openAiTunnelLaunchFingerprint({ tunnelId, apiKey, healthPort, se
 
 /**
  * Decide whether a currently running tunnel-client process is exactly the one
- * launched for the current desired configuration. Missing legacy evidence,
- * PID replacement, duplicates, unhealthy transport, or config changes
- * all fail closed as config drift.
+ * launched for the current desired configuration. Process/config identity drift
+ * is reported separately from operational health so a transient health probe
+ * cannot be misdiagnosed as stale launch configuration.
  */
 export function evaluateOpenAiTunnelLaunchState({
   mode,
   healthy,
   processPids,
+  processStartedAt,
   savedPid,
+  savedProcessStartedAt,
   savedFingerprint,
   desiredFingerprint,
 }) {
@@ -42,25 +44,55 @@ export function evaluateOpenAiTunnelLaunchState({
     .sort((a, b) => a - b);
   const duplicateProcesses = pids.length > 1;
   const pidMatch = pids.length === 1 && Number(savedPid) === pids[0];
+  const processStartedAtMatch = pidMatch
+    && typeof processStartedAt === "string"
+    && processStartedAt.length > 0
+    && typeof savedProcessStartedAt === "string"
+    && savedProcessStartedAt === processStartedAt;
   const fingerprintMatch = typeof savedFingerprint === "string"
     && /^[0-9a-f]{64}$/.test(savedFingerprint)
     && typeof desiredFingerprint === "string"
     && savedFingerprint === desiredFingerprint;
-  const desired = mode === "openai"
-    && healthy === true
+  const launchIdentityMatches = mode === "openai"
     && !duplicateProcesses
     && pidMatch
+    && processStartedAtMatch
     && fingerprintMatch;
+  const desired = launchIdentityMatches && healthy === true;
 
   return {
     desired,
-    configDrift: !desired,
+    launchIdentityMatches,
+    configDrift: !launchIdentityMatches,
+    healthDrift: launchIdentityMatches && healthy !== true,
     ambiguous: duplicateProcesses,
     duplicateProcesses,
     pids,
     pidMatch,
+    processStartedAtMatch,
     fingerprintMatch,
   };
+}
+
+/**
+ * One-release bridge for tunnels started by the immediately previous Manager
+ * contract, which persisted the spawned PID but not Windows CreationDate.
+ * The PID file is written immediately around spawn, so its mtime must be very
+ * close to the process CreationDate. This is only ownership evidence for a
+ * safe stop/restart; it is deliberately weaker than current PID+CreationDate
+ * evidence and must never make the tunnel "desired"/green by itself.
+ */
+export function legacyPidFileMatchesProcessStart({
+  processStartedAt,
+  pidFileMtimeMs,
+  maxSkewMs = 10000,
+}) {
+  const startedAtMs = Date.parse(String(processStartedAt || ""));
+  const mtimeMs = Number(pidFileMtimeMs);
+  const skewMs = Number(maxSkewMs);
+  if (!Number.isFinite(startedAtMs) || !Number.isFinite(mtimeMs) || mtimeMs <= 0) return false;
+  if (!Number.isFinite(skewMs) || skewMs < 0) return false;
+  return Math.abs(mtimeMs - startedAtMs) <= skewMs;
 }
 
 /**
