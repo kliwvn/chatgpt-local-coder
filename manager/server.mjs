@@ -30,7 +30,7 @@ import { randomUUID } from "node:crypto";
 import { copyTruncateLogFile, isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
 import { recycleManagedDirectory } from "./safe-delete.mjs";
 import { preserveLegacySandboxPolicyManifest, reconcileLegacyRuntimeDirectory, reconcileLegacyShellStateDirectory } from "./runtime-state.mjs";
-import { assertManagedWorkspaceRootsUnambiguous, configuredPrimaryWorkspaceRootsFromEnv, configuredWorkspaceRootsFromEnv } from "./workspace-scope.mjs";
+import { configuredPrimaryWorkspaceRootsFromEnv, configuredWorkspaceRootsFromEnv } from "./workspace-scope.mjs";
 import {
   atomicWriteFile,
   enqueueKeyedMutation,
@@ -110,6 +110,7 @@ const CSC_PATH = [
   "C:/Windows/Microsoft.NET/Framework/v4.0.30319/csc.exe",
 ].find(fs.existsSync) || null;
 const SERVER_ENTRY = path.join(ROOT, "dist", "index.js");
+const SANDBOX_SETUP_SCRIPT = path.join(ROOT, "scripts", "setup-windows-sandbox.mjs");
 const RUNTIME_SOURCE_ROOT = path.join(ROOT, "src");
 const RUNTIME_ARTIFACT_ROOT = path.join(ROOT, "dist");
 const RUNTIME_BUILD_SOURCE_FILES = [
@@ -162,9 +163,17 @@ const MANAGER_LOG = path.join(LOG_DIR, "manager.log");
 const MANAGER_RESTART_FILE = path.join(STATE_DIR, "manager-restart.json");
 const MANAGER_RESTART_GRACE_MS = 1500;
 const MANAGER_RESTART_RETRY_MS = 20000;
+const SERVER_START_TIMEOUT_TRUSTED_MS = 20000;
+// First strict-mode startup can spend materially longer preparing/verifying the
+// AppContainer ACL policy for a broad configured workspace root. Do not kill a
+// healthy bootstrap at the old trusted-mode 20s deadline.
+const SERVER_START_TIMEOUT_STRICT_MS = 120000;
+const SANDBOX_COMPAT_CHECK_TIMEOUT_MS = 30000;
+const SANDBOX_COMPAT_SETUP_TIMEOUT_MS = 6 * 60 * 1000;
 let httpServer = null;
 let managerRestartInFlight = false;
 let installInProgress = false;
+let sandboxCompatibilityChain = Promise.resolve();
 
 function checkManagerSourceSyntax() {
   try {
@@ -518,7 +527,7 @@ async function validateManagedWorkspaceScope(env) {
       ok: false,
       workspaceMissing: true,
       roots: [],
-      error: "WORKSPACE_SCOPE_MISSING: WORKSPACE_PATH must identify exactly one primary project root.",
+      error: "WORKSPACE_SCOPE_MISSING: WORKSPACE_PATH must identify exactly one primary workspace root.",
     };
   }
   if (primaryRoots.length !== 1) {
@@ -526,7 +535,7 @@ async function validateManagedWorkspaceScope(env) {
       ok: false,
       workspaceMissing: false,
       roots: primaryRoots,
-      error: "WORKSPACE_SCOPE_INVALID: WORKSPACE_PATH must identify exactly one primary project root; use EXTRA_WORKSPACE_PATHS for additional explicitly intended roots.",
+      error: "WORKSPACE_SCOPE_INVALID: WORKSPACE_PATH must identify exactly one primary workspace root; use EXTRA_WORKSPACE_PATHS for additional explicitly intended roots.",
     };
   }
   const roots = configuredWorkspaceRootsFromEnv(env, ROOT);
@@ -539,14 +548,10 @@ async function validateManagedWorkspaceScope(env) {
       return { ok: false, workspaceMissing: true, roots, error: `Workspace root does not exist or is not a directory: ${root}` };
     }
   }
-  try {
-    await assertManagedWorkspaceRootsUnambiguous(roots, {
-      fullDiskAccess: String(env.FULL_DISK_ACCESS || "false").trim().toLowerCase() === "true",
-    });
-    return { ok: true, roots };
-  } catch (err) {
-    return { ok: false, workspaceMissing: false, roots, error: String(err?.message || err) };
-  }
+  // A configured root is explicit authority even when it is a collection/container
+  // of multiple repositories. In strict mode the boundary is still the configured
+  // root itself; nested repositories do not widen access outside that root.
+  return { ok: true, roots };
 }
 
 async function migrateLegacyRuntimeState(name, env, inst) {
@@ -874,6 +879,13 @@ function isManagedInstanceHealth(health, name, { allowLegacy = false } = {}) {
   return allowLegacy;
 }
 
+function isExactManagedRuntimeHealth(health, name, savedPid) {
+  if (!Number.isSafeInteger(savedPid) || savedPid <= 0 || !isPidAlive(savedPid)) return false;
+  if (!isManagedInstanceHealth(health, name)) return false;
+  const healthPid = Number(health?.pid);
+  return Number.isSafeInteger(healthPid) && healthPid === savedPid;
+}
+
 function isLocalCoderHealth(health, env, name = null, { allowLegacy = false } = {}) {
   if (!isLocalCoderRuntimeHealth(health)) return false;
   if (name && !isManagedInstanceHealth(health, name, { allowLegacy })) return false;
@@ -939,6 +951,130 @@ async function runInstall() {
   }
 }
 
+function sandboxSetupEnv(name, env, inst) {
+  // The compatibility helper only needs OS execution context plus the strict
+  // workspace/toolchain inputs. Never pass instance tunnel/admin secrets into a
+  // child that may later launch an elevated PowerShell process.
+  const childEnv = { ...process.env };
+  for (const key of Object.keys(childEnv)) {
+    if (isSecretKey(key)) delete childEnv[key];
+  }
+  const stateDir = managedRuntimeStatePath(
+    env.CLC_SANDBOX_STATE_DIR,
+    path.join(ROOT, ".mcp-state"),
+    path.join(inst.dir, "shell-state")
+  );
+  childEnv.WORKSPACE_PATH = String(env.WORKSPACE_PATH || "");
+  childEnv.EXTRA_WORKSPACE_PATHS = String(env.EXTRA_WORKSPACE_PATHS || "");
+  childEnv.SANDBOX_EXEC_ROOTS = String(env.SANDBOX_EXEC_ROOTS || "");
+  childEnv.MCP_INSTANCE_NAME = name;
+  childEnv.LOCAL_CODER_INSTANCE_ID = name;
+  childEnv.CLC_SANDBOX_STATE_DIR = stateDir;
+  childEnv.MCP_SHELL_STATE_DIR = stateDir;
+  if (String(env.CLC_SANDBOX_PROFILE_NAME || "").trim()) {
+    childEnv.CLC_SANDBOX_PROFILE_NAME = String(env.CLC_SANDBOX_PROFILE_NAME).trim();
+  } else {
+    delete childEnv.CLC_SANDBOX_PROFILE_NAME;
+  }
+  return childEnv;
+}
+
+function runSandboxSetupProcess(name, env, inst, args, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [SANDBOX_SETUP_SCRIPT, ...args], {
+      cwd: ROOT,
+      env: sandboxSetupEnv(name, env, inst),
+      windowsHide: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let settled = false;
+    let output = "";
+    let timer = null;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve({ code, output });
+    };
+    child.stdout.on("data", (chunk) => {
+      output = appendBoundedTail(output, chunk, INSTALL_OUTPUT_MAX_CHARS);
+    });
+    child.stderr.on("data", (chunk) => {
+      output = appendBoundedTail(output, chunk, INSTALL_OUTPUT_MAX_CHARS);
+    });
+    child.on("error", (err) => {
+      output = appendBoundedTail(output, `\nspawn error: ${err.message}`, INSTALL_OUTPUT_MAX_CHARS);
+      finish(-1);
+    });
+    child.on("close", (code) => finish(Number.isInteger(code) ? code : -1));
+    timer = setTimeout(() => {
+      output = appendBoundedTail(output, `\n[timeout after ${timeoutMs}ms]`, INSTALL_OUTPUT_MAX_CHARS);
+      if (child.pid) killPidTree(child.pid);
+      finish(124);
+    }, timeoutMs);
+    timer.unref?.();
+  });
+}
+
+function enqueueSandboxCompatibility(operation) {
+  const run = sandboxCompatibilityChain.then(operation, operation);
+  sandboxCompatibilityChain = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function ensureSandboxCompatibility(name, env, inst) {
+  if (!IS_WIN || String(env.FULL_DISK_ACCESS || "false").trim().toLowerCase() === "true") {
+    return { ok: true, skipped: true };
+  }
+  return enqueueSandboxCompatibility(async () => {
+    const check = await runSandboxSetupProcess(
+      name,
+      env,
+      inst,
+      ["--check"],
+      SANDBOX_COMPAT_CHECK_TIMEOUT_MS
+    );
+    if (check.code === 0) return { ok: true, prepared: true, setupRan: false };
+    if (check.code !== 3) {
+      return {
+        ok: false,
+        error: `Không kiểm tra được AppContainer compatibility cho '${name}': ${check.output.trim().slice(-1200) || `exit ${check.code}`}`,
+      };
+    }
+
+    console.log(`[Security] ${name}: AppContainer compatibility chưa có hoặc đã stale — yêu cầu UAC một lần.`);
+    const setup = await runSandboxSetupProcess(
+      name,
+      env,
+      inst,
+      [],
+      SANDBOX_COMPAT_SETUP_TIMEOUT_MS
+    );
+    if (setup.code !== 0) {
+      return {
+        ok: false,
+        error:
+          `AppContainer compatibility setup cho '${name}' thất bại hoặc UAC bị hủy. ` +
+          `${setup.output.trim().slice(-1200) || `exit ${setup.code}`}`,
+      };
+    }
+    const verify = await runSandboxSetupProcess(
+      name,
+      env,
+      inst,
+      ["--check"],
+      SANDBOX_COMPAT_CHECK_TIMEOUT_MS
+    );
+    if (verify.code !== 0) {
+      return {
+        ok: false,
+        error: `AppContainer compatibility setup cho '${name}' không qua verify: ${verify.output.trim().slice(-1200) || `exit ${verify.code}`}`,
+      };
+    }
+    return { ok: true, prepared: true, setupRan: true };
+  });
+}
+
 async function serverStatus(name, desiredEnv = null) {
   const env = desiredEnv || (await readInstanceEnv(name));
   const inst = instPaths(name);
@@ -953,7 +1089,14 @@ async function serverStatus(name, desiredEnv = null) {
   if (configuredPortValid) {
     portOpen = await isPortOpen(configuredPort);
     portPid = portOpen ? pidOnPort(configuredPort) : null;
-    health = portOpen ? await serverHealth(configuredPort) : null;
+    // Do not gate the authoritative HTTP identity probe behind a separate TCP
+    // connect snapshot. On Windows the socket/netstat view can briefly report
+    // closed/stale immediately after restart even though /health is already
+    // serving. A successful health response itself proves the configured port is
+    // open and lets current builds prove exact instance + PID ownership.
+    health = await serverHealth(configuredPort);
+    if (health) portOpen = true;
+    if (portOpen && !portPid) portPid = pidOnPort(configuredPort);
     if (!health && savedPid && portPid === savedPid && isPidAlive(savedPid)) {
       // A freshly restarted Local Coder Server can accept TCP a fraction before /health is
       // consistently ready under Windows load. Retry only when the listener PID
@@ -962,6 +1105,29 @@ async function serverStatus(name, desiredEnv = null) {
       await new Promise((resolve) => setTimeout(resolve, 120));
       health = await serverHealth(configuredPort);
     }
+    // netstat is cached for UI efficiency and Windows can briefly publish the
+    // listener before the PID snapshot catches up. If current health already
+    // proves the exact managed instance identity and the persisted PID is alive,
+    // refresh the PID map before deciding ownership. We still require the
+    // refreshed listener PID to equal server.pid; this repairs stale-cache races
+    // without adopting an unrelated process.
+    if (
+      portOpen &&
+      savedPid &&
+      isPidAlive(savedPid) &&
+      portPid !== savedPid &&
+      isManagedInstanceHealth(health, name)
+    ) {
+      for (let attempt = 0; attempt < 3 && portPid !== savedPid; attempt++) {
+        invalidatePortPidCache();
+        portPid = pidOnPort(configuredPort);
+        if (portPid === savedPid) break;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    }
+    const exactManagedRuntime = Boolean(
+      portOpen && isExactManagedRuntimeHealth(health, name, savedPid)
+    );
     const legacyOwnedListener = Boolean(savedPid && portPid === savedPid && isPidAlive(savedPid));
     if (portOpen && isLocalCoderHealth(health, env, name, { allowLegacy: legacyOwnedListener })) {
       const artifactDrift = isRuntimeArtifactStale(
@@ -972,7 +1138,7 @@ async function serverStatus(name, desiredEnv = null) {
         running: true,
         port: configuredPort,
         configuredPort,
-        pid: portPid || savedPid || null,
+        pid: exactManagedRuntime ? savedPid : (portPid || savedPid || null),
         health,
         portOccupied: false,
         invalidConfig: false,
@@ -981,7 +1147,7 @@ async function serverStatus(name, desiredEnv = null) {
         buildDrift: buildState.sourceNewerThanBuild,
         buildSourceMtimeMs: buildState.newestSourceMtimeMs,
         buildArtifactMtimeMs: buildState.newestArtifactMtimeMs,
-        owned: Boolean(savedPid && (!portPid || savedPid === portPid)),
+        owned: exactManagedRuntime || Boolean(savedPid && (!portPid || savedPid === portPid)),
       };
     }
 
@@ -992,8 +1158,7 @@ async function serverStatus(name, desiredEnv = null) {
       portOpen &&
       isManagedInstanceHealth(health, name, { allowLegacy: legacyOwnedListener }) &&
       savedPid &&
-      portPid === savedPid &&
-      isPidAlive(savedPid)
+      (exactManagedRuntime || legacyOwnedListener)
     ) {
       const artifactDrift = isRuntimeArtifactStale(
         health?.instructions?.loaded_at,
@@ -1177,9 +1342,9 @@ async function startServerUnlocked(name) {
     return { ok: false, error: `Session policy không hợp lệ — sửa trong Cấu hình: ${policy.errors.join("; ")}` };
   }
   const env = await readInstanceEnv(name);
-  // Validate every configured root, not only WORKSPACE_PATH. Fail closed when a
-  // root is missing or is merely a parent/container of another Git repository;
-  // otherwise one broad parent silently grants cross-project authority.
+  // Validate every configured root, not only WORKSPACE_PATH. Missing roots still
+  // fail closed. Explicit collection/container roots are valid authority boundaries;
+  // strict mode remains confined to those configured roots.
   const workspaceScope = await validateManagedWorkspaceScope(env);
   if (!workspaceScope.ok) {
     return {
@@ -1204,6 +1369,10 @@ async function startServerUnlocked(name) {
     return { ok: false, error: `Runtime limits không hợp lệ — sửa trong Cấu hình: ${runtimeLimits.errors.join("; ")}` };
   }
   await migrateLegacyRuntimeState(name, env, inst);
+  const sandboxCompatibility = await ensureSandboxCompatibility(name, env, inst);
+  if (!sandboxCompatibility.ok) {
+    return { ok: false, error: sandboxCompatibility.error, sandboxCompatibility: false };
+  }
   // serverStatus above established that this managed server is stopped, so no
   // child owns these process logs. Scrub historical generations before append /
   // rotation so old credentials do not remain at rest indefinitely.
@@ -1228,7 +1397,22 @@ async function startServerUnlocked(name) {
   });
   invalidatePortPidCache();
   await writePidFile(inst.serverPid, pid);
-  const up = await waitFor(async () => isLocalCoderHealth(await serverHealth(st.port), env, name), 20000);
+  const startupTimeoutMs = String(env.FULL_DISK_ACCESS || "false").trim().toLowerCase() === "true"
+    ? SERVER_START_TIMEOUT_TRUSTED_MS
+    : SERVER_START_TIMEOUT_STRICT_MS;
+  let startupState = "pending";
+  await waitFor(async () => {
+    if (!isPidAlive(pid)) {
+      startupState = "exited";
+      return true;
+    }
+    if (isLocalCoderHealth(await serverHealth(st.port), env, name)) {
+      startupState = "healthy";
+      return true;
+    }
+    return false;
+  }, startupTimeoutMs);
+  const up = startupState === "healthy";
   if (!up) {
     killPidTree(pid);
     invalidatePortPidCache();
@@ -1963,7 +2147,7 @@ async function checkConfig(name, overrides) {
     workspaceScope.ok,
     "Workspace scope",
     workspaceScope.ok
-      ? `Exact configured roots: ${workspaceScope.roots.join("; ") || "(none)"}`
+      ? `Configured workspace roots: ${workspaceScope.roots.join("; ") || "(none)"}`
       : workspaceScope.error
   );
 
@@ -2011,7 +2195,7 @@ async function checkConfig(name, overrides) {
     "FULL_DISK_ACCESS",
     fda === "true"
       ? "true — explicit trusted native full-machine mode"
-      : "false — exact workspace roots; local process trees require AppContainer and fail closed when sandbox health is not proven"
+      : "false — configured workspace roots; local process trees require AppContainer and fail closed when sandbox health is not proven"
   );
 
   // EXTRA_WORKSPACE_PATHS — mỗi path phải tồn tại
@@ -2111,7 +2295,7 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
     ? await checkConfig(name).catch((e) => ({ ok: false, items: [], error: String((e && e.message) || e) }))
     : null;
   // Tự phát hiện scope lỗi: bundle nào cũng kèm kết quả validate để UI hiển thị
-  // ngay (workspaceMissing / container root) thay vì chỉ lộ ra lúc save/start.
+  // ngay (ví dụ workspaceMissing) thay vì chỉ lộ ra lúc save/start.
   let workspaceScope;
   try {
     workspaceScope = await validateManagedWorkspaceScope(env);
@@ -2254,6 +2438,13 @@ async function deleteInstance(name) {
   if (!INSTANCE_NAME_RE.test(name)) return { ok: false, error: "Tên không hợp lệ." };
   if (name === "default") return { ok: false, error: "Instance 'default' là mặc định, không xóa được." };
   const inst = instPaths(name);
+  // Capture the exact managed PID before lifecycle teardown. Metadata must not be
+  // recycled until that process is confirmed gone; otherwise a transient status
+  // false-negative can orphan a still-running Local Coder child.
+  const serverBeforeDelete = await serverStatus(name);
+  const serverPidBeforeDelete = serverBeforeDelete.owned && Number.isSafeInteger(serverBeforeDelete.pid)
+    ? serverBeforeDelete.pid
+    : null;
 
   // Fail closed: never delete the only metadata/profile/PID files for a process
   // we failed to stop. Otherwise a transient lifecycle failure can turn a managed
@@ -2276,6 +2467,18 @@ async function deleteInstance(name) {
   }
   if (!serverStop?.ok) {
     return { ok: false, error: `Không thể dừng Server trước khi xóa '${name}': ${serverStop?.error || "unknown error"}` };
+  }
+
+  if (serverPidBeforeDelete) {
+    const exited = await waitFor(() => !isPidAlive(serverPidBeforeDelete), 5000, 100);
+    if (!exited) {
+      return {
+        ok: false,
+        error: `Từ chối xóa '${name}': managed Server PID ${serverPidBeforeDelete} vẫn còn sống sau stop; giữ nguyên metadata để retry an toàn.`,
+        serverPid: serverPidBeforeDelete,
+        serverPidExited: false,
+      };
+    }
   }
 
   const [serverAfter, tunnelAfter] = await Promise.all([serverStatus(name), tunnelStatus(name)]);
@@ -2302,7 +2505,7 @@ async function deleteInstance(name) {
   if (fs.existsSync(inst.dir)) {
     return { ok: false, error: `Xóa instance '${name}' thất bại — thư mục vẫn tồn tại. Hãy thử lại sau khi dừng server/tunnel.` };
   }
-  return { ok: true, name };
+  return { ok: true, name, serverPid: serverPidBeforeDelete, serverPidExited: true };
 }
 async function renameInstance(name, body) {
   if (!INSTANCE_NAME_RE.test(name)) return { ok: false, error: "Tên không hợp lệ." };
@@ -2336,15 +2539,7 @@ async function saveInstanceEnvUnlocked(name, body) {
   const originalValues = parseDotEnv(original);
   let next;
   if (typeof body.raw === "string") {
-    next = body.raw
-      .split(/\r?\n/)
-      .map((line) => {
-        const m = ENV_LINE_RE.exec(line.trim());
-        if (!m || m[2].trim() !== MASK_SENTINEL) return line;
-        const orig = originalValues[m[1]];
-        return orig !== undefined ? `${m[1]}=${orig}` : line;
-      })
-      .join("\n");
+    next = restoreMaskedRawEnv(body.raw, originalValues);
     next = serializeDotEnv({ MCP_SESSION_RECOVERY: null, CHATGPT_AUTO_APPROVE: null, WORKSPACE_PATHS: null, ALLOWED_WORKSPACE_PATHS: null }, next);
   } else {
     const values = { ...(body.values || {}) };
@@ -2357,7 +2552,7 @@ async function saveInstanceEnvUnlocked(name, body) {
     }
     for (const [key, value] of Object.entries(values)) {
       if (value === undefined) values[key] = null;
-      else if (value === MASK_SENTINEL) values[key] = originalValues[key] !== undefined ? originalValues[key] : null;
+      else if (value === MASK_SENTINEL && isSecretKey(key)) values[key] = originalValues[key] !== undefined ? originalValues[key] : null;
     }
     next = serializeDotEnv({ ...values, MCP_SESSION_RECOVERY: null, CHATGPT_AUTO_APPROVE: null, WORKSPACE_PATHS: null, ALLOWED_WORKSPACE_PATHS: null }, original);
   }
@@ -2422,6 +2617,29 @@ async function saveInstanceEnvUnlocked(name, body) {
   await atomicWriteFile(inst.env, next, "utf8");
   await updateInstanceConfig(name, (config) => { config.healthPort = hp; });
   return { ok: true, path: inst.env };
+}
+
+function restoreMaskedRawEnv(raw, originalValues) {
+  return String(raw)
+    .split(/\r?\n/)
+    .map((line) => {
+      const m = ENV_LINE_RE.exec(line.trim());
+      if (!m || m[2].trim() !== MASK_SENTINEL || !isSecretKey(m[1])) return line;
+      const orig = originalValues[m[1]];
+      // The sentinel means "preserve an existing secret", never "set the
+      // literal secret to eight stars". Match the structured-values branch:
+      // when no prior secret exists, keep the key empty rather than inventing
+      // a credential that will fail later in a less obvious place.
+      return orig !== undefined ? `${m[1]}=${orig}` : `${m[1]}=`;
+    })
+    .join("\n");
+}
+
+async function checkConfigRequest(name, body) {
+  if (typeof body?.raw !== "string") return checkConfig(name, body?.values);
+  const originalValues = await readInstanceEnv(name);
+  const candidateRaw = restoreMaskedRawEnv(body.raw, originalValues);
+  return checkConfig(name, parseDotEnv(candidateRaw));
 }
 
 async function saveInstanceEnv(name, body) {
@@ -2632,7 +2850,7 @@ async function handleApi(req, res, url, body) {
       return json(res, 200, { ok: true, config });
     }
 
-    if (req.method === "POST" && sub === "/check") return json(res, 200, await checkConfig(name, body && body.values));
+    if (req.method === "POST" && sub === "/check") return json(res, 200, await checkConfigRequest(name, body));
 
     if (req.method === "POST" && sub === "/server/start") return json(res, 200, await startServer(name));
     if (req.method === "POST" && sub === "/server/stop") return json(res, 200, await stopServer(name));
@@ -2787,7 +3005,7 @@ async function handleApi(req, res, url, body) {
   }
 
   if (req.method === "POST" && p === "/api/check") {
-    return json(res, 200, await checkConfig(dname, body && body.values));
+    return json(res, 200, await checkConfigRequest(dname, body));
   }
 
   if (req.method === "POST" && p === "/api/server/start") {

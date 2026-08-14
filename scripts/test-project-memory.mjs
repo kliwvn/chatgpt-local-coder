@@ -37,6 +37,37 @@ try {
   }
   ok("agent prompt in instructions");
 
+  if (!/use the narrow typed mutation tool/i.test(ctx.instructionsText) || !/Reserve run_command\/start_process for build, test, verification/i.test(ctx.instructionsText)) {
+    throw new Error("agent prompt does not prefer typed mutations over generic shell");
+  }
+  ok("typed mutation routing in instructions");
+
+  if (!/mcp_servers\(refresh=true\).*cannot refresh, reconnect, or rebind the ChatGPT/i.test(ctx.instructionsText)) {
+    throw new Error("agent prompt does not distinguish upstream MCP refresh from ChatGPT connector refresh");
+  }
+  ok("upstream refresh boundary in instructions");
+
+  if (!/mcp_dispatch counters are process-global/i.test(ctx.instructionsText)) {
+    if (!/mcp_dispatch aggregate counters are process-global/i.test(ctx.instructionsText)) {
+      throw new Error("agent prompt does not warn that dispatch counters are process-global");
+    }
+  }
+  ok("dispatch attribution warning in instructions");
+
+  if (!/\.clc-host-gate-canary-<UTC>-<nonce>\.tmp/i.test(ctx.instructionsText)
+      || !/PASS->HOST_NOT_INVOKED/i.test(ctx.instructionsText)
+      || !/MCP_REACHED_UNSETTLED/i.test(ctx.instructionsText)
+      || !/coverage\.canary\.complete_since/i.test(ctx.instructionsText)
+      || !/INDETERMINATE_NO_COVERAGE/i.test(ctx.instructionsText)) {
+    throw new Error("agent prompt does not include the standardized host-gate canary/context-bisect protocol");
+  }
+  ok("host-gate canary/context-bisect protocol in instructions");
+
+  if (!/tunnel_id, client_instance_id, boot_id, PID, and MCP session ids are transport\/runtime identities, not ChatGPT app\/install permission identities/i.test(ctx.instructionsText)) {
+    throw new Error("agent prompt does not distinguish transport ids from ChatGPT app permission identity");
+  }
+  ok("transport identity boundary in instructions");
+
   if (!ctx.instructionsText.includes("## Environment")) {
     throw new Error("missing environment block");
   }

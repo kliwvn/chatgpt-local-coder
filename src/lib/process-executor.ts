@@ -259,7 +259,7 @@ async function invokeBrokerControl(
     env: buildBrokerEnvironment(),
     stdio: ["pipe", "pipe", "pipe"],
   });
-  child.stdin.end(JSON.stringify(request));
+  child.stdin.end(`${JSON.stringify(request)}\n`);
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   let stdout = "";
@@ -292,6 +292,10 @@ async function prepareSandboxPolicy(
   removeRoots: string[],
   networkMode: SandboxNetworkMode
 ): Promise<BrokerPrepareResponse> {
+  // ACL application on a broad collection root can legitimately take tens of
+  // seconds on Windows. Keep identity probes short, but give prepare/reconcile
+  // the same bounded budget as Manager strict startup so the broker is not
+  // terminated mid-ACL and forced into partial rollback.
   const prepare = await invokeBrokerControl(runnerPath, {
     operation: "prepare",
     profileName,
@@ -299,7 +303,7 @@ async function prepareSandboxPolicy(
     rxRoots: execRoots,
     removeRoots,
     networkMode,
-  });
+  }, 120_000);
   if (prepare.exitCode !== 0) {
     const reason = prepare.stderr.trim() || prepare.stdout.trim() || `exit ${prepare.exitCode}`;
     throw new Error(`${OS_SANDBOX_PREPARE_FAILED}: ${reason}`);
@@ -342,7 +346,7 @@ async function cleanupSandboxPolicy(
     removeRoots: [...manifest.rwRoots],
     rwRoots: [],
     rxRoots: [],
-  });
+  }, 120_000);
   if (cleanup.exitCode !== 0) {
     const reason = cleanup.stderr.trim() || cleanup.stdout.trim() || `exit ${cleanup.exitCode}`;
     throw new Error(`${OS_SANDBOX_ACL_FAILED}: sandbox policy cleanup failed: ${reason}`);
@@ -501,6 +505,29 @@ async function runSandboxSelfTest(state: SandboxState): Promise<void> {
     if (existsSync(outsideWrite)) {
       throw new Error(`${OS_SANDBOX_SELF_TEST_FAILED}: outside write marker exists`);
     }
+
+    // Git for Windows uses the NUL kernel object for its /dev/null
+    // compatibility path. A sandbox can pass the generic filesystem proof yet
+    // still be unusable for every typed-Git operation if the one-time
+    // compatibility ACL was never prepared. Probe the real Git binary here so
+    // strict mode never reports a false-green process sandbox.
+    const git = findExecutableOnPath("git");
+    if (git) {
+      const gitResult = await invokeSandboxedProcess(state, {
+        executable: git,
+        args: ["--version"],
+        cwd: selfRoot,
+        timeoutMs: 10_000,
+      });
+      const gitCollected = await collectProcess(gitResult.child, 15_000);
+      if (gitCollected.code !== 0 || !/^git version /m.test(gitCollected.stdout)) {
+        const detail = (gitCollected.stderr || gitCollected.stdout).trim().slice(-1000);
+        throw new Error(
+          `${OS_SANDBOX_SELF_TEST_FAILED}: Git compatibility probe failed${detail ? `: ${detail}` : ""}. ` +
+            "Run `npm run setup:sandbox` once for this Local Coder instance, then restart Local Coder."
+        );
+      }
+    }
   } finally {
     await fs.rm(selfRoot, { recursive: true, force: true }).catch(() => undefined);
     await fs.rm(outsideRoot, { recursive: true, force: true }).catch(() => undefined);
@@ -578,8 +605,14 @@ export async function initializeProcessSecurity(): Promise<ProcessSecurityStatus
             "Refusing to run with stale AppContainer RX grants. Run `npm run setup:sandbox` once to reconcile privileged toolchain ACLs, then restart Local Coder."
         );
       }
+      const normalizeRootKey = (value: string) => process.platform === "win32" ? value.toLowerCase() : value;
+      const currentRootKeys = new Set(rwRoots.map(normalizeRootKey));
+      // SET_ACCESS on each current root replaces this AppContainer trustee's
+      // explicit ACE. Only roots that actually left the policy need REVOKE.
+      // Avoiding remove+grant on unchanged broad roots prevents duplicate ACL
+      // inheritance propagation during first boot/config reconciliation.
       const previousRoots = previousSameProfile
-        ? [...previousSameProfile.rwRoots]
+        ? previousSameProfile.rwRoots.filter((root) => !currentRootKeys.has(normalizeRootKey(root)))
         : [];
 
       const canReusePolicy = Boolean(
@@ -799,7 +832,7 @@ async function invokeSandboxedProcess(state: SandboxState, request: ProcessSpawn
     networkMode: state.networkMode,
     timeoutMs: Math.max(0, Math.floor(request.timeoutMs || 0)),
   };
-  child.stdin.end(JSON.stringify(brokerRequest));
+  child.stdin.end(`${JSON.stringify(brokerRequest)}\n`);
   return {
     child,
     sandboxed: true,

@@ -8,6 +8,11 @@ export const MCP_QUICKSTART = `
 6. Run builds/tests with run_command (short) or start_process + process_output (long).
 7. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
 
+Use typed file/Git mutation tools whenever one exists; do not retry a host-blocked typed write through run_command/start_process. Generic shell is a broader action, not a permission workaround.
+mcp_servers(refresh=true) refreshes Local Coder upstream MCPs only; it does not refresh/rebind the ChatGPT → Local Coder connector, ChatGPT app permissions, or host session/cache state.
+tunnel_id/client_instance_id/boot_id/PID/MCP session ids are transport/runtime identities, not ChatGPT app/install permission identities; Local Coder cannot observe the host app/install id.
+agent_status.mcp_dispatch aggregate counters are process-global across MCP sessions. For host-gate diagnosis follow mcp_dispatch.protocol v2: use write_file on a fresh canonical .clc-host-gate-canary-<UTC>-<nonce>.tmp (8-64 char nonce) with the exact canonical canary content inside an already authorized scratch/project directory, then immediately call agent_status and match host_gate_canaries/recent_dispatches by exact basename + timestamp. A match with state=reached => MCP_REACHED_UNSETTLED; state=rejected => MCP_REJECTED; state=executed => MCP_EXECUTED. Absence + a host disabled/not-dispatched result is HOST_NOT_INVOKED only when mcp_dispatch.coverage.canary.complete_since proves that attempt is covered by the same live Local Coder process; otherwise classify INDETERMINATE_NO_COVERAGE and run a fresh canary. The agent_status call used to inspect diagnostics appears as its own temporary state=reached until the response completes. A counter delta alone is never per-chat attribution.
+
 ## Output format
 All tools return JSON: { ok, tool, summary, data }
 

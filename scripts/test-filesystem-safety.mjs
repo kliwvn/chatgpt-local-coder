@@ -8,8 +8,6 @@ import { atomicWriteFile } from "../dist/lib/atomic-write.js";
 import { withFileMutation, withFileMutations } from "../dist/lib/file-mutation.js";
 import { loadProjectMemory } from "../dist/lib/project-memory.js";
 import {
-  assertWorkspaceRootsUnambiguous,
-  inspectWorkspaceRootScope,
   setDefaultCwd,
   setWorkspaceRoots,
   validateConfiguredWorkspaceRoot,
@@ -97,30 +95,25 @@ try {
   const escapeLink = path.join(workspace, "escape");
   await fs.symlink(outsideDir, escapeLink, process.platform === "win32" ? "junction" : "dir");
 
-  // Scope authority: a non-project parent containing even one Git repository
-  // must not silently become authority for that child repository.
+  // Scope authority is VCS-agnostic: if the user explicitly configures a
+  // collection root, strict path access may reach descendants inside it but not
+  // escape outside it.
   const collectionRoot = path.join(root, "collection-root");
   const childRepo = path.join(collectionRoot, "child-repo");
   await fs.mkdir(path.join(childRepo, ".git"), { recursive: true });
-  const collectionInspection = await inspectWorkspaceRootScope(collectionRoot);
-  assert(collectionInspection.ambiguous_collection_root, "parent/container workspace was not classified as ambiguous");
-  let collectionRejected = false;
-  try {
-    await assertWorkspaceRootsUnambiguous([collectionRoot]);
-  } catch (err) {
-    collectionRejected = /WORKSPACE_SCOPE_AMBIGUOUS/.test(String(err?.message || err));
-  }
-  assert(collectionRejected, "parent/container workspace root was not rejected");
+  process.env.FULL_DISK_ACCESS = "false";
+  setDefaultCwd(collectionRoot);
+  setWorkspaceRoots([collectionRoot]);
+  const childRepoPath = await validatePath(childRepo);
+  assert(path.normalize(childRepoPath) === path.normalize(await fs.realpath(childRepo)), "explicit collection root did not authorize its child repository");
 
-  // A project root that owns its .git marker remains a valid authority, while
-  // project_context-style switching is restricted to exact configured roots.
+  // project_context-style switching remains restricted to exact configured roots.
   const scopeProject = path.join(root, "scope-project");
   const scopeDescendant = path.join(scopeProject, "subdir");
   const scopeExtra = path.join(root, "scope-extra");
   await fs.mkdir(path.join(scopeProject, ".git"), { recursive: true });
   await fs.mkdir(scopeDescendant, { recursive: true });
   await fs.mkdir(path.join(scopeExtra, ".git"), { recursive: true });
-  await assertWorkspaceRootsUnambiguous([scopeProject, scopeExtra]);
   process.env.FULL_DISK_ACCESS = "false";
   setDefaultCwd(scopeProject);
   setWorkspaceRoots([scopeProject, scopeExtra]);

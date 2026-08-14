@@ -74,11 +74,68 @@ const FIELD_ENV = {
   "f-mem-lines": "PROJECT_MEMORY_MAX_LINES",
 };
 
+let rawDirty = false;
+
+function parseRawEnvEditor(text) {
+  const values = {};
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+    if (!match) continue;
+    values[match[1]] = match[2].replace(/^['"]|['"]$/g, "");
+  }
+  return values;
+}
+
+function mergeRawEditorValues(text, values) {
+  const lines = String(text || "").split(/\r?\n/);
+  const remaining = new Map(Object.entries(values || {}).map(([key, value]) => [key, String(value ?? "")]));
+  const next = lines.map((line) => {
+    const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/.exec(line);
+    if (!match || !remaining.has(match[1])) return line;
+    const key = match[1];
+    const value = remaining.get(key);
+    remaining.delete(key);
+    return `${key}=${value}`;
+  });
+  for (const [key, value] of remaining) next.push(`${key}=${value}`);
+  return next.join("\n");
+}
+
+function syncStructuredFormFromRaw() {
+  const values = parseRawEnvEditor($("f-raw").value);
+  for (const [id, key] of Object.entries(FIELD_ENV)) {
+    if (!Object.prototype.hasOwnProperty.call(values, key)) continue;
+    const el = $(id);
+    if (el.tagName === "SELECT" && !Array.from(el.options).some((option) => option.value === values[key])) continue;
+    el.value = values[key];
+  }
+}
+
+function syncRawFromStructuredForm() {
+  const raw = $("f-raw");
+  if (!raw) return;
+  const values = {};
+  for (const [id, key] of Object.entries(FIELD_ENV)) values[key] = $(id).value.trim();
+  raw.value = mergeRawEditorValues(raw.value, values);
+  rawDirty = true;
+}
+
 function collectValues() {
   const values = {};
   for (const [id, key] of Object.entries(FIELD_ENV)) values[key] = $(id).value.trim();
   if ($("f-tunnel-key").value) values.OPENAI_TUNNEL_API_KEY = $("f-tunnel-key").value.trim();
   return values;
+}
+
+function currentEditorPayload() {
+  if (!rawDirty) return { values: collectValues() };
+  let raw = $("f-raw").value;
+  const tunnelKey = $("f-tunnel-key").value.trim();
+  // Keep plaintext secrets out of the Raw editor itself, but do not lose a new
+  // structured tunnel key merely because another structured field made Raw the
+  // authoritative save/check representation.
+  if (tunnelKey) raw = mergeRawEditorValues(raw, { OPENAI_TUNNEL_API_KEY: tunnelKey });
+  return { raw };
 }
 
 function fillForm(values, keySet) {
@@ -408,13 +465,16 @@ async function selectInstance(name, initial) {
 
   // raw env — server trả masked values (không bao giờ gửi plaintext .env).
   // Dựng lại dạng KEY=VALUE cho editor; secret hiện là sentinel ******** và
-  // được server khôi phục lại giá trị cũ khi lưu.
+  // được server khôi phục lại giá trị cũ khi lưu. Reset dirty state trước mỗi
+  // lần chọn/reload instance để raw editor cũ không thể thắng form mới.
+  rawDirty = false;
   try {
     const r = await api(instUrl(name, "/env"));
     if (state.current !== name) return; // user đã chuyển instance — không đè form
     $("f-raw").value = Object.entries(r.values || {})
       .map(([k, v]) => `${k}=${typeof v === "object" && v !== null ? "********" : v}`)
       .join("\n");
+    rawDirty = false;
   } catch (err) {
     if (state.current !== name) return;
     $("f-raw").value = "";
@@ -458,7 +518,7 @@ async function doCheck() {
   if (!state.current) return;
   setBusy(true);
   try {
-    const r = await api(curUrl("/check"), "POST", { values: collectValues() });
+    const r = await api(curUrl("/check"), "POST", currentEditorPayload());
     const box = $("check-result");
     box.classList.remove("hidden");
     if (r.error) {
@@ -476,14 +536,12 @@ async function doCheck() {
   setBusy(false);
 }
 
-let rawDirty = false;
-
 async function doSave() {
   if (!state.current) return;
   const name = state.current;
   setBusy(true);
   try {
-    const body = rawDirty ? { raw: $("f-raw").value } : { values: collectValues() };
+    const body = currentEditorPayload();
     const envRes = await api(instUrl(name, "/env"), "PUT", body);
     if (!envRes.ok) throw new Error(envRes.error || "Lưu .env thất bại");
     const cfgRes = await api(instUrl(name, "/config"), "PUT", {
@@ -565,6 +623,7 @@ async function onProfileSelect() {
   const key = vals.OPENAI_TUNNEL_API_KEY;
   delete vals.OPENAI_TUNNEL_API_KEY;
   fillForm(vals, key ? { set: true, last4: String(key).slice(-4) } : null);
+  syncRawFromStructuredForm();
 }
 
 /* ---------------- server / tunnel toggles ---------------- */
@@ -691,11 +750,11 @@ async function doAddInstance() {
     return;
   }
   if (!workspacePath) {
-    toast("Chọn WORKSPACE_PATH chính xác cho project", "err");
+    toast("Chọn một WORKSPACE_PATH root", "err");
     return;
   }
   if (workspacePath.includes(";")) {
-    toast("WORKSPACE_PATH chỉ được chứa 1 project. Dùng EXTRA_WORKSPACE_PATHS sau khi tạo nếu cần thêm project.", "err");
+    toast("WORKSPACE_PATH chỉ được chứa 1 root/path; root có thể là project, monorepo hoặc collection root đã chủ động cấp quyền. Dùng EXTRA_WORKSPACE_PATHS cho root bổ sung.", "err");
     return;
   }
   const parsedPort = port ? Number(port) : undefined;
@@ -832,7 +891,16 @@ function init() {
   $("btn-profile-save").addEventListener("click", doProfileSave);
   $("btn-profile-del").addEventListener("click", doProfileDelete);
   $("profile-select").addEventListener("change", onProfileSelect);
-  $("f-raw").addEventListener("input", () => (rawDirty = true));
+  $("f-raw").addEventListener("input", () => {
+    rawDirty = true;
+    syncStructuredFormFromRaw();
+  });
+  for (const id of Object.keys(FIELD_ENV)) {
+    const el = $(id);
+    const sync = () => syncRawFromStructuredForm();
+    el.addEventListener("input", sync);
+    el.addEventListener("change", sync);
+  }
   $("btn-del-inst").addEventListener("click", doDeleteInstance);
   const renameModal = $("rename-modal");
   $("btn-rename-inst").addEventListener("click", () => {
@@ -909,6 +977,7 @@ function init() {
       }
       if (data.cancelled) return; // user hủy — giữ giá trị cũ
       $("f-workspace").value = data.path;
+      syncRawFromStructuredForm();
       toast("Đã chọn: " + data.path, "ok");
     } catch (err) {
       toast("Lỗi chọn folder: " + (err.message || err), "err");
@@ -925,8 +994,11 @@ function init() {
     const roots =
       (b && b.server.health && b.server.health.instructions && b.server.health.instructions.workspace_roots) ||
       (b && b.env && b.env.WORKSPACE_PATH ? [b.env.WORKSPACE_PATH] : []);
+    const fullDisk = b?.env?.FULL_DISK_ACCESS === "true";
     $("guide-ws").textContent = roots.length
-      ? `Workspace hiện tại (${state.current || "?"}): ${roots.join("  ·  ")} — ChatGPT chỉ truy cập file trong các thư mục này.`
+      ? fullDisk
+        ? `Workspace context (${state.current || "?"}): ${roots.join("  ·  ")} — FULL_DISK_ACCESS=true: các root này xác định context/default cwd; filesystem authority là full machine theo quyền OS user.`
+        : `Workspace authority (${state.current || "?"}): ${roots.join("  ·  ")} — FULL_DISK_ACCESS=false: path/process bị giới hạn trong các root đã cấu hình.`
       : "Chưa có instance focus — chọn workspace ở sidebar trước.";
     modal.showModal();
   });

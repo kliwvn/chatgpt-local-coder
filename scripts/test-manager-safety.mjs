@@ -15,6 +15,20 @@ function pidAlive(pid) {
     return err?.code === "EPERM";
   }
 }
+function pidLooksLikeLocalCoder(pid) {
+  if (!pidAlive(pid)) return false;
+  if (process.platform !== "win32") return true;
+  const escapedRepo = process.cwd().replace(/'/g, "''");
+  const script =
+    `$p=Get-CimInstance Win32_Process -Filter \"ProcessId=${pid}\" -ErrorAction SilentlyContinue; ` +
+    `if ($p -and $p.Name -eq 'node.exe' -and $p.CommandLine -like '*dist\\index.js*' -and $p.CommandLine -like '*${escapedRepo}*') { exit 0 }; exit 1`;
+  const probe = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    windowsHide: true,
+    stdio: "ignore",
+    timeout: 10000,
+  });
+  return probe.status === 0;
+}
 async function freePort() {
   const server = http.createServer();
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
@@ -137,7 +151,10 @@ await fs.writeFile(path.join(restartDemo, ".env"), [
   "OPENAI_TUNNEL_API_KEY=",
   `OPENAI_TUNNEL_HEALTH_PORT=${restartHealthPort}`,
   "CHATGPT_TOOL_PROFILE=slim",
-  "FULL_DISK_ACCESS=false",
+  // Lifecycle/ownership tests do not need to exercise Windows UAC. Strict-mode
+  // AppContainer behavior has dedicated executable boundary suites; keep this
+  // managed restart fixture trusted so the Manager test remains headless.
+  "FULL_DISK_ACCESS=true",
   "SHELL_TIMEOUT=120",
   "MCP_SESSION_RECOVERY=true",
   "MCP_SESSION_TTL_MS=120000",
@@ -217,6 +234,31 @@ try {
   assert.equal(envResponse.values.ADMIN_TOKEN, "********");
   assert.equal(Object.prototype.hasOwnProperty.call(envResponse.values, "MCP_SESSION_RECOVERY"), false, "obsolete recovery switch must not be exposed by Manager env API");
 
+  // Emulate the browser Raw editor exactly: all secrets are sent back as the
+  // sentinel, while a non-secret value that happens to equal eight stars must
+  // remain literal. Raw-mode Check and Save must share this same interpretation.
+  const browserRaw = Object.entries(envResponse.values)
+    .map(([key, value]) => `${key}=${typeof value === "object" && value !== null ? "********" : value}`)
+    .join("\n");
+  const rawLiteralStars = `${browserRaw}\nPLAIN_STAR_TEST=********`;
+  const rawSave = (await put("/api/instances/demo/env", { raw: rawLiteralStars })).body;
+  assert.equal(rawSave.ok, true, `masked browser Raw save failed: ${JSON.stringify(rawSave)}`);
+  const rawSavedDisk = await fs.readFile(path.join(demo, ".env"), "utf8");
+  assert.match(rawSavedDisk, new RegExp(`^OPENAI_TUNNEL_API_KEY=${tunnelSecret}$`, "m"), "raw Save must restore the existing tunnel secret from its sentinel");
+  assert.match(rawSavedDisk, new RegExp(`^ADMIN_TOKEN=${adminSecret}$`, "m"), "raw Save must restore the existing admin secret from its sentinel");
+  assert.match(rawSavedDisk, /^PLAIN_STAR_TEST=\*{8}$/m, "non-secret eight-star values must remain literal instead of being restored as a secret sentinel");
+
+  const missingRawWorkspace = path.join(root, "raw-check-missing");
+  const rawCheckPayload = {
+    raw: rawLiteralStars.replace(/^WORKSPACE_PATH=.*$/m, `WORKSPACE_PATH=${missingRawWorkspace}`),
+  };
+  const rawCheck = (await post("/api/instances/demo/check", rawCheckPayload)).body;
+  assert.equal(rawCheck.ok, false, "instance raw-mode Check ignored the proposed raw WORKSPACE_PATH");
+  assert.equal(rawCheck.items.find((entry) => entry.label === "Workspace scope")?.ok, false, "instance raw-mode Check must validate raw workspace authority");
+  const legacyRawCheck = (await post("/api/check", rawCheckPayload)).body;
+  assert.equal(legacyRawCheck.ok, false, "legacy raw-mode Check ignored the proposed raw WORKSPACE_PATH");
+  assert.equal(legacyRawCheck.items.find((entry) => entry.label === "Workspace scope")?.ok, false, "legacy /api/check must share raw-mode semantics with the instance route");
+
   const proxiedAdmin = await fetch(`http://127.0.0.1:${managerPort}/admin/health?instance=demo`, {
     headers: { Authorization: "Bearer stale-browser-token" },
   });
@@ -231,6 +273,53 @@ try {
   assert.match(diskEnv, new RegExp(`OPENAI_TUNNEL_API_KEY=${tunnelSecret}`));
   assert.match(diskEnv, new RegExp(`ADMIN_TOKEN=${adminSecret}`));
   assert.doesNotMatch(diskEnv, /^MCP_SESSION_RECOVERY=/m, "saving any managed env must scrub the obsolete recovery switch");
+
+  // FULL_DISK_ACCESS is a mode toggle, not a hidden Git-root selector. An
+  // explicitly configured collection root remains the strict-mode authority
+  // boundary; toggling true -> false must not make Save fail just because the
+  // root contains independent repositories.
+  const collectionRoot = path.join(root, "collection-root");
+  await fs.mkdir(path.join(collectionRoot, "repo-a", ".git"), { recursive: true });
+  await fs.mkdir(path.join(collectionRoot, "repo-b", ".git"), { recursive: true });
+  const collectionCreate = (await post("/api/instances", {
+    name: "collection-root",
+    workspacePath: collectionRoot,
+    autoStart: false,
+  })).body;
+  assert.equal(collectionCreate.ok, true, `explicit collection workspace create failed: ${JSON.stringify(collectionCreate)}`);
+  const collectionStrictSave = (await put("/api/instances/collection-root/env", {
+    values: { FULL_DISK_ACCESS: "false" },
+  })).body;
+  assert.equal(collectionStrictSave.ok, true, `FULL_DISK_ACCESS=false rejected explicit collection root: ${JSON.stringify(collectionStrictSave)}`);
+  const collectionEnvPath = path.join(instances, "collection-root", ".env");
+  const collectionNoSecretRaw = await fs.readFile(collectionEnvPath, "utf8");
+  const absentSecretSentinelSave = (await put("/api/instances/collection-root/env", {
+    raw: `${collectionNoSecretRaw}\nADMIN_TOKEN=********`,
+  })).body;
+  assert.equal(absentSecretSentinelSave.ok, true, `sentinel save on absent secret failed: ${JSON.stringify(absentSecretSentinelSave)}`);
+  const absentSecretDisk = await fs.readFile(collectionEnvPath, "utf8");
+  assert.doesNotMatch(absentSecretDisk, /^ADMIN_TOKEN=\*{8}$/m, "secret sentinel must never become a literal credential when no prior secret exists");
+  assert.match(absentSecretDisk, /^ADMIN_TOKEN=$/m, "absent secret sentinel must resolve to an empty secret consistently with structured Save");
+  const collectionStrictRaw = await fs.readFile(collectionEnvPath, "utf8");
+  const collectionTrustedRawSave = (await put("/api/instances/collection-root/env", {
+    raw: collectionStrictRaw.replace(/^FULL_DISK_ACCESS=.*$/m, "FULL_DISK_ACCESS=true"),
+  })).body;
+  assert.equal(collectionTrustedRawSave.ok, true, `raw Save could not toggle FULL_DISK_ACCESS=true: ${JSON.stringify(collectionTrustedRawSave)}`);
+  const collectionTrustedRaw = await fs.readFile(collectionEnvPath, "utf8");
+  const collectionStrictRawSave = (await put("/api/instances/collection-root/env", {
+    raw: collectionTrustedRaw.replace(/^FULL_DISK_ACCESS=.*$/m, "FULL_DISK_ACCESS=false"),
+  })).body;
+  assert.equal(collectionStrictRawSave.ok, true, `raw Save could not toggle FULL_DISK_ACCESS=false on collection root: ${JSON.stringify(collectionStrictRawSave)}`);
+  const collectionStrictCheck = (await post("/api/instances/collection-root/check", {
+    values: { FULL_DISK_ACCESS: "false" },
+  })).body;
+  const collectionScopeItem = collectionStrictCheck.items.find((entry) => entry.label === "Workspace scope");
+  assert.equal(collectionScopeItem?.ok, true, `strict collection root was not accepted as configured authority: ${JSON.stringify(collectionScopeItem)}`);
+  assert.doesNotMatch(collectionScopeItem?.detail || "", /WORKSPACE_SCOPE_AMBIGUOUS/);
+  const collectionTrustedSave = (await put("/api/instances/collection-root/env", {
+    values: { FULL_DISK_ACCESS: "true" },
+  })).body;
+  assert.equal(collectionTrustedSave.ok, true, `FULL_DISK_ACCESS=true failed after strict collection save: ${JSON.stringify(collectionTrustedSave)}`);
 
   const profileSecret = "profile-secret-must-not-persist";
   await Promise.all(Array.from({ length: 30 }, (_, i) => post("/api/profiles", { name: `p${i}`, values: { WORKSPACE_PATH: `D:/p${i}`, MCP_SESSION_RECOVERY: "false", OPENAI_TUNNEL_API_KEY: profileSecret, ADMIN_TOKEN: profileSecret, AUTHORIZATION: profileSecret, "api-key": profileSecret } })));
@@ -260,6 +349,7 @@ try {
   const adminUiSource = await fs.readFile(path.join(process.cwd(), "public", "ui", "app.js"), "utf8");
   const envExampleSource = await fs.readFile(path.join(process.cwd(), ".env.example"), "utf8");
   const runtimeEntrySource = await fs.readFile(path.join(process.cwd(), "src", "index.ts"), "utf8");
+  const sandboxSetupSource = await fs.readFile(path.join(process.cwd(), "scripts", "setup-windows-sandbox.mjs"), "utf8");
   assert.match(managerHtml, /id="btn-server-restart"[^>]*class="[^"]*btn-green[^"]*"[^>]*>[^<]*Khởi động lại Local Coder Server/, "Local Coder Server restart must use the same green emphasis as Connector");
   assert.match(managerHtml, /id="btn-connector"[^>]*class="[^"]*btn-green[^"]*"/, "Connector button must retain the shared green emphasis");
   assert.match(managerHtml, /id="foot-admin"[^>]*class="[^"]*btn-primary[^"]*"/, "Admin UI link must be visually emphasized");
@@ -338,6 +428,40 @@ try {
   assert.match(managerApp, /splitExtraWorkspacePaths/);
   assert.match(managerApp, /\.split\(";"\)/);
   assert.match(managerApp, /extraRoots\.join\("; "\)/, "EXTRA_WORKSPACE_PATHS must render as one semicolon-separated line");
+  assert.match(
+    managerApp,
+    /rawDirty = false;[\s\S]{0,900}?\$\("f-raw"\)\.value = Object\.entries[\s\S]{0,320}?rawDirty = false;/,
+    "loading/switching an instance must clear stale raw-editor authority before Save",
+  );
+  assert.match(
+    managerApp,
+    /\$\("f-raw"\)\.addEventListener\("input", \(\) => \{[\s\S]{0,180}?syncStructuredFormFromRaw\(\)/,
+    "raw env edits must synchronize the structured form so Check and Save see the same workspace authority",
+  );
+  assert.match(
+    managerApp,
+    /for \(const id of Object\.keys\(FIELD_ENV\)\) \{[\s\S]{0,260}?syncRawFromStructuredForm\(\)/,
+    "structured form edits must synchronize the raw env editor before raw-mode Save",
+  );
+  assert.match(
+    managerApp,
+    /function syncRawFromStructuredForm\(\)[\s\S]{0,360}?for \(const \[id, key\] of Object\.entries\(FIELD_ENV\)\)[\s\S]{0,220}?mergeRawEditorValues\(raw\.value, values\)/,
+    "structured FULL_DISK_ACCESS/WORKSPACE_PATH values must become the raw Save payload instead of stale values",
+  );
+  assert.match(
+    managerApp,
+    /function currentEditorPayload\(\)[\s\S]{0,900}?if \(!rawDirty\) return \{ values: collectValues\(\) \}[\s\S]{0,500}?OPENAI_TUNNEL_API_KEY:\s*tunnelKey[\s\S]{0,240}?return \{ raw \}/,
+    "raw-mode Check/Save must overlay a newly typed tunnel key without exposing it in the Raw editor",
+  );
+  assert.match(managerApp, /\/check"\), "POST", currentEditorPayload\(\)/, "Check must use the exact same payload constructor as Save");
+  assert.match(managerApp, /const body = currentEditorPayload\(\)/, "Save must use the same raw/form authority payload as Check");
+  assert.match(managerServerSource, /function restoreMaskedRawEnv[\s\S]{0,420}?isSecretKey\(m\[1\]\)/, "raw sentinel restoration must be restricted to actual secret keys");
+  assert.match(managerServerSource, /async function checkConfigRequest[\s\S]{0,360}?restoreMaskedRawEnv\(body\.raw, originalValues\)[\s\S]{0,120}?checkConfig\(name, parseDotEnv\(candidateRaw\)\)/, "raw-mode Check must resolve masked secrets with the same semantics as raw-mode Save");
+  assert.match(managerServerSource, /p === "\/api\/check"[\s\S]{0,100}?checkConfigRequest\(dname, body\)/, "legacy /api/check must use the same raw/form request semantics as the instance route");
+  assert.doesNotMatch(managerApp, /WORKSPACE_PATH chỉ được chứa 1 project/, "Manager UI must not contradict collection-root workspace authority");
+  assert.match(managerApp, /root có thể là project, monorepo hoặc collection root/, "Manager add-workspace guidance must describe supported collection roots");
+  assert.match(managerApp, /FULL_DISK_ACCESS=true:[\s\S]{0,160}?filesystem authority là full machine/, "workspace guide must not claim root confinement in trusted full-disk mode");
+  assert.match(managerApp, /FULL_DISK_ACCESS=false:[\s\S]{0,160}?giới hạn trong các root/, "workspace guide must explain strict root confinement");
   assert.match(managerApp, /inst-extra-path/);
   assert.doesNotMatch(managerApp, /shortPath\(extra\)/, "sidebar must not collapse the whole EXTRA_WORKSPACE_PATHS string to one short path");
   assert.match(managerApp, /Đang chạy/);
@@ -348,10 +472,24 @@ try {
   assert.doesNotMatch(managerServerSource, /HARPOON_ALLOW_PLAINTEXT_HTTP|--harpoon\.allow-plaintext-http/, "managed tunnel must not weaken Harpoon transport policy just to accept local HTTP metadata");
   assert.match(managerServerSource, /spawnDetached\([\s\S]{0,260}?\.\.\.env,[\s\S]{0,260}?MCP_INSTANCE_NAME:\s*name,[\s\S]{0,120}?LOCAL_CODER_INSTANCE_ID:\s*name/, "Manager must inject instance identity after user env values so .env cannot spoof the managed runtime identity");
   assert.match(managerServerSource, /function isManagedInstanceHealth[\s\S]{0,620}?instance_id[\s\S]{0,320}?instanceId === name[\s\S]{0,320}?return allowLegacy/, "Manager must verify managed runtime instance_id and make missing identity an explicit legacy-only path");
+  assert.match(managerServerSource, /function isExactManagedRuntimeHealth[\s\S]{0,420}?isManagedInstanceHealth\(health, name\)[\s\S]{0,220}?health\?\.pid[\s\S]{0,180}?healthPid === savedPid/, "current runtime health PID must provide exact ownership proof independent of transient netstat cache state");
+  assert.match(managerServerSource, /health = await serverHealth\(configuredPort\);[\s\S]{0,120}?if \(health\) portOpen = true/, "configured-port health identity must not be skipped because a separate TCP snapshot briefly reports closed");
   assert.match(managerServerSource, /const legacyOwnedListener = Boolean\(savedPid && portPid === savedPid && isPidAlive\(savedPid\)\)/, "legacy health without instance_id must require persisted PID + live listener proof");
+  assert.match(managerServerSource, /isManagedInstanceHealth\(health, name\)[\s\S]{0,260}?invalidatePortPidCache\(\)[\s\S]{0,180}?portPid = pidOnPort\(configuredPort\)/, "managed instance health must trigger a bounded fresh PID snapshot before ownership is lost to a stale netstat cache");
   assert.match(managerServerSource, /isLocalCoderHealth\(health, env, name, \{ allowLegacy: legacyOwnedListener \}\)/, "configured-port legacy recovery must be gated by the saved-PID listener proof");
-  assert.match(managerServerSource, /waitFor\(async \(\) => isLocalCoderHealth\(await serverHealth\(st\.port\), env, name\), 20000\)/, "newly spawned runtimes must pass strict instance identity without allowLegacy");
+  assert.match(managerServerSource, /SERVER_START_TIMEOUT_STRICT_MS = 120000/, "strict AppContainer startup must have a bounded prepare/self-test window larger than trusted startup");
+  assert.match(managerServerSource, /if \(!isPidAlive\(pid\)\)[\s\S]{0,220}?startupState = "exited"[\s\S]{0,420}?isLocalCoderHealth\(await serverHealth\(st\.port\), env, name\)/, "startup wait must stop early on process exit while still requiring strict instance identity for health");
+  assert.match(managerServerSource, /async function ensureSandboxCompatibility[\s\S]{0,900}?\["--check"\][\s\S]{0,900}?SANDBOX_COMPAT_SETUP_TIMEOUT_MS[\s\S]{0,900}?\["--check"\]/, "strict managed startup must preflight AppContainer compatibility, prepare it only when stale, then verify the marker");
+  assert.match(managerServerSource, /await migrateLegacyRuntimeState\(name, env, inst\);[\s\S]{0,220}?ensureSandboxCompatibility\(name, env, inst\)[\s\S]{0,800}?spawnDetached/, "strict compatibility must be established before the managed Local Coder child is spawned");
+  assert.match(managerServerSource, /for \(const key of Object\.keys\(childEnv\)\)[\s\S]{0,160}?isSecretKey\(key\)[\s\S]{0,320}?WORKSPACE_PATH/, "sandbox compatibility setup must not inherit instance secrets when it may invoke UAC");
+  assert.match(sandboxSetupSource, /sandbox-compat-\$\{instanceId\(\)\}\.json/, "sandbox compatibility must use an instance-scoped durable marker");
+  assert.match(sandboxSetupSource, /process\.argv\.includes\("--check"\)[\s\S]{0,420}?compatibilityStateMatches/, "sandbox compatibility helper must support a non-elevating marker preflight");
+  assert.match(sandboxSetupSource, /const desiredCompatibilityState = \{[\s\S]{0,700}?version:\s*2,[\s\S]{0,700}?runnerArtifact:\s*path\.basename\(runner\)/, "sandbox compatibility marker must be invalidated when the content-versioned broker artifact changes");
+  assert.match(sandboxSetupSource, /recorded\?\.runnerArtifact === desired\.runnerArtifact/, "sandbox compatibility check must compare the recorded broker artifact identity");
+  assert.match(sandboxSetupSource, /recordCompatibilityState\(desiredCompatibilityState\)/, "successful compatibility setup must persist the verified fingerprint marker");
   assert.match(runtimeEntrySource, /instance_id:\s*process\.env\.LOCAL_CODER_INSTANCE_ID \|\| process\.env\.MCP_INSTANCE_NAME \|\| null/, "Local Coder /health must expose the Manager-injected instance identity without inventing one for direct launches");
+  assert.match(runtimeEntrySource, /pid:\s*process\.pid/, "Local Coder /health must expose its actual PID so Manager can prove current-build ownership during config drift");
+  assert.match(runtimeEntrySource, /processSecurity\.sandbox_self_test !== "passed"[\s\S]{0,260}?OS_SANDBOX_STARTUP_FAILED/, "strict Local Coder startup must fail closed before listening when process sandbox proof fails");
   assert.match(managerServerSource, /CHECKPOINT_PATH:[^\n]+path\.join\(inst\.dir, "checkpoints"\)/, "managed checkpoint state must live under the instance, not repo root");
   assert.match(managerServerSource, /MCP_SHELL_STATE_DIR:[^\n]+path\.join\(inst\.dir, "shell-state"\)/, "managed shell state must live under the instance, not repo root");
   assert.match(managerServerSource, /CLC_SANDBOX_STATE_DIR:[^\n]+path\.join\(inst\.dir, "shell-state"\)/, "AppContainer policy state must stay bound to managed shell-state so prior ACL roots remain reconcilable");
@@ -489,7 +627,8 @@ try {
   managedRestartPid = deleteStart.pid;
   const deleteResult = (await api("/api/instances/restart-demo", { method: "DELETE" })).body;
   assert.equal(deleteResult.ok, true, `live instance delete failed: ${JSON.stringify(deleteResult)}`);
-  assert.equal(pidAlive(deleteStart.pid), false, "instance delete left its Local Coder Server process alive");
+  assert.equal(deleteResult.serverPidExited, true, "instance delete must prove the captured managed PID exited before recycling metadata");
+  assert.equal(pidLooksLikeLocalCoder(deleteStart.pid), false, "instance delete left its Local Coder Server process alive");
   assert.equal(await fs.stat(restartDemo).then(() => true, () => false), false, "instance directory survived successful delete");
   managedRestartPid = null;
 

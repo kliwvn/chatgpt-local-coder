@@ -36,7 +36,7 @@ const powershell = path.join(process.env.WINDIR || "C:\\Windows", "System32", "W
 
 function invoke(request, { timeout = 30_000 } = {}) {
   return spawnSync(helper, [], {
-    input: JSON.stringify(request),
+    input: `${JSON.stringify(request)}\n`,
     encoding: "utf8",
     windowsHide: true,
     timeout,

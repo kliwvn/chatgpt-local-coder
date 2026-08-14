@@ -146,6 +146,12 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
         host_action_permission: "unobservable",
         host_write_gate: "unobservable",
         host_not_invoked_semantics: "externally_inferred_only",
+        identity_semantics: {
+          chatgpt_app_install_identity: "unobservable",
+          local_transport_runtime_ids: "transport_or_runtime_only_not_chatgpt_app_permission_identity",
+          permission_lookup_guidance:
+            "Do not use tunnel_id, client_instance_id, boot_id, PID, or MCP session id as a ChatGPT app/install/developer-connector permission identity. A permission lookup returning not_installed for one of those local/transport identifiers does not diagnose the connector's host permission state.",
+        },
         full_machine_access: getFullDiskAccess(),
         path_sandbox_enabled: !getFullDiskAccess(),
         shell_commands_os_sandboxed: areAgentProcessesOsSandboxed(),

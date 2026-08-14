@@ -500,7 +500,13 @@ namespace ChatGptLocalCoder.SandboxRunner
                     }
                     return 0;
                 }
-                string input = Console.In.ReadToEnd();
+                // Broker requests are one compact JSON line. ReadLine avoids a
+                // Windows pipe deadlock where ReadToEnd can wait forever for EOF
+                // if an inherited writer handle remains open in the process tree.
+                // JSON string newlines are escaped by JSON.stringify, so the
+                // framing remains unambiguous while request/env data stays off
+                // the command line.
+                string input = Console.In.ReadLine();
                 if (String.IsNullOrWhiteSpace(input))
                 {
                     return Fail("missing JSON request on stdin", EXIT_USAGE, 0);
@@ -623,10 +629,13 @@ namespace ChatGptLocalCoder.SandboxRunner
             identity.ProfilePath = GetProfilePath(identity.SidString);
             EnsureProfileDirectories(identity.ProfilePath);
 
-            // Exact-policy reconciliation. Purge only this AppContainer SID on
-            // the known old/current roots; preserve every unrelated DACL entry.
+            // Exact-policy reconciliation. Purge only roots that are no longer
+            // part of the configured policy. Do NOT revoke the current rwRoots
+            // before SET_ACCESS: SetEntriesInAcl(SET_ACCESS) already replaces the
+            // trustee's explicit access entry on that root, while a revoke first
+            // forces an unnecessary second inheritance-propagation pass across a
+            // broad workspace tree (for example C:\AI_Home).
             RemoveRootsAcl(identity.SidString, request.removeRoots);
-            RemoveRootsAcl(identity.SidString, request.rwRoots);
             ApplyRootsAcl(identity.SidString, request.rwRoots, true);
             // Read/execute toolchain roots may live under protected locations
             // such as Program Files. They are granted only by the explicit

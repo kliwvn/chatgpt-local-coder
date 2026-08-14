@@ -2,10 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  assertManagedWorkspaceRootsUnambiguous,
   configuredPrimaryWorkspaceRootsFromEnv,
   configuredWorkspaceRootsFromEnv,
-  inspectManagedWorkspaceRoot,
   workspacePathParts,
 } from "../manager/workspace-scope.mjs";
 
@@ -16,27 +14,16 @@ function assert(condition, message) {
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-manager-workspace-scope-"));
 try {
   const project = path.join(root, "project");
-  const nestedRepo = path.join(project, "packages", "nested");
-  await fs.mkdir(path.join(project, ".git"), { recursive: true });
-  await fs.mkdir(path.join(nestedRepo, ".git"), { recursive: true });
-  const projectInspection = await inspectManagedWorkspaceRoot(project);
-  assert(projectInspection.projectRoot, "root owning .git was not recognized as an exact project root");
-  assert(!projectInspection.ambiguousCollectionRoot, "project/monorepo root was incorrectly rejected because it contains nested repositories");
-  await assertManagedWorkspaceRootsUnambiguous([project]);
-
   const collection = path.join(root, "collection");
-  const childRepo = path.join(collection, "child");
-  await fs.mkdir(path.join(childRepo, ".git"), { recursive: true });
-  const collectionInspection = await inspectManagedWorkspaceRoot(collection);
-  assert(collectionInspection.ambiguousCollectionRoot, "non-project parent containing a child Git repository was not flagged");
-  let rejected = false;
-  try {
-    await assertManagedWorkspaceRootsUnambiguous([collection]);
-  } catch (err) {
-    rejected = /WORKSPACE_SCOPE_AMBIGUOUS/.test(String(err?.message || err));
-  }
-  assert(rejected, "ambiguous parent/container workspace was not rejected");
-  await assertManagedWorkspaceRootsUnambiguous([collection], { fullDiskAccess: true });
+  await fs.mkdir(path.join(project, ".git"), { recursive: true });
+  await fs.mkdir(path.join(collection, "repo-a", ".git"), { recursive: true });
+  await fs.mkdir(path.join(collection, "repo-b", ".git"), { recursive: true });
+
+  // Workspace parsing is intentionally VCS-agnostic. A collection root is an
+  // explicit authority boundary just like a project root; FULL_DISK_ACCESS only
+  // changes whether that boundary is enforced, not whether the root is valid.
+  const collectionRoots = configuredWorkspaceRootsFromEnv({ WORKSPACE_PATH: collection }, root);
+  assert(collectionRoots.length === 1 && path.resolve(collectionRoots[0]) === path.resolve(collection), "explicit collection root was not preserved as workspace authority");
 
   const extra = path.join(root, "extra");
   const alias = path.join(root, "alias");
@@ -60,7 +47,7 @@ try {
   assert(normalized.includes(path.resolve(extra).toLowerCase()), "extra workspace missing from configured roots");
   assert(!normalized.includes(path.resolve(alias).toLowerCase()), "obsolete WORKSPACE_PATHS alias must not affect workspace authority");
 
-  console.log("manager-workspace-scope: ok (exact single primary, strict exact roots, trusted full-disk collection roots, obsolete aliases ignored)");
+  console.log("manager-workspace-scope: ok (single primary, explicit collection roots, additional roots, obsolete aliases ignored)");
 } finally {
   await fs.rm(root, { recursive: true, force: true });
 }

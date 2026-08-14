@@ -11,7 +11,6 @@ import {
   getDefaultCwd,
   getFullDiskAccess,
   setWorkspaceRoots,
-  assertWorkspaceRootsUnambiguous,
 } from "./lib/path-security.js";
 import {
   consumeSessionTransportError,
@@ -44,6 +43,7 @@ import {
   recordMcpExecuted,
   recordMcpReached,
   recordMcpRejected,
+  type McpDispatchContext,
   type McpRejectReason,
 } from "./lib/mcp-dispatch-diagnostics.js";
 
@@ -64,13 +64,13 @@ function resolveWorkspaceRoots(): string[] {
   const primary = splitWorkspaceEnv(process.env.WORKSPACE_PATH);
   if (primary.length === 0) {
     throw new Error(
-      "WORKSPACE_SCOPE_MISSING: WORKSPACE_PATH must explicitly identify one primary project root; " +
+      "WORKSPACE_SCOPE_MISSING: WORKSPACE_PATH must explicitly identify one primary workspace root; " +
         "refusing to derive project context from process.cwd()."
     );
   }
   if (primary.length !== 1) {
     throw new Error(
-      "WORKSPACE_SCOPE_INVALID: WORKSPACE_PATH must identify exactly one primary project root; " +
+      "WORKSPACE_SCOPE_INVALID: WORKSPACE_PATH must identify exactly one primary workspace root; " +
         "use EXTRA_WORKSPACE_PATHS for additional explicitly intended roots."
     );
   }
@@ -84,11 +84,9 @@ function resolveWorkspaceRoots(): string[] {
 }
 
 const workspaceRoots = resolveWorkspaceRoots();
-// Exact project roots are a security invariant only while workspace roots define
-// the actual process/filesystem boundary. In explicit FULL_DISK_ACCESS=true mode
-// a broad parent is merely the default project/cwd context and grants no new
-// authority beyond the already trusted full-machine mode.
-if (!getFullDiskAccess()) await assertWorkspaceRootsUnambiguous(workspaceRoots);
+// Every configured root is explicit user-granted authority. In strict mode the
+// path/process sandbox remains confined to these roots even when one root is an
+// intentional collection containing multiple independent Git repositories.
 const workspaceRoot = workspaceRoots[0] || process.cwd();
 setDefaultCwd(workspaceRoot);
 setWorkspaceRoots(workspaceRoots);
@@ -98,6 +96,12 @@ if (processSecurity.process_sandbox_mode === "required") {
     ? `${processSecurity.sandbox_backend} ${processSecurity.process_filesystem_scope}`
     : `${processSecurity.sandbox_backend} FAILED: ${processSecurity.sandbox_error || "unknown error"}`;
   console.log(`${formatLogTime()} [Security] Process sandbox: ${detail}`);
+  if (processSecurity.sandbox_self_test !== "passed") {
+    throw new Error(
+      `OS_SANDBOX_STARTUP_FAILED: strict mode requires a verified process sandbox; ` +
+        `${processSecurity.sandbox_error || processSecurity.sandbox_self_test}`
+    );
+  }
 }
 // Restore durable shell cwd/history once at process startup. Per-MCP-session
 // server creation only observes this already-resolved promise, avoiding repeated
@@ -246,6 +250,11 @@ app.get("/health", async (_req, res) => {
     // from workspace so an owned process can still be identified after the
     // saved WORKSPACE_PATH changes and before the process is restarted.
     instance_id: process.env.LOCAL_CODER_INSTANCE_ID || process.env.MCP_INSTANCE_NAME || null,
+    // Current-build Manager ownership proof. This is the process that actually
+    // served this /health response, so Manager can keep exact PID ownership
+    // across transient netstat/cache gaps or desired workspace drift. Legacy
+    // builds without this field still require listener-PID proof.
+    pid: process.pid,
     workspace: workspaceRoot,
     defaultCwd: getDefaultCwd(),
     fullMachineAccess: getFullDiskAccess(),
@@ -287,17 +296,17 @@ app.get("/.well-known/oauth-protected-resource/mcp", (_req, res) => {
 });
 
 async function handleMcpPost(req: express.Request, res: express.Response): Promise<void> {
-  let dispatchTool: string | null = null;
+  let dispatchContext: McpDispatchContext | null = null;
   let dispatchSettled = false;
   const markExecuted = () => {
-    if (!dispatchTool || dispatchSettled) return;
+    if (!dispatchContext || dispatchSettled) return;
     dispatchSettled = true;
-    recordMcpExecuted(dispatchTool);
+    recordMcpExecuted(dispatchContext);
   };
   const markRejected = (reason: McpRejectReason) => {
-    if (!dispatchTool || dispatchSettled) return;
+    if (!dispatchContext || dispatchSettled) return;
     dispatchSettled = true;
-    recordMcpRejected(dispatchTool, reason);
+    recordMcpRejected(dispatchContext, reason);
   };
   try {
     // SEP-2575: server/discover (stateless discovery) — trả JSON-RPC error 200
@@ -311,8 +320,8 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
       });
       return;
     }
-    dispatchTool = recordMcpReached(req.body);
     const sessionId = validatedSessionId(req, res);
+    dispatchContext = recordMcpReached(req.body, sessionId === null ? null : sessionId);
     if (sessionId === null) {
       markRejected("INVALID_SESSION_ID");
       return;

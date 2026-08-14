@@ -8,10 +8,15 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const nativeRoot = path.join(repoRoot, "native", "windows-sandbox-runner");
 const binRoot = path.join(nativeRoot, "bin");
 const sourcePath = path.join(nativeRoot, "SandboxRunner.cs");
+const executorSourcePath = path.join(repoRoot, "src", "lib", "process-executor.ts");
+const setupSourcePath = path.join(repoRoot, "scripts", "setup-windows-sandbox.mjs");
 const pointerPath = path.join(binRoot, "SandboxRunner.current");
 const references = ["System.dll", "System.Core.dll", "System.Web.Extensions.dll"];
 
 const sourceBytes = await fs.readFile(sourcePath);
+const sourceText = sourceBytes.toString("utf8");
+const executorSource = await fs.readFile(executorSourcePath, "utf8");
+const setupSource = await fs.readFile(setupSourcePath, "utf8");
 const sourceFingerprint = createHash("sha256")
   .update(sourceBytes)
   .update("\0", "utf8")
@@ -30,5 +35,36 @@ const actualHash = createHash("sha256").update(bytes).digest("hex");
 const expectedHash = (await fs.readFile(`${runnerPath}.sha256`, "utf8")).trim().toLowerCase();
 assert.match(expectedHash, /^[a-f0-9]{64}$/, "sandbox runner sidecar hash is malformed");
 assert.equal(actualHash, expectedHash, "sandbox runner binary does not match its integrity sidecar");
+assert.match(
+  setupSource,
+  /const desiredCompatibilityState = \{[\s\S]{0,700}?version:\s*2,[\s\S]{0,700}?runnerArtifact:\s*path\.basename\(runner\)/,
+  "privileged compatibility marker must be tied to the content-versioned runner artifact",
+);
+assert.match(
+  setupSource,
+  /recorded\?\.runnerArtifact === desired\.runnerArtifact/,
+  "compatibility preflight must invalidate a marker produced by an older runner artifact",
+);
+
+const prepareIdentityBlock = sourceText.match(
+  /private static AppContainerIdentity PrepareIdentity\(BrokerRequest request\)([\s\S]*?)private static IntPtr CreateOrDeriveSid/
+)?.[1] || "";
+assert.ok(prepareIdentityBlock, "failed to isolate PrepareIdentity for ACL reconciliation checks");
+
+assert.doesNotMatch(
+  prepareIdentityBlock,
+  /RemoveRootsAcl\(identity\.SidString, request\.rwRoots\)/,
+  "prepare must not revoke current rwRoots before SET_ACCESS; that doubles ACL propagation on broad roots",
+);
+assert.match(
+  prepareIdentityBlock,
+  /RemoveRootsAcl\(identity\.SidString, request\.removeRoots\);[\s\S]{0,240}?ApplyRootsAcl\(identity\.SidString, request\.rwRoots, true\);/,
+  "prepare must revoke only stale roots, then apply the current rwRoots policy",
+);
+assert.match(
+  executorSource,
+  /previousSameProfile\.rwRoots\.filter\(\(root\) => !currentRootKeys\.has\(normalizeRootKey\(root\)\)\)/,
+  "runtime reconciliation must pass only roots removed from the current policy to broker revoke",
+);
 
 console.log(`sandbox-runner-artifact: ok (${pointerName}; sha256=${actualHash})`);

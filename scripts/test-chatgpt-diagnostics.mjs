@@ -108,6 +108,54 @@ try {
   check("host_action_permission unobservable", status.host_action_permission === "unobservable", `${status.host_action_permission}`);
   check("host_write_gate unobservable", status.host_write_gate === "unobservable", `${status.host_write_gate}`);
   check("HOST_NOT_INVOKED is externally inferred only", status.host_not_invoked_semantics === "externally_inferred_only", `${status.host_not_invoked_semantics}`);
+  check("dispatch diagnostics expose correlated process-global scope", status.mcp_dispatch?.scope === "process_global_with_recent_correlated_dispatches", `${status.mcp_dispatch?.scope}`);
+  check(
+    "dispatch diagnostics forbid cross-chat counter attribution",
+    /every MCP session\/chat/i.test(String(status.mcp_dispatch?.attribution_warning || "")) &&
+      /counter delta alone does not prove/i.test(String(status.mcp_dispatch?.attribution_warning || "")) &&
+      /current agent_status request/i.test(String(status.mcp_dispatch?.attribution_warning || "")),
+    String(status.mcp_dispatch?.attribution_warning || "")
+  );
+  check("dispatch diagnostics describe secret-safe correlation", /basename only/i.test(String(status.mcp_dispatch?.correlation?.secret_safety || "")), JSON.stringify(status.mcp_dispatch?.correlation));
+  check("host-gate protocol version 2 present", status.mcp_dispatch?.protocol?.version === 2, JSON.stringify(status.mcp_dispatch?.protocol)?.slice(0, 240));
+  check("host-gate protocol standardizes canary prefix", status.mcp_dispatch?.protocol?.canary?.basename_prefix === ".clc-host-gate-canary-", JSON.stringify(status.mcp_dispatch?.protocol?.canary));
+  check("host-gate protocol requires canonical canary shape+content", /8-64 character nonce/i.test(String(status.mcp_dispatch?.protocol?.canary?.recognition_rule || "")) && /content exactly matches/i.test(String(status.mcp_dispatch?.protocol?.canary?.recognition_rule || "")), JSON.stringify(status.mcp_dispatch?.protocol?.canary));
+  check("host-gate protocol keeps a dedicated canary ledger", status.mcp_dispatch?.correlation?.canary_limit === status.mcp_dispatch?.protocol?.canary?.retained_records, JSON.stringify(status.mcp_dispatch?.correlation));
+  check("host-gate diagnostics expose coverage start", !Number.isNaN(Date.parse(status.mcp_dispatch?.coverage?.canary?.complete_since || "")), JSON.stringify(status.mcp_dispatch?.coverage));
+  check("host-gate absence requires same-process coverage", /same live Local Coder process/i.test(String(status.mcp_dispatch?.coverage?.absence_rule || "")) && /evicted attempt makes absence indeterminate/i.test(String(status.mcp_dispatch?.coverage?.absence_rule || "")), String(status.mcp_dispatch?.coverage?.absence_rule || ""));
+  check("host-gate protocol has indeterminate no-coverage state", /evicted\/reset record/i.test(String(status.mcp_dispatch?.protocol?.classification?.INDETERMINATE_NO_COVERAGE?.evidence || "")), JSON.stringify(status.mcp_dispatch?.protocol?.classification));
+  check("host-gate protocol distinguishes reached-unsettled", /state=reached/i.test(String(status.mcp_dispatch?.protocol?.classification?.MCP_REACHED_UNSETTLED?.evidence || "")), JSON.stringify(status.mcp_dispatch?.protocol?.classification));
+  check("handler rejection warns about unknown side effects", /HANDLER_ERROR.*side-effect status is unknown/i.test(String(status.mcp_dispatch?.protocol?.classification?.MCP_REJECTED?.next_action || "")), String(status.mcp_dispatch?.protocol?.classification?.MCP_REJECTED?.next_action || ""));
+  check("host-gate protocol says host surface is unobservable", status.mcp_dispatch?.protocol?.host_surface_checklist?.observable_by_server === false, JSON.stringify(status.mcp_dispatch?.protocol?.host_surface_checklist));
+  check("host-gate support bundle is secret-safe", /Do not include file contents.*raw MCP session IDs.*API keys.*command text/i.test(String(status.mcp_dispatch?.protocol?.support_bundle?.privacy || "")), String(status.mcp_dispatch?.protocol?.support_bundle?.privacy || ""));
+  check("host-gate protocol forbids annotation falsification", Array.isArray(status.mcp_dispatch?.protocol?.prohibitions) && status.mcp_dispatch.protocol.prohibitions.some((item) => /Do not weaken or falsify MCP annotations/i.test(String(item))), JSON.stringify(status.mcp_dispatch?.protocol?.prohibitions));
+  check("host-gate protocol includes context bisect", Array.isArray(status.mcp_dispatch?.protocol?.context_bisect?.steps) && status.mcp_dispatch.protocol.context_bisect.steps.some((item) => /PASS->HOST_NOT_INVOKED/i.test(String(item))), JSON.stringify(status.mcp_dispatch?.protocol?.context_bisect));
+  check("agent_status says host app identity is unobservable", status.identity_semantics?.chatgpt_app_install_identity === "unobservable", JSON.stringify(status.identity_semantics));
+  check(
+    "agent_status forbids using transport ids as app permission identity",
+    /Do not use tunnel_id.*ChatGPT app\/install\/developer-connector permission identity/i.test(String(status.identity_semantics?.permission_lookup_guidance || "")),
+    String(status.identity_semantics?.permission_lookup_guidance || "")
+  );
+  check(
+    "quickstart forbids shell fallback for host-blocked typed writes",
+    /do not retry a host-blocked typed write through run_command\/start_process/i.test(String(status.quickstart || "")),
+    String(status.quickstart || "").slice(0, 500)
+  );
+  check(
+    "quickstart says upstream refresh cannot refresh ChatGPT connector",
+    /mcp_servers\(refresh=true\).*does not refresh\/rebind the ChatGPT/i.test(String(status.quickstart || "")),
+    String(status.quickstart || "").slice(0, 700)
+  );
+  check(
+    "quickstart separates transport ids from ChatGPT app identity",
+    /tunnel_id\/client_instance_id\/boot_id\/PID\/MCP session ids are transport\/runtime identities, not ChatGPT app\/install permission identities/i.test(String(status.quickstart || "")),
+    String(status.quickstart || "").slice(0, 1000)
+  );
+  check(
+    "quickstart uses standardized host-gate protocol",
+    /follow mcp_dispatch\.protocol v2.*\.clc-host-gate-canary-<UTC>-<nonce>\.tmp.*MCP_REACHED_UNSETTLED.*MCP_REJECTED.*MCP_EXECUTED.*HOST_NOT_INVOKED.*coverage\.canary\.complete_since.*INDETERMINATE_NO_COVERAGE/i.test(String(status.quickstart || "")),
+    String(status.quickstart || "").slice(0, 2600)
+  );
   check("agent_status process sandbox required", status.process_security?.process_sandbox_mode === "required", `${status.process_security?.process_sandbox_mode}`);
   check("agent_status AppContainer backend", status.process_security?.sandbox_backend === "windows_appcontainer", `${status.process_security?.sandbox_backend}`);
   check("agent_status sandbox self-test passed", status.process_security?.sandbox_self_test === "passed", `${status.process_security?.sandbox_self_test}`);

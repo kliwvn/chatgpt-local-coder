@@ -114,6 +114,47 @@ function sandboxPolicyStatePath() {
   return path.join(dir, `sandbox-policy-${instanceId()}.json`);
 }
 
+function sandboxCompatibilityStatePath() {
+  return path.join(path.dirname(sandboxPolicyStatePath()), `sandbox-compat-${instanceId()}.json`);
+}
+
+function normalizePathSet(values) {
+  return [...new Set(values.map((value) => path.resolve(value).toLowerCase()))].sort();
+}
+
+async function readCompatibilityState() {
+  try {
+    return JSON.parse(await fsp.readFile(sandboxCompatibilityStatePath(), "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function compatibilityStateMatches(recorded, desired) {
+  return Boolean(
+    recorded?.version === desired.version &&
+    recorded?.profileName === desired.profileName &&
+    recorded?.runnerArtifact === desired.runnerArtifact &&
+    recorded?.nulPrepared === true &&
+    JSON.stringify(normalizePathSet(recorded?.traverseRoots || [])) === JSON.stringify(normalizePathSet(desired.traverseRoots)) &&
+    JSON.stringify(normalizePathSet(recorded?.execRoots || [])) === JSON.stringify(normalizePathSet(desired.execRoots))
+  );
+}
+
+async function recordCompatibilityState(desired) {
+  const filePath = sandboxCompatibilityStatePath();
+  const next = { ...desired, updatedAt: new Date().toISOString() };
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fsp.writeFile(tempPath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+    await fsp.rename(tempPath, filePath);
+  } finally {
+    await fsp.rm(tempPath, { force: true }).catch(() => undefined);
+  }
+}
+
 async function readExistingPolicyManifest() {
   try {
     const parsed = JSON.parse(await fsp.readFile(sandboxPolicyStatePath(), "utf8"));
@@ -193,6 +234,28 @@ function traversePathsForProfile(profile) {
     : ancestors;
 }
 
+const desiredCompatibilityState = {
+  version: 2,
+  profileName: productionProfile,
+  // The runner filename is content-versioned from SandboxRunner.cs. Binding the
+  // privileged compatibility marker to it ensures a broker behavior update
+  // cannot silently reuse grants prepared under an older broker contract.
+  runnerArtifact: path.basename(runner),
+  nulPrepared: true,
+  traverseRoots: traversePathsForProfile(productionProfile),
+  execRoots: [...execRoots],
+};
+
+if (process.argv.includes("--check")) {
+  const recorded = await readCompatibilityState();
+  if (compatibilityStateMatches(recorded, desiredCompatibilityState)) {
+    console.log(`Windows AppContainer compatibility ready for: ${productionProfile}`);
+    process.exit(0);
+  }
+  console.error(`Windows AppContainer compatibility missing or stale for: ${productionProfile}`);
+  process.exit(3);
+}
+
 function runDirect(args) {
   return spawnSync(runner, args, {
     cwd: repoRoot,
@@ -226,6 +289,7 @@ for (const profile of profiles) {
 }
 if (directOk) {
   await recordReconciledExecRoots(previousPolicy, productionProfile, execRoots);
+  await recordCompatibilityState(desiredCompatibilityState);
   console.log(`Windows AppContainer compatibility prepared for: ${profiles.join(", ")}`);
   process.exit(0);
 }
@@ -300,4 +364,5 @@ if (elevated.status !== 0) {
 }
 
 await recordReconciledExecRoots(previousPolicy, productionProfile, execRoots);
+await recordCompatibilityState(desiredCompatibilityState);
 console.log(`Windows AppContainer compatibility prepared for: ${profiles.join(", ")}`);
