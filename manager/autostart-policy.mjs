@@ -19,6 +19,7 @@ export async function autoStartInstance(name, {
   readConfig,
   startServer,
   startTunnel,
+  recoverTunnel = null,
   shouldContinue = async () => true,
   sleep = DEFAULT_SLEEP,
   log = () => undefined,
@@ -27,6 +28,9 @@ export async function autoStartInstance(name, {
 } = {}) {
   if (typeof readConfig !== "function" || typeof startServer !== "function" || typeof startTunnel !== "function") {
     throw new TypeError("autoStartInstance requires readConfig, startServer, and startTunnel functions");
+  }
+  if (recoverTunnel !== null && typeof recoverTunnel !== "function") {
+    throw new TypeError("recoverTunnel must be a function when provided");
   }
   if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
     throw new RangeError("maxAttempts must be a positive integer");
@@ -113,8 +117,49 @@ export async function autoStartInstance(name, {
           );
           return { ok: true, attempts: attempt, server: true, tunnel: true };
         }
-        lastFailure = { stage: "tunnel", result: tunnel };
-        log(`[Auto] ${name}: Tunnel failed on attempt ${attempt}/${maxAttempts}: ${errorText(tunnel)}`);
+
+        // A matching Manager-owned OpenAI tunnel can survive a Manager restart
+        // while its local health listener is wedged. Repeating startTunnel()
+        // cannot heal that state because start is intentionally fail-closed for
+        // an already-running unhealthy process. During bootstrap only, allow a
+        // typed recovery hook to restart that exact-owned unhealthy transport.
+        // Never recover config drift or unowned processes, and re-check explicit
+        // lifecycle cancellation before scheduling destructive recovery.
+        let recoveryHandledFailure = false;
+        if (
+          recoverTunnel &&
+          tunnel?.running === true &&
+          tunnel?.owned === true &&
+          tunnel?.healthDrift === true &&
+          tunnel?.configDrift !== true
+        ) {
+          if (!(await shouldContinue(name))) {
+            log(`[Auto] ${name}: bootstrap reconciliation cancelled before unhealthy Tunnel recovery.`);
+            return { ok: true, skipped: true, reason: "cancelled", attempts: attempt };
+          }
+          log(`[Auto] ${name}: exact-owned Tunnel is unhealthy; attempting bounded bootstrap recovery.`);
+          let recovery;
+          try {
+            recovery = await recoverTunnel(name);
+          } catch (err) {
+            recovery = { ok: false, error: String((err && err.message) || err) };
+          }
+          if (recovery?.cancelled === true) {
+            log(`[Auto] ${name}: unhealthy Tunnel recovery cancelled by an explicit lifecycle action.`);
+            return { ok: true, skipped: true, reason: "cancelled", attempts: attempt };
+          }
+          if (recovery?.ok) {
+            log(`[Auto] ${name}: unhealthy Tunnel recovered (${recovery.mode || recovery.kind || "unknown"}).`);
+            return { ok: true, attempts: attempt, server: true, tunnel: true, recoveredTunnel: true };
+          }
+          lastFailure = { stage: "tunnel-recovery", result: recovery };
+          log(`[Auto] ${name}: Tunnel recovery failed on attempt ${attempt}/${maxAttempts}: ${errorText(recovery)}`);
+          recoveryHandledFailure = true;
+        }
+        if (!recoveryHandledFailure) {
+          lastFailure = { stage: "tunnel", result: tunnel };
+          log(`[Auto] ${name}: Tunnel failed on attempt ${attempt}/${maxAttempts}: ${errorText(tunnel)}`);
+        }
       }
     }
 

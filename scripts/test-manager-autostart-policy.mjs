@@ -52,6 +52,116 @@ import { autoStartInstance, autoStartInstances } from "../manager/autostart-poli
   assert.equal(tunnelCalls, 2);
 }
 
+// Repeating startTunnel cannot heal an exact-owned process whose health endpoint
+// is wedged. Bootstrap may recover only that typed state through the dedicated
+// recovery hook, without spending all retries on the same non-healing start.
+{
+  let recoveryCalls = 0;
+  const result = await autoStartInstance("unhealthy-owned", {
+    readConfig: async () => ({ autoStart: true }),
+    startServer: async () => ({ ok: true, alreadyRunning: true, pid: 55, port: 3000 }),
+    startTunnel: async () => ({
+      ok: false,
+      running: true,
+      owned: true,
+      healthDrift: true,
+      configDrift: false,
+      mode: "openai",
+      error: "health endpoint is not responding",
+    }),
+    recoverTunnel: async () => {
+      recoveryCalls += 1;
+      return { ok: true, restarted: true, mode: "openai" };
+    },
+    retryDelaysMs: [0, 0],
+    sleep: async () => undefined,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.recoveredTunnel, true);
+  assert.equal(result.attempts, 1);
+  assert.equal(recoveryCalls, 1);
+}
+
+// Health drift alone is not permission to kill a process. Unowned or
+// configuration-drifted Tunnel states must never enter bootstrap recovery.
+{
+  for (const tunnelState of [
+    { running: true, owned: false, healthDrift: true, configDrift: false },
+    { running: true, owned: true, healthDrift: true, configDrift: true },
+  ]) {
+    let recoveryCalls = 0;
+    const result = await autoStartInstance("unsafe-recovery", {
+      readConfig: async () => ({ autoStart: true }),
+      startServer: async () => ({ ok: true, alreadyRunning: true, pid: 55, port: 3000 }),
+      startTunnel: async () => ({ ok: false, error: "unsafe state", ...tunnelState }),
+      recoverTunnel: async () => { recoveryCalls += 1; return { ok: true }; },
+      maxAttempts: 1,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.stage, "tunnel");
+    assert.equal(recoveryCalls, 0);
+  }
+}
+
+// An explicit lifecycle action that lands immediately before recovery must win;
+// the supervisor must not restart the Tunnel after the user's Stop request.
+{
+  let cancelled = false;
+  let recoveryCalls = 0;
+  const result = await autoStartInstance("cancel-before-recovery", {
+    readConfig: async () => ({ autoStart: true }),
+    startServer: async () => ({ ok: true, alreadyRunning: true, pid: 55, port: 3000 }),
+    startTunnel: async () => {
+      cancelled = true;
+      return {
+        ok: false,
+        running: true,
+        owned: true,
+        healthDrift: true,
+        configDrift: false,
+        error: "health endpoint is not responding",
+      };
+    },
+    recoverTunnel: async () => { recoveryCalls += 1; return { ok: true }; },
+    shouldContinue: async () => !cancelled,
+    maxAttempts: 1,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, "cancelled");
+  assert.equal(recoveryCalls, 0);
+}
+
+// Failed unhealthy-Tunnel recovery remains bounded by the same retry backoff as
+// ordinary bootstrap failures; recovery must not spin in an immediate retry loop.
+{
+  let recoveryCalls = 0;
+  const sleeps = [];
+  const result = await autoStartInstance("unhealthy-recovery-fails", {
+    readConfig: async () => ({ autoStart: true }),
+    startServer: async () => ({ ok: true, alreadyRunning: true, pid: 55, port: 3000 }),
+    startTunnel: async () => ({
+      ok: false,
+      running: true,
+      owned: true,
+      healthDrift: true,
+      configDrift: false,
+      error: "health endpoint is not responding",
+    }),
+    recoverTunnel: async () => {
+      recoveryCalls += 1;
+      return { ok: false, error: "restart did not settle" };
+    },
+    maxAttempts: 2,
+    retryDelaysMs: [17],
+    sleep: async (ms) => { sleeps.push(ms); },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.stage, "tunnel-recovery");
+  assert.equal(result.attempts, 2);
+  assert.equal(recoveryCalls, 2);
+  assert.deepEqual(sleeps, [17], "failed bootstrap recovery must use bounded retry backoff exactly once between two attempts");
+}
+
 // A transient config re-read failure after Server health is established must
 // remain a retryable config failure. It must never be false-greened as
 // autoStart-disabled merely because tunnelConfig is temporarily unavailable.

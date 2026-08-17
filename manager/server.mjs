@@ -2857,19 +2857,48 @@ async function stopTunnel(name) {
   return enqueueTunnelLifecycle(name, () => stopTunnelUnlocked(name));
 }
 
+async function restartTunnelUnlocked(name, before = null) {
+  const prior = before || await tunnelStatus(name);
+  const stopped = await stopTunnelUnlocked(name);
+  if (!stopped.ok) return { ...stopped, restarted: false };
+  const started = await startTunnelUnlocked(name);
+  if (!started.ok) return { ...started, restarted: false, stop: stopped };
+  return { ...started, ok: true, restarted: true, previousMode: prior.mode, stop: stopped };
+}
+
+async function recoverTunnelForBoot(name) {
+  if (managerRestartInFlight || cancelledBootAutoStart.has(name)) {
+    return { ok: false, cancelled: true, error: "Bootstrap Tunnel recovery was cancelled by Manager restart or an explicit lifecycle action." };
+  }
+  return enqueueTunnelLifecycle(name, async () => {
+    // Re-check after acquiring the lifecycle queue. A manual Stop/Restart may
+    // have been queued between the supervisor's shouldContinue() check and this
+    // operation; that manual action must win and must never be followed by a
+    // boot recovery that silently starts the Tunnel again.
+    if (managerRestartInFlight || cancelledBootAutoStart.has(name)) {
+      return { ok: false, cancelled: true, error: "Bootstrap Tunnel recovery was cancelled before lifecycle execution." };
+    }
+    const current = await tunnelStatus(name);
+    if (current.running && current.owned && !current.configDrift && !current.healthDrift) {
+      return { ok: true, alreadyRunning: true, recovered: false, ...current };
+    }
+    if (!(current.running && current.owned && current.healthDrift && !current.configDrift)) {
+      return {
+        ok: false,
+        error: "Bootstrap Tunnel recovery refused because exact-owned unhealthy state is no longer proven.",
+        ...current,
+      };
+    }
+    return restartTunnelUnlocked(name, current);
+  });
+}
+
 async function restartTunnel(name) {
   cancelledBootAutoStart.add(name);
   if (managerRestartInFlight) {
     return { ok: false, restarted: false, error: "Manager đang self-restart; từ chối bắt đầu Tunnel lifecycle mới." };
   }
-  return enqueueTunnelLifecycle(name, async () => {
-    const before = await tunnelStatus(name);
-    const stopped = await stopTunnelUnlocked(name);
-    if (!stopped.ok) return { ...stopped, restarted: false };
-    const started = await startTunnelUnlocked(name);
-    if (!started.ok) return { ...started, restarted: false, stop: stopped };
-    return { ...started, ok: true, restarted: true, previousMode: before.mode, stop: stopped };
-  });
+  return enqueueTunnelLifecycle(name, () => restartTunnelUnlocked(name));
 }
 
 async function downloadCloudflared() {
@@ -4419,6 +4448,7 @@ async function main() {
     readConfig: readInstanceConfig,
     startServer,
     startTunnel,
+    recoverTunnel: recoverTunnelForBoot,
     shouldContinue: async (name) => !managerRestartInFlight && !cancelledBootAutoStart.has(name),
     log: (line) => console.log(line),
   }).then((results) => {
