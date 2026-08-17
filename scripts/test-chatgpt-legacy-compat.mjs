@@ -11,10 +11,16 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpServer } from "../dist/server-factory.js";
 import { getDefaultCwd, getWorkspaceRoots, setDefaultCwd, setWorkspaceRoots } from "../dist/lib/path-security.js";
 
 const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
+const oldRuntimeEnv = Object.fromEntries([
+  "FULL_DISK_ACCESS",
+  "LOCAL_CODER_INSTANCE_ID",
+  "CLC_SANDBOX_PROFILE_NAME",
+  "CLC_SANDBOX_STATE_DIR",
+  "MCP_SHELL_STATE_DIR",
+].map((key) => [key, process.env[key]]));
 const oldCwd = getDefaultCwd();
 const oldRoots = getWorkspaceRoots();
 // Strict-mode workspace must not live under os.tmpdir() (C:\Users is not
@@ -32,9 +38,18 @@ let server;
 let client;
 try {
   process.env.CHATGPT_TOOL_PROFILE = "slim";
+  process.env.FULL_DISK_ACCESS = "false";
+  process.env.LOCAL_CODER_INSTANCE_ID = "tests";
+  process.env.CLC_SANDBOX_PROFILE_NAME = "ChatGPTLocalCoder.tests";
+  process.env.CLC_SANDBOX_STATE_DIR = path.join(temp, ".sandbox-state");
+  process.env.MCP_SHELL_STATE_DIR = path.join(temp, ".shell-state");
   setDefaultCwd(temp);
   setWorkspaceRoots([temp]);
 
+  // server-factory imports persistent-shell/state-path. Import it only after the
+  // test-owned state roots above are installed; a static import would bind the
+  // production parent's MCP_SHELL_STATE_DIR before fixture setup.
+  const { createMcpServer } = await import("../dist/server-factory.js");
   server = await createMcpServer(temp, 10, [temp], false);
   client = new Client({ name: "legacy-compat", version: "1" }, { capabilities: {} });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -154,6 +169,10 @@ try {
   setWorkspaceRoots(oldRoots);
   if (oldProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
   else process.env.CHATGPT_TOOL_PROFILE = oldProfile;
+  for (const [key, value] of Object.entries(oldRuntimeEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   // The fixture dir is owned by this test and created just above; remove it on
   // exit like the sibling git/sandbox tests so runs leave no residue under the
   // repo parent. The dir never holds user content, so exact-target removal is

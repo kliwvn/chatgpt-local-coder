@@ -32,6 +32,7 @@ import { recycleManagedDirectory } from "./safe-delete.mjs";
 import { preserveLegacySandboxPolicyManifest, reconcileLegacyRuntimeDirectory, reconcileLegacyShellStateDirectory } from "./runtime-state.mjs";
 import { evaluateOpenAiTunnelLaunchState, legacyPidFileMatchesProcessStart, openAiTunnelLaunchFingerprint, waitForTunnelPortRelease } from "./tunnel-state.mjs";
 import { configuredPrimaryWorkspaceRootsFromEnv, configuredWorkspaceRootsFromEnv } from "./workspace-scope.mjs";
+import { autoStartInstances, DEFAULT_AUTO_START_CONCURRENCY } from "./autostart-policy.mjs";
 import {
   atomicWriteFile,
   enqueueKeyedMutation,
@@ -57,12 +58,14 @@ const MANAGER_RUNTIME_FILES = [
   path.join(__dirname, "runtime-state.mjs"),
   path.join(__dirname, "tunnel-state.mjs"),
   path.join(__dirname, "workspace-scope.mjs"),
+  path.join(__dirname, "autostart-policy.mjs"),
 ];
 const ENV_PATH = path.join(ROOT, ".env");
 const STATE_DIR = path.resolve(process.env.MANAGER_STATE_DIR || path.join(__dirname, "state"));
 const LOG_DIR = path.join(STATE_DIR, "logs");
 const CONFIG_PATH = path.join(STATE_DIR, "config.json");
 const PROFILES_PATH = path.join(STATE_DIR, "profiles.json");
+const LEGACY_INSTANCE_MIGRATION_PATH = path.join(STATE_DIR, "legacy-instance-migration-v1.json");
 const SERVER_PID_FILE = path.join(STATE_DIR, "server.pid");
 const TUNNEL_PID_FILE = path.join(STATE_DIR, "tunnel.pid");
 const SERVER_LOG = path.join(LOG_DIR, "server.log");
@@ -94,6 +97,50 @@ const STARTUP_LNK = IS_WIN
       "ChatGPT Local Coder Manager.lnk"
     )
   : path.join(ROOT, ".autostart");
+
+function psSingleQuoted(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function autostartExpectedArguments() {
+  const launcherLiteral = `'${LAUNCHER_BAT.replaceAll("'", "''")}'`;
+  return `-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "& ${launcherLiteral} start"`;
+}
+
+function inspectAutostartLink() {
+  const exists = fs.existsSync(STARTUP_LNK);
+  if (!exists) return { exists: false, valid: false, reason: "missing" };
+  if (!IS_WIN) return { exists: true, valid: true, reason: "non-windows-marker" };
+
+  const psExe = path.join(
+    process.env.SystemRoot || "C:\\Windows",
+    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+  );
+  const expectedTarget = psExe;
+  const expectedArguments = autostartExpectedArguments();
+  const psCode = [
+    "$ErrorActionPreference='Stop'",
+    "$w=New-Object -ComObject WScript.Shell",
+    `$s=$w.CreateShortcut(${psSingleQuoted(STARTUP_LNK)})`,
+    `$expectedTarget=[IO.Path]::GetFullPath(${psSingleQuoted(expectedTarget)})`,
+    `$expectedLauncher=[IO.Path]::GetFullPath(${psSingleQuoted(LAUNCHER_BAT)})`,
+    `$expectedWork=[IO.Path]::GetFullPath(${psSingleQuoted(REPO_ROOT)}).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar)`,
+    `$expectedArguments=${psSingleQuoted(expectedArguments)}`,
+    "$actualTarget=[IO.Path]::GetFullPath($s.TargetPath)",
+    "$actualWork=[IO.Path]::GetFullPath($s.WorkingDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar)",
+    "if (-not [string]::Equals($actualTarget,$expectedTarget,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($actualWork,$expectedWork,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($s.Arguments,$expectedArguments,[StringComparison]::OrdinalIgnoreCase)) { exit 1 }",
+  ].join("; ");
+  const result = spawnSync(
+    psExe,
+    ["-NoProfile", "-Command", psCode],
+    { encoding: "utf8", windowsHide: true, timeout: 30000, maxBuffer: HELPER_OUTPUT_MAX_CHARS }
+  );
+  return {
+    exists: true,
+    valid: result.status === 0,
+    reason: result.status === 0 ? "exact-current-repo" : "stale-or-invalid",
+  };
+}
 const NPM_CMD = IS_WIN ? "npm.cmd" : "npm";
 const CLOUDFLARED = IS_WIN ? path.join(ROOT, "cloudflared.exe") : "cloudflared";
 const CLOUDFLARED_PROC = IS_WIN ? "cloudflared.exe" : "cloudflared";
@@ -165,17 +212,23 @@ const MANAGER_LOG = path.join(LOG_DIR, "manager.log");
 const MANAGER_RESTART_FILE = path.join(STATE_DIR, "manager-restart.json");
 const MANAGER_RESTART_GRACE_MS = 1500;
 const MANAGER_RESTART_RETRY_MS = 20000;
-const SERVER_START_TIMEOUT_TRUSTED_MS = 20000;
+const MANAGER_RESTART_PREPARE_TIMEOUT_MS = 8000;
+// A full-disk instance can still cold-start slowly immediately after Windows
+// login (disk/cache/AV contention, runtime-state migration, Node initialization).
+// Do not classify a live bootstrap as failed after the former 20s window.
+const SERVER_START_TIMEOUT_TRUSTED_MS = 120000;
 // First strict-mode startup can spend materially longer preparing/verifying the
-// AppContainer ACL policy for a broad configured workspace root. Do not kill a
-// healthy bootstrap at the old trusted-mode 20s deadline.
-const SERVER_START_TIMEOUT_STRICT_MS = 120000;
+// AppContainer ACL policy for a broad configured workspace root.
+const SERVER_START_TIMEOUT_STRICT_MS = 180000;
 const SANDBOX_COMPAT_CHECK_TIMEOUT_MS = 30000;
 const SANDBOX_COMPAT_SETUP_TIMEOUT_MS = 6 * 60 * 1000;
 let httpServer = null;
 let managerRestartInFlight = false;
 let installInProgress = false;
+const activeManagerMutations = new Map();
+let managerMutationSequence = 0;
 let sandboxCompatibilityChain = Promise.resolve();
+const cancelledBootAutoStart = new Set();
 
 function checkManagerSourceSyntax() {
   try {
@@ -197,28 +250,168 @@ function checkManagerSourceSyntax() {
 async function requestManagerRestart() {
   if (managerRestartInFlight) return { ok: false, error: "Manager đang khởi động lại rồi." };
   if (installInProgress) return { ok: false, error: "Install đang chạy — chờ xong rồi khởi động lại Manager." };
+  if (activeManagerMutations.size > 0) {
+    return {
+      ok: false,
+      retryable: true,
+      error: "Manager đang có mutation request chưa settle; từ chối self-restart để không cắt ngang state persistence.",
+      activeMutations: [...activeManagerMutations.values()].map((entry) => ({
+        method: entry.method,
+        path: entry.path,
+        startedAt: entry.startedAt,
+      })),
+    };
+  }
+  const busyServerInstances = [...serverLifecycleChains.keys()];
+  const busyTunnelInstances = [...tunnelLifecycleChains.keys()];
+  if (busyServerInstances.length > 0 || busyTunnelInstances.length > 0) {
+    return {
+      ok: false,
+      retryable: true,
+      error: "Manager đang có lifecycle Server/Tunnel chưa settle; từ chối self-restart để không cắt giữa spawn và persistence.",
+      busyServerInstances,
+      busyTunnelInstances,
+    };
+  }
   const check = checkManagerSourceSyntax();
   if (!check.ok) {
     return { ok: false, error: `Manager source lỗi cú pháp — không restart được: ${check.error}` };
   }
+  // Set the gate synchronously before the first await. This prevents a boot
+  // supervisor/API request from starting a new lifecycle operation after the
+  // busy check but before restart-token persistence completes.
   managerRestartInFlight = true;
   const token = randomUUID();
-  await fsp.mkdir(LOG_DIR, { recursive: true }).catch(() => {});
+  try {
+    await fsp.mkdir(LOG_DIR, { recursive: true });
+    await atomicWriteFile(
+      MANAGER_RESTART_FILE,
+      JSON.stringify({ token, at: Date.now(), pid: process.pid }),
+      "utf8"
+    );
+  } catch (err) {
+    managerRestartInFlight = false;
+    return {
+      ok: false,
+      error: `Không persist được restart handoff token; Manager hiện tại được giữ nguyên: ${String((err && err.message) || err).slice(0, 300)}`,
+    };
+  }
   await rotateLogFile(MANAGER_LOG).catch(() => {});
-  await fsp
-    .writeFile(MANAGER_RESTART_FILE, JSON.stringify({ token, at: Date.now(), pid: process.pid }), "utf8")
-    .catch(() => {});
   console.log(`[Manager] Restart theo yêu cầu (token ${token.slice(0, 8)}…) — spawn bản mới, giữ nguyên instance.`);
-  setTimeout(() => {
-    spawnDetached(process.execPath, ["manager/server.mjs", "--no-open", "--restart", token], MANAGER_LOG);
-  }, 300);
-  setTimeout(() => {
+  let replacementPid = null;
+  try {
+    replacementPid = spawnDetached(
+      process.execPath,
+      ["manager/server.mjs", "--no-open", "--restart", token],
+      MANAGER_LOG
+    );
+    if (!Number.isSafeInteger(replacementPid) || replacementPid <= 0 || !isPidAlive(replacementPid)) {
+      throw new Error(`replacement PID is not live/valid: ${replacementPid}`);
+    }
+  } catch (err) {
+    managerRestartInFlight = false;
+    return {
+      ok: false,
+      error: `Không spawn được replacement Manager; Manager hiện tại được giữ nguyên: ${String((err && err.message) || err).slice(0, 300)}`,
+    };
+  }
+  const prepared = await waitFor(async () => {
+    if (!isPidAlive(replacementPid)) return false;
     try {
-      if (httpServer) httpServer.close();
-    } catch {}
-    process.exit(0);
+      const receipt = JSON.parse(await fsp.readFile(MANAGER_RESTART_FILE, "utf8"));
+      return Boolean(
+        receipt &&
+        receipt.token === token &&
+        receipt.state === "prepared" &&
+        Number(receipt.replacementPid) === replacementPid
+      );
+    } catch {
+      return false;
+    }
+  }, MANAGER_RESTART_PREPARE_TIMEOUT_MS, 100);
+  if (!prepared || !isPidAlive(replacementPid)) {
+    if (isPidAlive(replacementPid)) {
+      killPidTree(replacementPid);
+      await waitFor(() => !isPidAlive(replacementPid), 3000, 100);
+    }
+    managerRestartInFlight = false;
+    return {
+      ok: false,
+      error: "Replacement Manager không hoàn tất prepared handoff; Manager hiện tại được giữ nguyên.",
+      replacementPid,
+      replacementPrepared: false,
+    };
+  }
+  // Return the API response while the old listener is still alive. After the
+  // response grace window, close only the listener (not the process), let the
+  // prepared replacement bind the canonical port, and require a second atomic
+  // `listening` receipt before the old process exits. If the replacement dies or
+  // never binds, the old Manager re-opens its listener instead of creating an
+  // avoidable control-plane outage.
+  setTimeout(() => {
+    void (async () => {
+      const reopenOldListener = async () => {
+        if (!httpServer || httpServer.listening) return true;
+        try {
+          await new Promise((resolve, reject) => {
+            const onError = (err) => {
+              httpServer.off("listening", onListening);
+              reject(err);
+            };
+            const onListening = () => {
+              httpServer.off("error", onError);
+              resolve();
+            };
+            httpServer.once("error", onError);
+            httpServer.once("listening", onListening);
+            httpServer.listen(managerPortNum, "127.0.0.1");
+          });
+          return true;
+        } catch (err) {
+          console.error(`[Manager] Restart rollback could not re-bind port ${managerPortNum}: ${String(err?.message || err).slice(0, 300)}`);
+          return false;
+        }
+      };
+
+      try {
+        if (httpServer?.listening) {
+          await new Promise((resolve, reject) => {
+            httpServer.close((err) => err ? reject(err) : resolve());
+          });
+        }
+        const listening = await waitFor(async () => {
+          if (!isPidAlive(replacementPid)) return false;
+          try {
+            const receipt = JSON.parse(await fsp.readFile(MANAGER_RESTART_FILE, "utf8"));
+            return Boolean(
+              receipt &&
+              receipt.token === token &&
+              receipt.state === "listening" &&
+              Number(receipt.replacementPid) === replacementPid
+            );
+          } catch {
+            return false;
+          }
+        }, MANAGER_RESTART_RETRY_MS + 5000, 100);
+        if (listening && isPidAlive(replacementPid)) {
+          process.exit(0);
+        }
+
+        if (isPidAlive(replacementPid)) {
+          killPidTree(replacementPid);
+          await waitFor(() => !isPidAlive(replacementPid), 3000, 100);
+        }
+        managerRestartInFlight = false;
+        await reopenOldListener();
+        console.error("[Manager] Replacement never proved canonical-port ownership; old Manager stayed alive and attempted listener rollback.");
+      } catch (err) {
+        managerRestartInFlight = false;
+        await reopenOldListener();
+        console.error(`[Manager] Restart handoff failed; old Manager stayed alive: ${String(err?.message || err).slice(0, 300)}`);
+      }
+    })();
   }, MANAGER_RESTART_GRACE_MS);
-  return { ok: true, pid: process.pid };
+  return { ok: true, pid: process.pid, replacementPid, handoffPending: true };
 }
 
 /* Canonical ChatGPT public contract (ABI v1) — read straight from the repo
@@ -305,21 +498,37 @@ function invalidatePortPidCache() { portPidCache = { at: 0, pids: new Map() }; }
 function listeningPortPids() {
   if (Date.now() - portPidCache.at < PORT_PID_CACHE_TTL_MS) return portPidCache.pids;
   const pids = new Map();
-  try {
-    const out = spawnSync("netstat", ["-ano", "-p", "tcp"], {
+  // netstat can transiently exceed a few seconds during Windows cold boot or
+  // heavy process churn. Ownership must still fail closed, but a single helper
+  // timeout must not turn a healthy managed runtime into an availability outage.
+  // Retry with bounded increasing budgets and cache only a successful scan.
+  const scanTimeouts = [3000, 6000, 10000];
+  let scan = null;
+  const scanFailures = [];
+  for (let attempt = 0; attempt < scanTimeouts.length; attempt++) {
+    const timeout = scanTimeouts[attempt];
+    scan = spawnSync("netstat", ["-ano", "-p", "tcp"], {
       encoding: "utf8",
       windowsHide: true,
-      timeout: 3000,
+      timeout,
       maxBuffer: 2 * 1024 * 1024,
-    }).stdout || "";
-    for (const line of out.split(/\r?\n/)) {
-      const m = /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i.exec(line);
-      if (!m) continue;
-      const port = Number(m[1]);
-      const pid = Number(m[2]);
-      if (Number.isInteger(port) && Number.isInteger(pid) && pid > 0 && !pids.has(port)) pids.set(port, pid);
-    }
-  } catch {}
+    });
+    if (!scan.error && scan.status === 0) break;
+    const detail = scan.error?.message || String(scan.stderr || "").trim() || `exit ${scan.status}`;
+    scanFailures.push(`attempt ${attempt + 1}/${scanTimeouts.length} (${timeout}ms): ${detail.slice(0, 180)}`);
+    scan = null;
+  }
+  if (!scan) {
+    throw new Error(`PROCESS_PORT_SCAN_FAILED: netstat listener ownership scan failed after bounded retries: ${scanFailures.join("; ").slice(0, 700)}`);
+  }
+  const out = scan.stdout || "";
+  for (const line of out.split(/\r?\n/)) {
+    const m = /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i.exec(line);
+    if (!m) continue;
+    const port = Number(m[1]);
+    const pid = Number(m[2]);
+    if (Number.isInteger(port) && Number.isInteger(pid) && pid > 0 && !pids.has(port)) pids.set(port, pid);
+  }
   portPidCache = { at: Date.now(), pids };
   return pids;
 }
@@ -362,12 +571,17 @@ async function ensureStateDirs() {
 }
 
 async function readJson(p, fallback) {
+  let raw;
   try {
-    return JSON.parse(await readUtf8FileBounded(p, MANAGER_JSON_MAX_BYTES, "manager state JSON"));
+    raw = await readUtf8FileBounded(p, MANAGER_JSON_MAX_BYTES, "manager state JSON");
   } catch (err) {
     if (err?.code === "ENOENT") return fallback;
-    if (/manager state JSON exceeds/i.test(String(err?.message || err))) throw err;
-    return fallback;
+    throw err;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`MANAGER_JSON_INVALID: ${p}: ${String(err?.message || err).slice(0, 300)}`);
   }
 }
 
@@ -398,12 +612,19 @@ async function readConfig() {
 }
 
 async function readPidFile(p) {
+  let raw;
   try {
-    const pid = Number((await readUtf8FileBounded(p, MANAGER_PID_MAX_BYTES, "manager PID file")).trim());
-    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
-  } catch {
-    return null;
+    raw = await readUtf8FileBounded(p, MANAGER_PID_MAX_BYTES, "manager PID file");
+  } catch (err) {
+    if (err?.code === "ENOENT") return null;
+    throw err;
   }
+  const text = raw.trim();
+  const pid = Number(text);
+  if (!text || !Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error(`MANAGER_PID_INVALID: ${p}: expected a positive integer PID, received ${JSON.stringify(text.slice(0, 80))}`);
+  }
+  return pid;
 }
 
 async function writePidFile(p, pid) {
@@ -571,7 +792,7 @@ async function migrateLegacyRuntimeState(name, env, inst) {
       targetDir: path.join(inst.dir, "shell-state"),
       instanceId: name,
     });
-    if (restoredPolicy.action !== "none" && restoredPolicy.action !== "identical") {
+    if (!["none", "identical", "covered"].includes(restoredPolicy.action)) {
       console.log(`[manager] Recovered sandbox policy metadata from historical shell-state orphan (${restoredPolicy.action}).`);
     }
   } catch (err) {
@@ -702,7 +923,9 @@ async function readInstanceConfig(name) {
   const config = await readJson(instPaths(name).config, {
     lastTunnelUrl: "",
     healthPort: 8080,
-    autoStart: true,
+    // Missing managed config is missing authority, not consent to start. New
+    // instances and legacy migration always persist an explicit autoStart value.
+    autoStart: false,
   });
   delete config.connectorName;
   return config;
@@ -712,7 +935,7 @@ function publicInstanceConfig(config) {
   return {
     lastTunnelUrl: String(config?.lastTunnelUrl || ""),
     healthPort: Number(config?.healthPort || 8080),
-    autoStart: config?.autoStart !== false,
+    autoStart: config?.autoStart === true,
   };
 }
 
@@ -729,7 +952,7 @@ async function writeInstanceConfig(name, config) {
 
 async function updateInstanceConfig(name, updater) {
   const file = instPaths(name).config;
-  return mutateJson(file, { lastTunnelUrl: "", healthPort: 8080, autoStart: true }, async (config) => {
+  return mutateJson(file, { lastTunnelUrl: "", healthPort: 8080, autoStart: false }, async (config) => {
     await updater(config);
     delete config.connectorName;
     return config;
@@ -738,7 +961,16 @@ async function updateInstanceConfig(name, updater) {
 
 async function removeLegacyConnectorNameConfig() {
   for (const name of await listInstances()) {
-    await updateInstanceConfig(name, () => undefined);
+    try {
+      if (!fs.existsSync(instPaths(name).config)) continue;
+      await updateInstanceConfig(name, () => undefined);
+    } catch (err) {
+      // A corrupt config must never be rewritten from defaults (which could turn
+      // autoStart back on), but one damaged workspace must not take the Manager
+      // control plane down. Leave the bytes untouched and surface the instance
+      // error through /api/instances for explicit repair.
+      console.warn(`[manager] ${name}: config cleanup skipped: ${String(err?.message || err).slice(0, 300)}`);
+    }
   }
 }
 
@@ -752,8 +984,20 @@ async function allUsedPorts(excludeName = null) {
     if (Number.isInteger(p) && p > 0 && p < 65536) ports.add(p);
     const a = Number(env.ADMIN_PORT);
     if (Number.isInteger(a) && a > 0 && a < 65536) ports.add(a);
-    const cfg = await readInstanceConfig(n);
-    const h = Number(cfg.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 8080);
+    let configHealthPort = null;
+    try {
+      const cfg = await readInstanceConfig(n);
+      configHealthPort = cfg.healthPort;
+    } catch (err) {
+      // config.json owns UI/autostart/tunnel launch evidence, but the tunnel
+      // health port is also persisted in .env. One corrupt auxiliary config must
+      // not make unrelated instance create/save operations unavailable. Reserve
+      // the .env/default port here; actual allocation also probes OS listeners.
+      console.warn(
+        `[Manager] ${n}: config unreadable during port catalog scan; using .env health-port authority: ${String(err?.message || err).slice(0, 220)}`
+      );
+    }
+    const h = Number(configHealthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 8080);
     if (Number.isInteger(h) && h > 0 && h < 65536) ports.add(h);
   }
   return ports;
@@ -778,35 +1022,254 @@ async function findTunnelConflicts(name, tunnelId, apiKey) {
   return conflicts;
 }
 
+async function readLegacyInstanceMigrationReceipt() {
+  let raw;
+  try {
+    raw = await readUtf8FileBounded(
+      LEGACY_INSTANCE_MIGRATION_PATH,
+      MANAGER_JSON_MAX_BYTES,
+      "legacy instance migration receipt"
+    );
+  } catch (err) {
+    if (err?.code === "ENOENT") return null;
+    throw err;
+  }
+  try {
+    const receipt = JSON.parse(raw);
+    if (!receipt || receipt.version !== 1 || !["prepared", "complete"].includes(receipt.state)) {
+      throw new Error("unsupported receipt shape/state");
+    }
+    return receipt;
+  } catch (err) {
+    throw new Error(`LEGACY_INSTANCE_MIGRATION_RECEIPT_INVALID: ${String(err?.message || err).slice(0, 300)}`);
+  }
+}
+
+async function writeLegacyInstanceMigrationReceipt(receipt) {
+  await atomicWriteFile(
+    LEGACY_INSTANCE_MIGRATION_PATH,
+    JSON.stringify({ version: 1, ...receipt }, null, 2),
+    "utf8"
+  );
+}
+
+async function readLegacyMigrationMarker(dir, expectedMigrationId) {
+  const markerPath = path.join(dir, ".legacy-instance-migration-v1.json");
+  let raw;
+  try {
+    raw = await readUtf8FileBounded(markerPath, MANAGER_JSON_MAX_BYTES, "legacy instance migration marker");
+  } catch (err) {
+    if (err?.code === "ENOENT") return null;
+    throw err;
+  }
+  let marker;
+  try {
+    marker = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`LEGACY_INSTANCE_MIGRATION_MARKER_INVALID: ${markerPath}: ${String(err?.message || err).slice(0, 300)}`);
+  }
+  if (
+    !marker ||
+    marker.version !== 1 ||
+    marker.source !== "legacy-single-instance" ||
+    marker.migrationId !== expectedMigrationId
+  ) {
+    throw new Error(`LEGACY_INSTANCE_MIGRATION_MARKER_INVALID: ${markerPath}: migration identity mismatch`);
+  }
+  return marker;
+}
+
+async function listLegacyMigrationStages() {
+  const prefix = ".legacy-default-migration-";
+  const stages = [];
+  const dir = await fsp.opendir(INSTANCES_DIR);
+  for await (const entry of dir) {
+    if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
+    stages.push({
+      name: entry.name,
+      migrationId: entry.name.slice(prefix.length),
+      dir: path.join(INSTANCES_DIR, entry.name),
+    });
+  }
+  stages.sort((a, b) => a.name.localeCompare(b.name));
+  return stages;
+}
+
 /** Migrate trạng thái đơn-instance (ROOT/.env + manager/state) sang instance "default". */
 async function ensureInstances() {
   await fsp.mkdir(INSTANCES_DIR, { recursive: true });
-  if ((await listInstances()).length > 0) return;
+  const migrationReceipt = await readLegacyInstanceMigrationReceipt();
+  const migrationComplete = migrationReceipt?.state === "complete";
+  const existingInstances = await listInstances();
+  if (existingInstances.length > 0) {
+    if (migrationComplete) return;
+    if (migrationReceipt?.state === "prepared") {
+      const marker = await readLegacyMigrationMarker(instPaths("default").dir, migrationReceipt.migrationId);
+      if (!marker) {
+        throw new Error(
+          "LEGACY_INSTANCE_MIGRATION_INCOMPLETE: a prepared migration exists beside managed instances, but exact default-instance migration identity cannot be proven."
+        );
+      }
+      await writeLegacyInstanceMigrationReceipt({
+        state: "complete",
+        migrationId: migrationReceipt.migrationId,
+        completedAt: new Date().toISOString(),
+        reason: "legacy-default-migrated-recovered",
+      });
+      return;
+    }
+    // Upgrade path: managed workspaces existed before the receipt contract. Mark
+    // migration complete without touching their bytes. From this point onward,
+    // deleting the final workspace is a durable intentional zero-instance state.
+    await writeLegacyInstanceMigrationReceipt({
+      state: "complete",
+      completedAt: new Date().toISOString(),
+      reason: "managed-instances-present",
+    });
+    return;
+  }
+  if (migrationComplete) return;
+
+  const migrationStages = await listLegacyMigrationStages();
+  if (migrationReceipt?.state === "prepared") {
+    const expectedStage = migrationStages.find((stage) => stage.migrationId === migrationReceipt.migrationId);
+    if (!expectedStage || migrationStages.length !== 1) {
+      throw new Error(
+        `LEGACY_INSTANCE_MIGRATION_INCOMPLETE: prepared migration ${migrationReceipt.migrationId} does not have exactly one matching hidden stage.`
+      );
+    }
+    const marker = await readLegacyMigrationMarker(expectedStage.dir, migrationReceipt.migrationId);
+    if (!marker) {
+      throw new Error(
+        `LEGACY_INSTANCE_MIGRATION_INCOMPLETE: prepared hidden stage ${expectedStage.name} is missing its exact migration marker.`
+      );
+    }
+    const inst = instPaths("default");
+    await fsp.rename(expectedStage.dir, inst.dir);
+    await writeLegacyInstanceMigrationReceipt({
+      state: "complete",
+      migrationId: migrationReceipt.migrationId,
+      completedAt: new Date().toISOString(),
+      reason: "legacy-default-migrated-stage-recovered",
+    });
+    return;
+  }
+
+  if (migrationStages.length > 0) {
+    if (migrationStages.length !== 1) {
+      throw new Error(
+        `LEGACY_INSTANCE_MIGRATION_ORPHAN_STAGE: found ${migrationStages.length} hidden migration stages without a receipt; refusing ambiguous recovery.`
+      );
+    }
+    const orphanStage = migrationStages[0];
+    const marker = await readLegacyMigrationMarker(orphanStage.dir, orphanStage.migrationId);
+    if (!marker) {
+      throw new Error(
+        `LEGACY_INSTANCE_MIGRATION_ORPHAN_STAGE: ${orphanStage.name} is partial (no exact marker); preserving it and refusing false completion.`
+      );
+    }
+    // The stage is fully populated and identity-marked; only the global prepared
+    // receipt write was lost. Reconstruct it, then atomically publish the stage.
+    await writeLegacyInstanceMigrationReceipt({
+      state: "prepared",
+      migrationId: orphanStage.migrationId,
+      preparedAt: new Date().toISOString(),
+      reason: "legacy-default-stage-recovered-without-receipt",
+    });
+    const inst = instPaths("default");
+    await fsp.rename(orphanStage.dir, inst.dir);
+    await writeLegacyInstanceMigrationReceipt({
+      state: "complete",
+      migrationId: orphanStage.migrationId,
+      completedAt: new Date().toISOString(),
+      reason: "legacy-default-migrated-stage-recovered-without-receipt",
+    });
+    return;
+  }
+
   const legacyEnv = await readEnvRaw();
-  if (!legacyEnv) return;
+  if (!legacyEnv) {
+    await writeLegacyInstanceMigrationReceipt({
+      state: "complete",
+      completedAt: new Date().toISOString(),
+      reason: "no-legacy-instance-state",
+    });
+    return;
+  }
+
+  // Build the legacy default instance outside the managed-name namespace. The
+  // leading dot makes this staging directory impossible for listInstances() to
+  // treat as a real instance. Only a fully populated stage is atomically renamed
+  // to `default`, so a crash/error cannot leave a partial valid-looking instance.
+  const migrationId = randomUUID();
+  const stageDir = path.join(INSTANCES_DIR, `.legacy-default-migration-${migrationId}`);
+  const staged = {
+    dir: stageDir,
+    env: path.join(stageDir, ".env"),
+    config: path.join(stageDir, "config.json"),
+    serverPid: path.join(stageDir, "server.pid"),
+    tunnelPid: path.join(stageDir, "tunnel.pid"),
+    serverLog: path.join(stageDir, "server.log"),
+    tunnelLog: path.join(stageDir, "tunnel.log"),
+    marker: path.join(stageDir, ".legacy-instance-migration-v1.json"),
+  };
+  await fsp.mkdir(stageDir, { recursive: false });
+  await atomicWriteFile(staged.env, legacyEnv, "utf8");
   const inst = instPaths("default");
-  await fsp.mkdir(inst.dir, { recursive: true });
-  await atomicWriteFile(inst.env, legacyEnv, "utf8");
   const legacyConfig = await readConfig();
   const legacyParsed = parseDotEnv(legacyEnv);
   const legacyHealthPortRaw = String(legacyParsed.OPENAI_TUNNEL_HEALTH_PORT || "8080").trim();
   const legacyHealthPort = Number(legacyHealthPortRaw);
-  await writeInstanceConfig("default", {
+  await writeJson(staged.config, {
     lastTunnelUrl: legacyConfig.lastTunnelUrl || "",
     healthPort: Number.isInteger(legacyHealthPort) && legacyHealthPort > 0 && legacyHealthPort < 65536 ? legacyHealthPort : 8080,
     autoStart: true,
   });
   // Nhận nuôi process/log đang chạy (server/tunnel sống sót qua migration)
   for (const [old, dest] of [
-    [SERVER_PID_FILE, inst.serverPid],
-    [TUNNEL_PID_FILE, inst.tunnelPid],
-    [SERVER_LOG, inst.serverLog],
-    [TUNNEL_LOG, inst.tunnelLog],
+    [SERVER_PID_FILE, staged.serverPid],
+    [TUNNEL_PID_FILE, staged.tunnelPid],
   ]) {
     try {
       await fsp.copyFile(old, dest);
-    } catch {}
+    } catch (err) {
+      if (err?.code !== "ENOENT") {
+        throw new Error(`Legacy lifecycle authority migration failed (${old} -> ${dest}): ${String(err?.message || err)}`);
+      }
+    }
   }
+  // Historical logs are diagnostic only. Their absence/copy failure must not
+  // block migration, but non-ENOENT failures are surfaced instead of swallowed.
+  for (const [old, dest] of [
+    [SERVER_LOG, staged.serverLog],
+    [TUNNEL_LOG, staged.tunnelLog],
+  ]) {
+    try {
+      await fsp.copyFile(old, dest);
+    } catch (err) {
+      if (err?.code !== "ENOENT") {
+        console.warn(`[manager] Legacy diagnostic log copy skipped (${old} -> ${dest}): ${String(err?.message || err).slice(0, 240)}`);
+      }
+    }
+  }
+  await atomicWriteFile(
+    staged.marker,
+    JSON.stringify({ version: 1, migrationId, source: "legacy-single-instance" }, null, 2),
+    "utf8"
+  );
+  await writeLegacyInstanceMigrationReceipt({
+    state: "prepared",
+    migrationId,
+    preparedAt: new Date().toISOString(),
+    reason: "legacy-default-stage-ready",
+  });
+  await fsp.rename(stageDir, inst.dir);
+  await writeLegacyInstanceMigrationReceipt({
+    state: "complete",
+    migrationId,
+    completedAt: new Date().toISOString(),
+    reason: "legacy-default-migrated",
+  });
 }
 
 
@@ -922,6 +1385,14 @@ function isExactManagedRuntimeHealth(health, name, savedPid) {
   return Number.isSafeInteger(healthPid) && healthPid === savedPid;
 }
 
+function isExactCurrentServerProcess(pid) {
+  if (!IS_WIN || !Number.isSafeInteger(pid) || pid <= 0 || !isPidAlive(pid)) return false;
+  // Recovery is intentionally stronger than normal health classification. A
+  // missing server.pid is writable authority, so only adopt a current repo child
+  // whose Windows command line names this exact compiled entry point.
+  return processesWithCmdLine("node.exe", SERVER_ENTRY).some((process) => process.pid === pid);
+}
+
 function isLocalCoderHealth(health, env, name = null, { allowLegacy = false } = {}) {
   if (!isLocalCoderRuntimeHealth(health)) return false;
   if (name && !isManagedInstanceHealth(health, name, { allowLegacy })) return false;
@@ -930,16 +1401,36 @@ function isLocalCoderHealth(health, env, name = null, { allowLegacy = false } = 
   // must never make an arbitrary Local Coder health response look like a match.
   return Boolean(expected && samePath(expected, health.workspace));
 }
-async function tunnelClientHealth(port) {
+async function tunnelClientHealthOnce(port) {
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(1500) });
-    if (!res.ok) return false;
-    const type = String(res.headers.get("content-type") || "").toLowerCase();
-    if (!type.includes("text/html")) return false;
-    return /<title>\s*tunnel-client\s*<\/title>/i.test(
-      await readResponseTextBounded(res, 64 * 1024, "tunnel health response")
-    );
+    const [liveness, readiness] = await Promise.all([
+      fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(1500) }),
+      fetch(`http://127.0.0.1:${port}/readyz`, { signal: AbortSignal.timeout(1500) }),
+    ]);
+    if (!liveness.ok || !readiness.ok) {
+      await liveness.body?.cancel().catch(() => undefined);
+      await readiness.body?.cancel().catch(() => undefined);
+      return false;
+    }
+    const [liveText, readyText] = await Promise.all([
+      readResponseTextBounded(liveness, 4096, "tunnel liveness response"),
+      readResponseTextBounded(readiness, 4096, "tunnel readiness response"),
+    ]);
+    return liveText.trim().toLowerCase() === "live" && readyText.trim().toLowerCase() === "ready";
   } catch { return false; }
+}
+
+async function tunnelClientHealth(port) {
+  // The health listener is local and normally answers immediately, but a single
+  // probe can transiently time out while Windows/Node is under cold-start load.
+  // Do not turn one observation miss into healthDrift for an otherwise exact
+  // managed tunnel. Keep the retry bounded and keep the body contract strict:
+  // every accepted result still requires healthz="live" + readyz="ready".
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (await tunnelClientHealthOnce(port)) return true;
+    if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+  }
+  return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1117,7 +1608,7 @@ async function serverStatus(name, desiredEnv = null) {
   const buildState = await runtimeBuildStatus();
   const configuredPort = Number(env.PORT || 0);
   const configuredPortValid = Number.isInteger(configuredPort) && configuredPort > 0 && configuredPort < 65536;
-  const savedPid = await readPidFile(inst.serverPid);
+  let savedPid = await readPidFile(inst.serverPid);
 
   let portOpen = false;
   let health = null;
@@ -1133,38 +1624,79 @@ async function serverStatus(name, desiredEnv = null) {
     health = await serverHealth(configuredPort);
     if (health) portOpen = true;
     if (portOpen && !portPid) portPid = pidOnPort(configuredPort);
-    if (!health && savedPid && portPid === savedPid && isPidAlive(savedPid)) {
-      // A freshly restarted Local Coder Server can accept TCP a fraction before /health is
-      // consistently ready under Windows load. Retry only when the listener PID
-      // exactly matches our managed PID; never spend extra retries on an unknown
-      // port occupant and never relax the health/workspace identity requirement.
-      await new Promise((resolve) => setTimeout(resolve, 120));
-      health = await serverHealth(configuredPort);
+    if (!health && portOpen) {
+      // A freshly restarted Local Coder Server can accept TCP a fraction before
+      // /health is consistently ready under Windows load. This retry must also
+      // work in the exact crash window where server.pid is missing/dead; gating
+      // it on savedPid makes the recovery path self-defeating. Retry only the
+      // identity probe — never infer ownership from an open socket alone.
+      for (let attempt = 0; attempt < 3 && !health; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        health = await serverHealth(configuredPort);
+      }
     }
     // netstat is cached for UI efficiency and Windows can briefly publish the
-    // listener before the PID snapshot catches up. If current health already
-    // proves the exact managed instance identity and the persisted PID is alive,
-    // refresh the PID map before deciding ownership. We still require the
-    // refreshed listener PID to equal server.pid; this repairs stale-cache races
-    // without adopting an unrelated process.
+    // listener before the PID snapshot catches up. Current health carries its own
+    // PID, so refresh toward health.pid rather than toward server.pid. The latter
+    // can itself be a live-but-wrong stale ledger and must never become the target
+    // of cache reconciliation.
+    let currentHealthPid = Number(health?.pid);
+    let currentHealthPidAlive = Boolean(
+      Number.isSafeInteger(currentHealthPid) && currentHealthPid > 0 && isPidAlive(currentHealthPid)
+    );
     if (
       portOpen &&
-      savedPid &&
-      isPidAlive(savedPid) &&
-      portPid !== savedPid &&
-      isManagedInstanceHealth(health, name)
+      currentHealthPidAlive &&
+      isManagedInstanceHealth(health, name) &&
+      portPid !== currentHealthPid
     ) {
-      for (let attempt = 0; attempt < 3 && portPid !== savedPid; attempt++) {
+      for (let attempt = 0; attempt < 3 && portPid !== currentHealthPid; attempt++) {
         invalidatePortPidCache();
         portPid = pidOnPort(configuredPort);
-        if (portPid === savedPid) break;
+        if (portPid === currentHealthPid) break;
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
-    const exactManagedRuntime = Boolean(
-      portOpen && isExactManagedRuntimeHealth(health, name, savedPid)
+    // Crash-window recovery: the managed child may have reached /health after
+    // spawn while the Manager died before server.pid persistence completed.
+    // Reconstruct the ledger only from mutually reinforcing current-build proof:
+    // exact instance+workspace health, health PID, live listener PID and exact
+    // CURRENT repo dist/index.js command-line identity. Never apply this bridge to
+    // legacy health without instance_id, unsaved/proposed config, or a PID mismatch.
+    const savedPidAlive = Boolean(savedPid && isPidAlive(savedPid));
+    if ((!savedPid || !savedPidAlive) && !desiredEnv && isLocalCoderHealth(health, env, name)) {
+      const healthPid = currentHealthPid;
+      if (Number.isSafeInteger(healthPid) && healthPid > 0 && isPidAlive(healthPid)) {
+        for (let attempt = 0; attempt < 3 && portPid !== healthPid; attempt += 1) {
+          invalidatePortPidCache();
+          portPid = pidOnPort(configuredPort);
+          if (portPid === healthPid) break;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        if (portPid === healthPid && isExactCurrentServerProcess(healthPid)) {
+          await writePidFile(inst.serverPid, healthPid);
+          savedPid = healthPid;
+          currentHealthPid = healthPid;
+          currentHealthPidAlive = true;
+          console.warn(`[manager] ${name}: recovered missing server.pid from exact current runtime identity (PID ${healthPid}).`);
+        }
+      }
+    }
+    const currentManagedListener = Boolean(
+      portOpen &&
+      currentHealthPidAlive &&
+      portPid === currentHealthPid &&
+      isManagedInstanceHealth(health, name)
     );
-    const legacyOwnedListener = Boolean(savedPid && portPid === savedPid && isPidAlive(savedPid));
+    const exactManagedRuntime = Boolean(
+      currentManagedListener && isExactManagedRuntimeHealth(health, name, savedPid)
+    );
+    const legacyOwnedListener = Boolean(
+      !String(health?.instance_id || "").trim() &&
+      savedPid &&
+      portPid === savedPid &&
+      isPidAlive(savedPid)
+    );
     if (portOpen && isLocalCoderHealth(health, env, name, { allowLegacy: legacyOwnedListener })) {
       const artifactDrift = isRuntimeArtifactStale(
         health?.instructions?.loaded_at,
@@ -1174,7 +1706,7 @@ async function serverStatus(name, desiredEnv = null) {
         running: true,
         port: configuredPort,
         configuredPort,
-        pid: exactManagedRuntime ? savedPid : (portPid || savedPid || null),
+        pid: currentManagedListener ? currentHealthPid : (portPid || savedPid || null),
         health,
         portOccupied: false,
         invalidConfig: false,
@@ -1183,7 +1715,10 @@ async function serverStatus(name, desiredEnv = null) {
         buildDrift: buildState.sourceNewerThanBuild,
         buildSourceMtimeMs: buildState.newestSourceMtimeMs,
         buildArtifactMtimeMs: buildState.newestArtifactMtimeMs,
-        owned: exactManagedRuntime || Boolean(savedPid && (!portPid || savedPid === portPid)),
+        // Current runtimes prove ownership through exact saved-PID == health-PID
+        // identity. Legacy runtimes without instance_id require the stricter
+        // saved-PID listener proof. Missing netstat data alone is never ownership.
+        owned: exactManagedRuntime || legacyOwnedListener,
       };
     }
 
@@ -1193,8 +1728,7 @@ async function serverStatus(name, desiredEnv = null) {
     if (
       portOpen &&
       isManagedInstanceHealth(health, name, { allowLegacy: legacyOwnedListener }) &&
-      savedPid &&
-      (exactManagedRuntime || legacyOwnedListener)
+      (currentManagedListener || legacyOwnedListener)
     ) {
       const artifactDrift = isRuntimeArtifactStale(
         health?.instructions?.loaded_at,
@@ -1204,7 +1738,7 @@ async function serverStatus(name, desiredEnv = null) {
         running: true,
         port: configuredPort,
         configuredPort,
-        pid: savedPid,
+        pid: currentManagedListener ? currentHealthPid : savedPid,
         health,
         portOccupied: false,
         invalidConfig: false,
@@ -1215,7 +1749,7 @@ async function serverStatus(name, desiredEnv = null) {
         buildDrift: buildState.sourceNewerThanBuild,
         buildSourceMtimeMs: buildState.newestSourceMtimeMs,
         buildArtifactMtimeMs: buildState.newestArtifactMtimeMs,
-        owned: true,
+        owned: exactManagedRuntime || legacyOwnedListener,
       };
     }
   }
@@ -1228,10 +1762,27 @@ async function serverStatus(name, desiredEnv = null) {
   // instance_id on current builds is never adopted as owned. Older builds that
   // predate instance_id remain recoverable once so the Manager can upgrade them.
   if (savedPid && isPidAlive(savedPid)) {
-    for (const actualPort of portsForPid(savedPid)) {
+    let actualPorts = [];
+    // This path is entered specifically because desired PORT no longer proves
+    // the live child. Never trust the normal 2s UI cache here: it may have been
+    // captured just before a restart published the replacement listener. Take a
+    // fresh bounded snapshot so out-of-band PORT edits cannot make a managed
+    // child disappear until the cache naturally expires.
+    for (let attempt = 0; attempt < 3 && actualPorts.length === 0; attempt++) {
+      invalidatePortPidCache();
+      actualPorts = portsForPid(savedPid);
+      if (actualPorts.length > 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    for (const actualPort of actualPorts) {
       if (actualPort === configuredPort) continue;
       const actualHealth = await serverHealth(actualPort);
-      if (!isManagedInstanceHealth(actualHealth, name, { allowLegacy: true })) continue;
+      const exactCurrentIdentity = isExactManagedRuntimeHealth(actualHealth, name, savedPid);
+      const legacyWithoutInstanceIdentity = Boolean(
+        !String(actualHealth?.instance_id || "").trim() &&
+        isManagedInstanceHealth(actualHealth, name, { allowLegacy: true })
+      );
+      if (!exactCurrentIdentity && !legacyWithoutInstanceIdentity) continue;
       const workspaceDrift = !isLocalCoderHealth(actualHealth, env, name, { allowLegacy: true });
       const artifactDrift = isRuntimeArtifactStale(
         actualHealth?.instructions?.loaded_at,
@@ -1352,6 +1903,13 @@ async function startServerUnlocked(name) {
       ...st,
     };
   }
+  if (st.running && !st.owned) {
+    return {
+      ok: false,
+      error: `A Local Coder runtime is already serving PORT ${st.port} but exact managed PID ownership could not be proven; refusing false-green start/adoption.`,
+      ...st,
+    };
+  }
   if (st.running) return { ok: true, alreadyRunning: true, ...st };
   if (st.invalidConfig) return { ok: false, error: "PORT is invalid; fix configuration before starting Local Coder." };
   if (st.portOccupied) return { ok: false, error: `PORT ${st.port} is occupied by another process${st.pid ? ` (PID ${st.pid})` : ""}; refusing to start Local Coder.` };
@@ -1416,6 +1974,17 @@ async function startServerUnlocked(name) {
     await scrubLogFile(file);
   }
   await rotateLogFile(inst.serverLog);
+  const startupTimeoutMs = String(env.FULL_DISK_ACCESS || "false").trim().toLowerCase() === "true"
+    ? SERVER_START_TIMEOUT_TRUSTED_MS
+    : SERVER_START_TIMEOUT_STRICT_MS;
+  const startupAttemptId = randomUUID().slice(0, 12);
+  const startupStartedAt = Date.now();
+  const startupLogMarker = `[manager-start] attempt=${startupAttemptId}`;
+  await fsp.appendFile(
+    inst.serverLog,
+    `\n${startupLogMarker} instance=${name} started_at=${new Date(startupStartedAt).toISOString()} timeout_ms=${startupTimeoutMs}\n`,
+    "utf8"
+  );
   const pid = spawnDetached(process.execPath, [SERVER_ENTRY], inst.serverLog, {
     ...env,
     // Manager-owned identity/state injected after user env so .env cannot spoof runtime identity.
@@ -1433,9 +2002,6 @@ async function startServerUnlocked(name) {
   });
   invalidatePortPidCache();
   await writePidFile(inst.serverPid, pid);
-  const startupTimeoutMs = String(env.FULL_DISK_ACCESS || "false").trim().toLowerCase() === "true"
-    ? SERVER_START_TIMEOUT_TRUSTED_MS
-    : SERVER_START_TIMEOUT_STRICT_MS;
   let startupState = "pending";
   await waitFor(async () => {
     if (!isPidAlive(pid)) {
@@ -1448,22 +2014,42 @@ async function startServerUnlocked(name) {
     }
     return false;
   }, startupTimeoutMs);
+  // One exact final probe closes the waitFor deadline race: the runtime may have
+  // become healthy between the last polling iteration and timeout expiry. Never
+  // kill a process that can prove the expected instance/workspace identity now.
+  let finalHealth = null;
+  if (startupState !== "healthy" && isPidAlive(pid)) {
+    finalHealth = await serverHealth(st.port);
+    if (isLocalCoderHealth(finalHealth, env, name)) startupState = "healthy";
+  }
   const up = startupState === "healthy";
   if (!up) {
+    const startupElapsedMs = Date.now() - startupStartedAt;
+    const pidAliveAtDeadline = isPidAlive(pid);
+    const portOpenAtDeadline = await isPortOpen(st.port);
     killPidTree(pid);
     invalidatePortPidCache();
     const stopped = await waitFor(() => !isPidAlive(pid), 5000, 150);
     if (stopped) await writePidFile(inst.serverPid, null);
     const tail = await tailFile(inst.serverLog);
+    const markerOffset = tail.lastIndexOf(startupLogMarker);
+    const attemptTail = markerOffset >= 0 ? tail.slice(markerOffset) : tail;
+    const diagnostic = `attempt=${startupAttemptId} state=${startupState} elapsed_ms=${startupElapsedMs} timeout_ms=${startupTimeoutMs} pid_alive=${pidAliveAtDeadline} port_open=${portOpenAtDeadline}`;
     return {
       ok: false,
-      error: "Server không khởi động được." + (stopped ? "" : ` PID ${pid} vẫn còn sống; giữ server.pid để có thể stop/recover an toàn.`) + " Log cuối:\n" + tail.slice(-1500),
+      error: `Server không đạt health-ready (${diagnostic}).` + (stopped ? "" : ` PID ${pid} vẫn còn sống; giữ server.pid để có thể stop/recover an toàn.`) + " Log của attempt:\n" + attemptTail.slice(-1500),
       pid: stopped ? null : pid,
       cleanupFailed: !stopped,
+      startupState,
+      startupAttemptId,
+      startupTimeoutMs,
+      startupElapsedMs,
+      pidAliveAtDeadline,
+      portOpenAtDeadline,
     };
   }
   await warmUpMcp(st.port); // làm ấm trước khi tunnel probe (timeout 2s)
-  return { ok: true, running: true, port: st.port, pid, health: await serverHealth(st.port) };
+  return { ok: true, running: true, port: st.port, pid, health: finalHealth || await serverHealth(st.port) };
 }
 
 async function stopServerUnlocked(name) {
@@ -1540,14 +2126,25 @@ async function stopServerUnlocked(name) {
 }
 
 async function startServer(name) {
+  if (managerRestartInFlight) {
+    return { ok: false, error: "Manager đang self-restart; từ chối bắt đầu Server lifecycle mới." };
+  }
   return enqueueServerLifecycle(name, () => startServerUnlocked(name));
 }
 
 async function stopServer(name) {
+  cancelledBootAutoStart.add(name);
+  if (managerRestartInFlight) {
+    return { ok: false, error: "Manager đang self-restart; từ chối bắt đầu Server lifecycle mới." };
+  }
   return enqueueServerLifecycle(name, () => stopServerUnlocked(name));
 }
 
 async function restartServer(name) {
+  cancelledBootAutoStart.add(name);
+  if (managerRestartInFlight) {
+    return { ok: false, restarted: false, error: "Manager đang self-restart; từ chối bắt đầu Server lifecycle mới." };
+  }
   return enqueueServerLifecycle(name, async () => {
     const buildState = await runtimeBuildStatus(true);
     if (buildState.sourceNewerThanBuild) {
@@ -1835,7 +2432,11 @@ async function ensureTunnelClient() {
   let backupPath = null;
   try {
     installedVersion = (await fsp.readFile(TUNNEL_CLIENT_VERSION_FILE, "utf8")).trim();
-  } catch {}
+  } catch (err) {
+    if (err?.code !== "ENOENT") {
+      return { ok: false, error: `Không đọc được tunnel-client version marker: ${String(err?.message || err).slice(0, 300)}` };
+    }
+  }
   if (fs.existsSync(exe) && installedVersion === OPENAI_TUNNEL_VERSION) {
     return { ok: true, path: exe };
   }
@@ -1882,13 +2483,24 @@ async function ensureTunnelClient() {
     const message = String((err && err.message) || err);
     // Rollback: nếu chưa cài được bản mới mà exe đang thiếu (đã rename đi),
     // khôi phục backup ngay để không để lại trạng thái mất binary.
+    let rollbackError = null;
     if (backupPath && !fs.existsSync(exe)) {
       try {
         await fsp.rename(backupPath, exe);
         backupPath = null;
-      } catch {}
+      } catch (rollbackErr) {
+        rollbackError = String(rollbackErr?.message || rollbackErr).slice(0, 300);
+      }
     }
-    return { ok: false, error: message.startsWith("Giải nén") || message.startsWith("Tải tunnel-client") ? message : `Tải tunnel-client lỗi: ${message}` };
+    const baseError = message.startsWith("Giải nén") || message.startsWith("Tải tunnel-client") ? message : `Tải tunnel-client lỗi: ${message}`;
+    return {
+      ok: false,
+      error: rollbackError
+        ? `${baseError}; rollback binary thất bại (${rollbackError}). Backup được giữ tại ${backupPath}.`
+        : baseError,
+      rollbackFailed: Boolean(rollbackError),
+      backupPath: rollbackError ? backupPath : null,
+    };
   }
 }
 
@@ -2231,14 +2843,25 @@ async function stopTunnelUnlocked(name) {
 }
 
 async function startTunnel(name) {
+  if (managerRestartInFlight) {
+    return { ok: false, error: "Manager đang self-restart; từ chối bắt đầu Tunnel lifecycle mới." };
+  }
   return enqueueTunnelLifecycle(name, () => startTunnelUnlocked(name));
 }
 
 async function stopTunnel(name) {
+  cancelledBootAutoStart.add(name);
+  if (managerRestartInFlight) {
+    return { ok: false, error: "Manager đang self-restart; từ chối bắt đầu Tunnel lifecycle mới." };
+  }
   return enqueueTunnelLifecycle(name, () => stopTunnelUnlocked(name));
 }
 
 async function restartTunnel(name) {
+  cancelledBootAutoStart.add(name);
+  if (managerRestartInFlight) {
+    return { ok: false, restarted: false, error: "Manager đang self-restart; từ chối bắt đầu Tunnel lifecycle mới." };
+  }
   return enqueueTunnelLifecycle(name, async () => {
     const before = await tunnelStatus(name);
     const stopped = await stopTunnelUnlocked(name);
@@ -2675,7 +3298,7 @@ async function instanceBundle(name, { includeCheck = false } = {}) {
       OPENAI_TUNNEL_HEALTH_PORT: String(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || "8080"),
     },
     config: {
-      autoStart: config.autoStart !== false,
+      autoStart: config.autoStart === true,
       lastTunnelUrl: config.lastTunnelUrl || "",
     },
     server: srv,
@@ -2745,7 +3368,6 @@ async function createInstanceUnlocked(body) {
     };
   }
   const inst = instPaths(name);
-  await fsp.mkdir(inst.dir, { recursive: true });
   const envText = [
     `PORT=${port}`,
     `ADMIN_PORT=${adminPort}`,
@@ -2763,13 +3385,43 @@ async function createInstanceUnlocked(body) {
     "AUDIT_LOG_PATH=.mcp-audit.log",
     "",
   ].join("\n");
-  await atomicWriteFile(inst.env, envText, "utf8");
-  await writeInstanceConfig(name, {
-    lastTunnelUrl: "",
-    healthPort,
-    autoStart: body.autoStart !== false,
-  });
-  return { ok: true, name, port, adminPort, healthPort, workspace: ws };
+  // Publish a new instance transactionally. A valid-name directory is catalog
+  // authority (`listInstances()` discovers it), so never create that directory
+  // until every required authority file is complete. Hidden staging names cannot
+  // match INSTANCE_NAME_RE and therefore remain invisible after a process crash.
+  const stageDir = path.join(INSTANCES_DIR, `.creating-${name}-${randomUUID()}`);
+  const stagedEnv = path.join(stageDir, ".env");
+  const stagedConfig = path.join(stageDir, "config.json");
+  await fsp.mkdir(stageDir, { recursive: false });
+  try {
+    await atomicWriteFile(stagedEnv, envText, "utf8");
+    await writeJson(stagedConfig, {
+      lastTunnelUrl: "",
+      healthPort,
+      autoStart: body.autoStart !== false,
+    });
+    // A serialized Manager create cannot race another Manager create, but an
+    // out-of-band directory may still appear. rename() is the final atomic
+    // catalog publication and must fail rather than merge/overwrite it.
+    await fsp.rename(stageDir, inst.dir);
+    return { ok: true, name, port, adminPort, healthPort, workspace: ws };
+  } catch (err) {
+    let cleanupError = null;
+    if (fs.existsSync(stageDir)) {
+      try {
+        await recycleManagedDirectory(stageDir, INSTANCES_DIR);
+      } catch (cleanupErr) {
+        cleanupError = String(cleanupErr?.message || cleanupErr).slice(0, 400);
+      }
+    }
+    return {
+      ok: false,
+      error: `Instance '${name}' was not published because transactional creation failed: ${String(err?.message || err).slice(0, 500)}`
+        + (cleanupError ? `; hidden staging cleanup failed and was preserved for recovery: ${cleanupError}` : ""),
+      published: false,
+      stagingPreserved: Boolean(cleanupError),
+    };
+  }
 }
 
 async function createInstance(body) {
@@ -2782,6 +3434,14 @@ async function deleteInstance(name) {
   if (!INSTANCE_NAME_RE.test(name)) return { ok: false, error: "Tên không hợp lệ." };
   if (name === "default") return { ok: false, error: "Instance 'default' là mặc định, không xóa được." };
   const inst = instPaths(name);
+  let configReadable = true;
+  let configReadError = null;
+  try {
+    await readInstanceConfig(name);
+  } catch (err) {
+    configReadable = false;
+    configReadError = err;
+  }
   // Capture the exact managed PID before lifecycle teardown. Metadata must not be
   // recycled until that process is confirmed gone; otherwise a transient status
   // false-negative can orphan a still-running Local Coder child.
@@ -2793,14 +3453,24 @@ async function deleteInstance(name) {
   // Fail closed: never delete the only metadata/profile/PID files for a process
   // we failed to stop. Otherwise a transient lifecycle failure can turn a managed
   // server/tunnel into an orphan that the Manager can no longer identify safely.
-  let tunnelStop;
-  try {
-    tunnelStop = await stopTunnel(name);
-  } catch (err) {
-    return { ok: false, error: `Không thể dừng Tunnel trước khi xóa '${name}': ${String(err?.message || err)}` };
-  }
-  if (!tunnelStop?.ok) {
-    return { ok: false, error: `Không thể dừng Tunnel trước khi xóa '${name}': ${tunnelStop?.error || "unknown error"}` };
+  if (!configReadable) {
+    const proof = await proveInstanceInactiveWithoutConfig(name, serverBeforeDelete);
+    if (!proof.ok) {
+      return {
+        ok: false,
+        error: `Config authority của '${name}' không đọc được (${String(configReadError?.message || configReadError)}); từ chối xóa vì chưa chứng minh instance hoàn toàn inactive: ${proof.error}`,
+      };
+    }
+  } else {
+    let tunnelStop;
+    try {
+      tunnelStop = await stopTunnel(name);
+    } catch (err) {
+      return { ok: false, error: `Không thể dừng Tunnel trước khi xóa '${name}': ${String(err?.message || err)}` };
+    }
+    if (!tunnelStop?.ok) {
+      return { ok: false, error: `Không thể dừng Tunnel trước khi xóa '${name}': ${tunnelStop?.error || "unknown error"}` };
+    }
   }
 
   let serverStop;
@@ -2825,7 +3495,8 @@ async function deleteInstance(name) {
     }
   }
 
-  const [serverAfter, tunnelAfter] = await Promise.all([serverStatus(name), tunnelStatus(name)]);
+  const serverAfter = await serverStatus(name);
+  const tunnelAfter = configReadable ? await tunnelStatus(name) : { running: false };
   if (serverAfter.running || tunnelAfter.running) {
     return {
       ok: false,
@@ -2851,6 +3522,41 @@ async function deleteInstance(name) {
   }
   return { ok: true, name, serverPid: serverPidBeforeDelete, serverPidExited: true };
 }
+
+async function proveInstanceInactiveWithoutConfig(name, knownServerStatus = null) {
+  const inst = instPaths(name);
+  const env = await readInstanceEnv(name);
+  const server = knownServerStatus || await serverStatus(name);
+  if (server.running) {
+    return { ok: false, error: `Server vẫn đang chạy trên PORT ${server.port || env.PORT || "?"}.` };
+  }
+
+  const savedTunnelPid = await readPidFile(inst.tunnelPid);
+  if (savedTunnelPid && isPidAlive(savedTunnelPid)) {
+    return { ok: false, error: `tunnel.pid còn trỏ tới PID sống ${savedTunnelPid}.` };
+  }
+
+  const openAiCandidates = processesWithCmdLine("tunnel-client.exe", inst.profile)
+    .filter((process) => isPidAlive(process.pid));
+  if (openAiCandidates.length > 0) {
+    return { ok: false, error: `còn tunnel-client candidate theo exact profile (${openAiCandidates.map((p) => p.pid).join(",")}).` };
+  }
+
+  const serverPort = Number(env.PORT || 0);
+  const cloudflareCandidates = Number.isInteger(serverPort) && serverPort > 0 && serverPort < 65536
+    ? processesWithCmdLine("cloudflared.exe", `localhost:${serverPort}`).filter((process) => isPidAlive(process.pid))
+    : [];
+  if (cloudflareCandidates.length > 0) {
+    return { ok: false, error: `còn cloudflared candidate cho PORT ${serverPort} (${cloudflareCandidates.map((p) => p.pid).join(",")}).` };
+  }
+
+  const healthPort = Number(env.OPENAI_TUNNEL_HEALTH_PORT || 0);
+  if (Number.isInteger(healthPort) && healthPort > 0 && healthPort < 65536 && await isPortOpen(healthPort)) {
+    return { ok: false, error: `tunnel health port ${healthPort} vẫn đang listen; ownership không thể chứng minh an toàn khi config hỏng.` };
+  }
+  return { ok: true };
+}
+
 async function renameInstance(name, body) {
   if (!INSTANCE_NAME_RE.test(name)) return { ok: false, error: "Tên không hợp lệ." };
   if (name === "default") return { ok: false, error: "Instance 'default' là instance mặc định, không đổi tên được." };
@@ -2863,8 +3569,20 @@ async function renameInstance(name, body) {
     return { ok: false, error: `Instance '${newName}' đã tồn tại.` };
   }
   // Chặn đổi tên khi server/tunnel đang chạy (pid files theo tên thư mục — đổi lúc chạy sẽ mất dấu process)
-  const [srv, tun] = await Promise.all([serverStatus(name), tunnelStatus(name)]);
-  if (srv.running || tun.running) {
+  const srv = await serverStatus(name);
+  let tun = null;
+  try {
+    tun = await tunnelStatus(name);
+  } catch (err) {
+    const proof = await proveInstanceInactiveWithoutConfig(name, srv);
+    if (!proof.ok) {
+      return {
+        ok: false,
+        error: `Không thể đọc config/tunnel authority để đổi tên '${name}' (${String(err?.message || err)}); ${proof.error}`,
+      };
+    }
+  }
+  if (srv.running || tun?.running) {
     return { ok: false, error: "Phải dừng Server và Tunnel trước khi đổi tên workspace." };
   }
   const src = instPaths(name);
@@ -2958,8 +3676,41 @@ async function saveInstanceEnvUnlocked(name, body) {
     return { ok: false, error: `Tunnel ${first.field === "OPENAI_TUNNEL_ID" ? "ID" : "API key"} '${first.value}' is already used by instance '${first.instance}'; each workspace must use its own tunnel.` };
   }
 
+  // `.env` and config.healthPort form one logical mutation. Prove the auxiliary
+  // config authority is readable before committing `.env`; otherwise a corrupt
+  // config could make the API return failure after silently changing runtime
+  // configuration. A later I/O race is handled by rolling `.env` back below.
+  try {
+    await readInstanceConfig(name);
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Cannot save instance environment while config authority is unreadable: ${String(err?.message || err).slice(0, 500)}`,
+      committed: false,
+    };
+  }
+
   await atomicWriteFile(inst.env, next, "utf8");
-  await updateInstanceConfig(name, (config) => { config.healthPort = hp; });
+  try {
+    await updateInstanceConfig(name, (config) => {
+      config.healthPort = hp;
+      if (typeof body.autoStart === "boolean") config.autoStart = body.autoStart;
+    });
+  } catch (err) {
+    let rollbackError = null;
+    try {
+      await atomicWriteFile(inst.env, original, "utf8");
+    } catch (restoreErr) {
+      rollbackError = String(restoreErr?.message || restoreErr).slice(0, 500);
+    }
+    return {
+      ok: false,
+      error: `Config health-port sync failed after .env write: ${String(err?.message || err).slice(0, 500)}`
+        + (rollbackError ? `; .env rollback also failed: ${rollbackError}` : "; .env was rolled back to its exact previous bytes."),
+      committed: false,
+      rollbackFailed: Boolean(rollbackError),
+    };
+  }
   return { ok: true, path: inst.env };
 }
 
@@ -3115,7 +3866,7 @@ async function handleApi(req, res, url, body) {
           node: process.version,
           error: String((err && err.message) || err),
           env: {},
-          config: { autoStart: true, lastTunnelUrl: "" },
+          config: { autoStart: false, lastTunnelUrl: "" },
           server: { running: false, port: 0, pid: null, health: null },
           tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
           check: { ok: false, items: [], error: String((err && err.message) || err) },
@@ -3236,17 +3987,12 @@ async function handleApi(req, res, url, body) {
 
   /* ---------------- legacy single-instance routes (alias → default) ---------------- */
   const dname = await defaultInstanceName();
-  if (!dname) {
-    return json(res, 200, {
-      ok: true,
-      migrated: false,
-      error: "Chưa có instance nào — tạo qua POST /api/instances",
-      env: {},
-      config: {},
-      server: { running: false, port: 3000, pid: null, health: null },
-      tunnel: { running: false, mode: "cloudflare", kind: null, url: null, healthPort: 8080, cloudflaredExists: false },
-    });
-  }
+  // Do NOT gate the rest of the API on a default instance. Instance-dependent
+  // legacy aliases are already rejected by the no-instance guard above, while
+  // Manager-global routes below (/health, /autostart, /manager/restart,
+  // /profiles, /install, /tunnel/download) must remain usable on a fresh install
+  // with zero workspaces. A catch-all `if (!dname) return ...` here used to
+  // shadow those routes and made exact Manager health identity disappear.
 
   if (req.method === "GET" && p === "/api/status") {
     const [env, config, srv, tun, installed] = await Promise.all([
@@ -3306,6 +4052,7 @@ async function handleApi(req, res, url, body) {
   if (req.method === "PUT" && p === "/api/config") {
     const config = await updateInstanceConfig(dname, (config) => {
       if (typeof body.lastTunnelUrl === "string") config.lastTunnelUrl = body.lastTunnelUrl;
+      if (typeof body.autoStart === "boolean") config.autoStart = body.autoStart;
     });
     return json(res, 200, { ok: true, config: publicInstanceConfig(config) });
   }
@@ -3393,8 +4140,15 @@ async function handleApi(req, res, url, body) {
   // --- Autostart manager khi đăng nhập Windows (Startup folder .lnk) ---
   if (p === "/api/autostart") {
     if (req.method === "GET") {
-      const on = fs.existsSync(STARTUP_LNK);
-      return json(res, 200, { ok: true, enabled: on, lnk: STARTUP_LNK });
+      const state = inspectAutostartLink();
+      return json(res, 200, {
+        ok: true,
+        enabled: state.valid,
+        exists: state.exists,
+        drift: state.exists && !state.valid,
+        reason: state.reason,
+        lnk: STARTUP_LNK,
+      });
     }
     if (req.method === "POST") {
       const enable = Boolean(body && body.enabled);
@@ -3409,12 +4163,13 @@ async function handleApi(req, res, url, body) {
           // Windows hiện đại: "There is no script engine for file extension
           // '.vbs'") và không tạo thêm file launcher phụ trong manager/state/.
           const psExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+          const expectedArguments = autostartExpectedArguments();
           const psCode =
             "$ws = New-Object -ComObject WScript.Shell\n" +
-            "$s = $ws.CreateShortcut('" + STARTUP_LNK + "')\n" +
-            "$s.TargetPath = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'\n" +
-            "$s.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"& ' + [char]39 + '" + LAUNCHER_BAT + "' + [char]39 + ' start\"'\n" +
-            "$s.WorkingDirectory = '" + REPO_ROOT + "'\n" +
+            `$s = $ws.CreateShortcut(${psSingleQuoted(STARTUP_LNK)})\n` +
+            `$s.TargetPath = ${psSingleQuoted(psExe)}\n` +
+            `$s.Arguments = ${psSingleQuoted(expectedArguments)}\n` +
+            `$s.WorkingDirectory = ${psSingleQuoted(REPO_ROOT)}\n` +
             "$s.WindowStyle = 7\n" +
             "$s.Description = 'ChatGPT Local Coder Manager (hidden)'\n" +
             "$s.Save()\n";
@@ -3426,19 +4181,12 @@ async function handleApi(req, res, url, body) {
           if (r.status !== 0) {
             return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: " + (r.stderr || r.stdout || "").trim().slice(-200) });
           }
-          // Đọc ngược LNK: phải trỏ đúng chatgpt-local-coder.bat (chống false-green
-          // khi LNK cũ còn sót lại mà lệnh tạo mới thất bại âm thầm).
-          const verifyCode =
-            "$w = New-Object -ComObject WScript.Shell; " +
-            "$s = $w.CreateShortcut('" + STARTUP_LNK + "'); " +
-            "if ($s.Arguments -notmatch 'chatgpt-local-coder\\.bat') { exit 1 }";
-          const v = spawnSync(
-            psExe,
-            ["-NoProfile", "-Command", verifyCode],
-            { encoding: "utf8", windowsHide: true, timeout: 30000, maxBuffer: HELPER_OUTPUT_MAX_CHARS }
-          );
-          if (v.status !== 0) {
-            return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: LNK không trỏ tới chatgpt-local-coder.bat" });
+          // Đọc ngược LNK và chứng minh đủ 3 identity: PowerShell target,
+          // launcher absolute path của CURRENT repo, và CURRENT repo working dir.
+          // Chỉ kiểm basename là false-green khi repo từng bị move/copy.
+          const verification = inspectAutostartLink();
+          if (!verification.valid) {
+            return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: LNK không khớp exact CURRENT repo launcher/working directory" });
           }
           // Dọn VBS cũ nếu còn (phiên bản cũ từng tạo) để không còn shortcut chết.
           try {
@@ -3506,6 +4254,7 @@ async function main() {
   // File để nguyên (inert sau khi dùng) — không xóa, tránh destructive op.
   const restartArgIndex = process.argv.indexOf("--restart");
   const restartToken = restartArgIndex >= 0 ? process.argv[restartArgIndex + 1] : null;
+  let restartPending = null;
   if (restartToken) {
     try {
       const pending = JSON.parse(await fsp.readFile(MANAGER_RESTART_FILE, "utf8"));
@@ -3513,6 +4262,7 @@ async function main() {
         console.error(`[Manager] --restart token không khớp file đang chờ — từ chối khởi động.`);
         process.exit(1);
       }
+      restartPending = pending;
     } catch {
       console.error(`[Manager] Không đọc được file restart (${MANAGER_RESTART_FILE}) — từ chối khởi động.`);
       process.exit(1);
@@ -3523,8 +4273,30 @@ async function main() {
     try {
       const url = new URL(req.url, `http://${req.headers.host || "127.0.0.1"}`);
       if (url.pathname.startsWith("/api/")) {
-        const body = ["POST", "PUT", "DELETE", "PATCH"].includes(req.method) ? await readBody(req) : {};
-        await handleApi(req, res, url, body);
+        const mutatingMethod = ["POST", "PUT", "DELETE", "PATCH"].includes(req.method);
+        const restartRequest = req.method === "POST" && url.pathname === "/api/manager/restart";
+        const trackMutation = mutatingMethod && !restartRequest;
+        if (trackMutation && managerRestartInFlight) {
+          return json(res, 409, {
+            ok: false,
+            retryable: true,
+            error: "Manager đang self-restart; mutation mới bị từ chối cho tới khi handoff settle.",
+          });
+        }
+        const mutationId = trackMutation ? ++managerMutationSequence : null;
+        if (trackMutation) {
+          activeManagerMutations.set(mutationId, {
+            method: req.method,
+            path: url.pathname,
+            startedAt: new Date().toISOString(),
+          });
+        }
+        try {
+          const body = mutatingMethod ? await readBody(req) : {};
+          await handleApi(req, res, url, body);
+        } finally {
+          if (trackMutation) activeManagerMutations.delete(mutationId);
+        }
         return;
       }
       if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
@@ -3555,13 +4327,38 @@ async function main() {
 
   httpServer = server;
 
+  if (restartToken) {
+    // Signal only after all pre-listen initialization above completed. The old
+    // Manager refuses to exit until this exact replacement PID proves it reached
+    // the handoff-ready point and persisted the receipt atomically.
+    await atomicWriteFile(
+      MANAGER_RESTART_FILE,
+      JSON.stringify({
+        ...restartPending,
+        state: "prepared",
+        replacementPid: process.pid,
+        preparedAt: Date.now(),
+      }),
+      "utf8"
+    );
+  }
+
   async function listenWithRetry(port, noOpen, restartToken) {
     const deadline = Date.now() + MANAGER_RESTART_RETRY_MS;
     for (;;) {
       try {
         await new Promise((resolve, reject) => {
-          server.once("error", reject);
-          server.listen(port, "127.0.0.1", resolve);
+          const onError = (err) => {
+            server.off("listening", onListening);
+            reject(err);
+          };
+          const onListening = () => {
+            server.off("error", onError);
+            resolve();
+          };
+          server.once("error", onError);
+          server.once("listening", onListening);
+          server.listen(port, "127.0.0.1");
         });
         return;
       } catch (err) {
@@ -3587,6 +4384,22 @@ async function main() {
   }
 
   await listenWithRetry(port, noOpen, restartToken);
+  if (restartToken) {
+    // The old Manager exits only after this exact replacement proves it owns the
+    // canonical control-plane listener. This closes the prepared-but-not-bound
+    // handoff window without requiring two Managers to bind the same port.
+    await atomicWriteFile(
+      MANAGER_RESTART_FILE,
+      JSON.stringify({
+        ...restartPending,
+        token: restartToken,
+        state: "listening",
+        replacementPid: process.pid,
+        listeningAt: Date.now(),
+      }),
+      "utf8"
+    );
+  }
   console.log("");
   console.log("=== Quản Lý ChatGPT Local Coder (multi-instance) ===");
   console.log(`Manager UI:  http://127.0.0.1:${port}`);
@@ -3596,38 +4409,26 @@ async function main() {
   startManagedLogMaintenance();
   if (!noOpen) openExternal(`http://127.0.0.1:${port}`);
 
-  // Tự động bật Focus Server + Focus Tunnel cho từng instance có autoStart
-  for (const name of await listInstances()) {
-    const config = await readInstanceConfig(name);
-    if (config.autoStart === false) {
-      console.log(`[Auto] ${name}: bỏ qua (autoStart tắt)`);
-      continue;
+  // Bootstrap autoStart as a bounded supervisor, not a one-shot serial loop.
+  // Keep this detached from manager HTTP startup so one slow Windows cold-start
+  // cannot block the dashboard or another independent instance. Explicit Stop /
+  // Restart cancels pending boot retries for that instance for this manager run.
+  const autoStartNames = await listInstances();
+  void autoStartInstances(autoStartNames, {
+    concurrency: DEFAULT_AUTO_START_CONCURRENCY,
+    readConfig: readInstanceConfig,
+    startServer,
+    startTunnel,
+    shouldContinue: async (name) => !managerRestartInFlight && !cancelledBootAutoStart.has(name),
+    log: (line) => console.log(line),
+  }).then((results) => {
+    const failed = results.filter((result) => !result.ok);
+    if (failed.length > 0) {
+      console.warn(`[Auto] bootstrap completed with ${failed.length}/${results.length} instance(s) still unavailable.`);
     }
-    try {
-      const srv = await startServer(name);
-      console.log(
-        srv.alreadyRunning
-          ? `[Auto] ${name}: Server đã chạy (cổng ${srv.port})`
-          : srv.ok
-            ? `[Auto] ${name}: Server đã bật (pid ${srv.pid})`
-            : `[Auto] ${name}: Server lỗi: ${String(srv.error || "").slice(0, 160)}`
-      );
-      if (!srv.ok) {
-        console.log(`[Auto] ${name}: bỏ qua Tunnel vì Server chưa chạy an toàn.`);
-        continue;
-      }
-      const tun = await startTunnel(name);
-      console.log(
-        tun.alreadyRunning
-          ? `[Auto] ${name}: Tunnel đã chạy (${tun.mode})`
-          : tun.ok
-            ? `[Auto] ${name}: Tunnel đã bật (${tun.mode}${tun.url ? " — " + tun.url : ""})`
-            : `[Auto] ${name}: Tunnel lỗi: ${String(tun.error || "").slice(0, 160)}`
-      );
-    } catch (err) {
-      console.log(`[Auto] ${name}: Lỗi không mong đợi: ${String((err && err.message) || err).slice(0, 200)}`);
-    }
-  }
+  }).catch((err) => {
+    console.error(`[Auto] bootstrap supervisor failed: ${String((err && err.message) || err).slice(0, 300)}`);
+  });
 }
 
 main();

@@ -243,9 +243,12 @@ try {
   const instanceConfigPut = (await put("/api/instances/demo/config", { autoStart: false })).body;
   assert.equal(Object.prototype.hasOwnProperty.call(instanceConfigPut.config || {}, "openaiTunnelLaunchFingerprint"), false, "instance config PUT response must not expose internal tunnel launch fingerprint");
   assert.equal(Object.prototype.hasOwnProperty.call(instanceConfigPut.config || {}, "tunnelProcessStartedAt"), false, "instance config PUT response must not expose internal tunnel process identity");
-  const legacyConfigPut = (await put("/api/config", { lastTunnelUrl: "" })).body;
+  const legacyConfigPut = (await put("/api/config", { lastTunnelUrl: "", autoStart: true })).body;
+  assert.equal(legacyConfigPut.config?.autoStart, true, "legacy /api/config must preserve alias semantics for autoStart mutations");
   assert.equal(Object.prototype.hasOwnProperty.call(legacyConfigPut.config || {}, "openaiTunnelLaunchFingerprint"), false, "legacy config PUT response must not expose internal tunnel launch fingerprint");
   assert.equal(Object.prototype.hasOwnProperty.call(legacyConfigPut.config || {}, "tunnelProcessStartedAt"), false, "legacy config PUT response must not expose internal tunnel process identity");
+  const legacyConfigReset = (await put("/api/config", { autoStart: false })).body;
+  assert.equal(legacyConfigReset.config?.autoStart, false, "legacy /api/config autoStart round-trip must remain writable in both directions");
   const internalConfigDisk = JSON.parse(await fs.readFile(path.join(demo, "config.json"), "utf8"));
   assert.equal(internalConfigDisk.openaiTunnelLaunchFingerprint, "a".repeat(64), "public config scrubbing must not destroy internal launch evidence");
   assert.equal(internalConfigDisk.tunnelProcessStartedAt, "2026-08-14T12:00:00.0000000Z", "public config scrubbing must preserve internal tunnel process identity");
@@ -362,6 +365,7 @@ try {
   const managerCss = await fs.readFile(path.join(process.cwd(), "manager", "styles.css"), "utf8");
   const managerServerSource = await fs.readFile(path.join(process.cwd(), "manager", "server.mjs"), "utf8");
   const managerRuntimeStateSource = await fs.readFile(path.join(process.cwd(), "manager", "runtime-state.mjs"), "utf8");
+  const launcherSource = await fs.readFile(path.join(process.cwd(), "chatgpt-local-coder.bat"), "utf8");
   const adminUiSource = await fs.readFile(path.join(process.cwd(), "public", "ui", "app.js"), "utf8");
   const envExampleSource = await fs.readFile(path.join(process.cwd(), ".env.example"), "utf8");
   const runtimeEntrySource = await fs.readFile(path.join(process.cwd(), "src", "index.ts"), "utf8");
@@ -406,6 +410,9 @@ try {
   assert.match(managerServerSource, /ADMIN_PORT .*is occupied by another process/);
   assert.match(managerServerSource, /dừng Server trước khi đổi PORT hoặc ADMIN_PORT/);
   assert.match(managerServerSource, /instanceCreateChain = Promise\.resolve\(\)/, "instance creation must serialize port allocation and persistence");
+  assert.match(managerServerSource, /const stageDir = path\.join\(INSTANCES_DIR, `\.creating-\$\{name\}-\$\{randomUUID\(\)\}`\)/, "new instance creation must stage under a hidden non-instance directory");
+  assert.match(managerServerSource, /atomicWriteFile\(stagedEnv, envText[\s\S]{0,420}?writeJson\(stagedConfig[\s\S]{0,420}?fsp\.rename\(stageDir, inst\.dir\)/, "new instance creation must complete .env+config before atomically publishing the valid-name directory");
+  assert.doesNotMatch(managerServerSource, /async function createInstanceUnlocked\(body\)[\s\S]{0,7000}?fsp\.mkdir\(inst\.dir, \{ recursive: true \}\)/, "create must never publish the catalog-visible instance directory before authority files are complete");
   assert.match(managerServerSource, /existingManager = await managerHealth\(port\)/, "EADDRINUSE must verify Local Coder Manager identity before treating the port as an existing Manager");
   assert.match(managerServerSource, /isRuntimeArtifactStale\([\s\S]{0,160}?instructions\?\.loaded_at[\s\S]{0,160}?buildState\.newestArtifactMtimeMs/, "Manager status must compare running Local Coder Server startup time against the newest compiled runtime module");
   assert.match(managerServerSource, /inspectRuntimeBuildFreshness/, "Manager must compare source freshness against the complete compiled runtime tree");
@@ -413,6 +420,7 @@ try {
   assert.match(managerServerSource, /const serverState = await serverStatus\(name\);[\s\S]{0,1200}?serverState\.buildDrift \|\| serverState\.artifactDrift/, "Tunnel start must refuse to expose a stale Local Coder Server contract");
   assert.match(managerServerSource, /MANAGER_RUNTIME_FILES/, "Manager must track the source modules that require self-restart after modification");
   assert.match(managerServerSource, /tunnel-state\.mjs/, "Manager self-drift tracking must include tunnel launch-state logic");
+  assert.match(managerServerSource, /autostart-policy\.mjs/, "Manager self-drift tracking must include boot autostart policy logic");
   assert.match(managerServerSource, /managerRuntimeStatus\(\)/, "Manager must expose self artifact drift status");
   assert.match(managerServerSource, /!st\.portOccupied && !st\.invalidConfig && !st\.configDrift && !st\.artifactDrift && !st\.buildDrift/, "configuration check must not report stale saved config/source/build/runtime state as healthy");
   assert.match(managerServerSource, /openAiTunnelLaunchFingerprint\(\{[\s\S]{0,220}?tunnelId[\s\S]{0,220}?apiKey[\s\S]{0,220}?healthPort[\s\S]{0,220}?serverPort/, "OpenAI tunnel status/start must bind ID, secret, health port and server port into secret-safe launch evidence");
@@ -472,17 +480,70 @@ try {
   assert.match(managerApp, /\/api\/manager\/restart/, "Manager frontend must call the dedicated self-restart API");
   assert.match(managerServerSource, /p === "\/api\/manager\/restart"/, "Manager must expose POST /api/manager/restart");
   assert.match(managerServerSource, /--restart/, "Manager self-restart must hand off via a restart token argument");
+  assert.match(managerServerSource, /const busyServerInstances = \[\.\.\.serverLifecycleChains\.keys\(\)\][\s\S]{0,220}?const busyTunnelInstances = \[\.\.\.tunnelLifecycleChains\.keys\(\)\][\s\S]{0,360}?retryable:\s*true/, "Manager self-restart must refuse to cut across in-flight Server/Tunnel lifecycle work");
+  assert.match(managerServerSource, /const activeManagerMutations = new Map\(\)[\s\S]{0,180}?let managerMutationSequence = 0/, "Manager must maintain explicit in-flight mutation authority for restart serialization");
+  assert.match(managerServerSource, /if \(activeManagerMutations\.size > 0\)[\s\S]{0,260}?retryable:\s*true[\s\S]{0,360}?activeMutations:/, "self-restart must fail closed while any Manager mutation request is unsettled");
+  assert.match(managerServerSource, /const mutatingMethod = \["POST", "PUT", "DELETE", "PATCH"\]\.includes\(req\.method\)[\s\S]{0,220}?const restartRequest = req\.method === "POST" && url\.pathname === "\/api\/manager\/restart"[\s\S]{0,160}?const trackMutation = mutatingMethod && !restartRequest/, "HTTP control-plane must classify all mutating methods while excluding the restart request from deadlocking itself");
+  assert.match(managerServerSource, /if \(trackMutation && managerRestartInFlight\)[\s\S]{0,260}?retryable:\s*true[\s\S]{0,420}?activeManagerMutations\.set\(mutationId[\s\S]{0,420}?const body = mutatingMethod \? await readBody\(req\) : \{\}[\s\S]{0,260}?finally \{[\s\S]{0,120}?activeManagerMutations\.delete\(mutationId\)/, "mutation authority must be registered before body read, reject new writes during handoff, and always settle in finally");
+  assert.match(managerServerSource, /const onError = \(err\) => \{[\s\S]{0,160}?server\.off\("listening", onListening\)[\s\S]{0,180}?const onListening = \(\) => \{[\s\S]{0,160}?server\.off\("error", onError\)[\s\S]{0,220}?server\.once\("error", onError\)[\s\S]{0,120}?server\.once\("listening", onListening\)/, "listenWithRetry must remove its one-shot startup error listener after successful bind instead of swallowing a later HTTP server error");
+  assert.match(managerServerSource, /managerRestartInFlight = true;[\s\S]{0,260}?atomicWriteFile\([\s\S]{0,120}?MANAGER_RESTART_FILE[\s\S]{0,260}?catch \(err\)[\s\S]{0,140}?managerRestartInFlight = false/, "Manager restart handoff token persistence must fail closed and keep the current Manager alive");
+  assert.doesNotMatch(managerServerSource, /writeFile\(MANAGER_RESTART_FILE[\s\S]{0,180}?\.catch\(\(\) => \{\}\)/, "Manager restart token persistence must never be best-effort/false-green");
+  assert.match(managerServerSource, /replacementPid = spawnDetached\([\s\S]{0,420}?isPidAlive\(replacementPid\)[\s\S]{0,900}?const prepared = await waitFor\([\s\S]{0,520}?receipt\.state === "prepared"[\s\S]{0,240}?Number\(receipt\.replacementPid\) === replacementPid[\s\S]{0,700}?if \(!prepared \|\| !isPidAlive\(replacementPid\)\)/, "Manager must require an exact prepared replacement receipt before beginning listener handoff");
+  assert.match(managerServerSource, /const reopenOldListener = async \(\) =>[\s\S]{0,900}?httpServer\.listen\(managerPortNum, "127\.0\.0\.1"\)[\s\S]{0,1200}?httpServer\.close[\s\S]{0,1000}?receipt\.state === "listening"[\s\S]{0,240}?Number\(receipt\.replacementPid\) === replacementPid[\s\S]{0,420}?if \(listening && isPidAlive\(replacementPid\)\) \{[\s\S]{0,100}?process\.exit\(0\)/, "old Manager must exit only after exact replacement canonical-port listening proof and retain an old-listener rollback path");
+  assert.match(managerServerSource, /if \(isPidAlive\(replacementPid\)\)[\s\S]{0,260}?killPidTree\(replacementPid\)[\s\S]{0,320}?managerRestartInFlight = false;[\s\S]{0,180}?await reopenOldListener\(\)[\s\S]{0,220}?Replacement never proved canonical-port ownership/, "failed replacement bind handoff must kill only the replacement, clear the restart gate and re-open the old Manager listener");
+  assert.match(managerServerSource, /return \{ ok: true, pid: process\.pid, replacementPid, handoffPending: true \}/, "Manager restart API must distinguish spawned/prepared handoff from completed listener ownership");
+  assert.match(managerServerSource, /httpServer = server;[\s\S]{0,160}?if \(restartToken\)[\s\S]{0,420}?atomicWriteFile\([\s\S]{0,120}?MANAGER_RESTART_FILE[\s\S]{0,360}?state: "prepared"[\s\S]{0,180}?replacementPid: process\.pid[\s\S]{0,420}?async function listenWithRetry/, "replacement Manager must atomically persist its prepared PID receipt after pre-listen initialization and before bind handoff");
+  assert.match(managerServerSource, /await listenWithRetry\(port, noOpen, restartToken\);[\s\S]{0,120}?if \(restartToken\)[\s\S]{0,520}?state: "listening"[\s\S]{0,180}?replacementPid: process\.pid[\s\S]{0,180}?listeningAt: Date\.now\(\)/, "replacement Manager must atomically publish exact canonical-port listening ownership after bind succeeds");
+  assert.match(managerServerSource, /async function startServer\(name\)[\s\S]{0,180}?if \(managerRestartInFlight\)/, "Server lifecycle must reject new work after restart handoff begins");
+  assert.match(managerServerSource, /async function startTunnel\(name\)[\s\S]{0,180}?if \(managerRestartInFlight\)/, "Tunnel lifecycle must reject new work after restart handoff begins");
   assert.match(managerServerSource, /TUNNEL_CLIENT_VERSION_FILE/, "Manager must track the installed tunnel-client version for auto-upgrade");
   assert.match(managerServerSource, /tunnel-client-\$\{OPENAI_TUNNEL_VERSION\}\.zip/, "Manager must retain a versioned tunnel-client zip cache instead of deleting it");
   assert.doesNotMatch(managerServerSource, /fsp\.rm\(tmpZip/, "tunnel-client install must not permanently delete its download");
   assert.match(managerServerSource, /OPENAI_TUNNEL_VERSION = "v0\.0\.11"/, "Manager must target tunnel-client v0.0.11 (timeout/session fixes)");
-  assert.match(managerServerSource, /if \(!srv\.ok\) \{[\s\S]{0,180}?continue;[\s\S]{0,180}?startTunnel\(name\)/, "autostart must not launch Tunnel after Server start fails");
+  assert.match(managerServerSource, /void autoStartInstances\(autoStartNames,[\s\S]{0,520}?concurrency:\s*DEFAULT_AUTO_START_CONCURRENCY[\s\S]{0,520}?startServer,[\s\S]{0,220}?startTunnel/, "autostart must use the bounded independent instance supervisor instead of the old serial one-shot loop");
+  assert.match(managerServerSource, /shouldContinue:\s*async \(name\) => !managerRestartInFlight && !cancelledBootAutoStart\.has\(name\)/, "boot retries must stop before self-restart and be cancelled by explicit lifecycle authority");
+  assert.match(managerServerSource, /async function stopServer\(name\)[\s\S]{0,120}?cancelledBootAutoStart\.add\(name\)/, "explicit Server Stop must cancel pending boot reconciliation");
+  assert.match(managerServerSource, /async function stopTunnel\(name\)[\s\S]{0,120}?cancelledBootAutoStart\.add\(name\)/, "explicit Tunnel Stop must cancel pending boot reconciliation");
   assert.match(managerServerSource, /Refusing to stop an unowned .*tunnel/i, "Tunnel stop must fail closed for unowned processes");
   assert.doesNotMatch(managerServerSource, /pidsWithCmdLine\(profileFile\)/, "Tunnel cleanup must include an executable identity and never call the process scanner with only a profile path");
   assert.match(managerServerSource, /processesWithCmdLine\("tunnel-client\.exe", profileFile\)/, "OpenAI tunnel identity lookup must scope by executable plus the instance-unique profile");
   assert.match(managerServerSource, /if \(stopped\) await writePidFile\(inst\.serverPid, null\)/, "failed Local Coder Server startup must preserve PID metadata until the child is confirmed stopped");
+  assert.match(managerServerSource, /LEGACY_INSTANCE_MIGRATION_PATH = path\.join\(STATE_DIR, "legacy-instance-migration-v1\.json"\)/, "legacy instance migration must have a durable one-time tombstone so intentional zero-instance state survives restart");
+  assert.match(managerServerSource, /if \(existingInstances\.length > 0\)[\s\S]{0,160}?if \(migrationComplete\) return;[\s\S]{0,1200}?reason: "managed-instances-present"/, "existing managed instances must establish migration completion before zero-instance state can later become authoritative");
+  assert.match(managerServerSource, /async function readLegacyInstanceMigrationReceipt\([\s\S]{0,900}?receipt\.version !== 1[\s\S]{0,260}?\["prepared", "complete"\]\.includes\(receipt\.state\)[\s\S]{0,300}?LEGACY_INSTANCE_MIGRATION_RECEIPT_INVALID/, "legacy migration receipt must be versioned/stateful and corrupt receipts must fail closed");
+  assert.match(managerServerSource, /const stageDir = path\.join\(INSTANCES_DIR, `\.legacy-default-migration-\$\{migrationId\}`\)/, "legacy migration must stage outside the managed instance-name namespace");
+  assert.match(managerServerSource, /atomicWriteFile\([\s\S]{0,120}?staged\.marker[\s\S]{0,260}?migrationId[\s\S]{0,180}?source: "legacy-single-instance"/, "legacy migration stage must carry an exact migration identity marker");
+  assert.match(managerServerSource, /writeLegacyInstanceMigrationReceipt\(\{[\s\S]{0,180}?state: "prepared"[\s\S]{0,220}?reason: "legacy-default-stage-ready"[\s\S]{0,220}?fsp\.rename\(stageDir, inst\.dir\)/, "legacy migration must persist prepared authority before atomically publishing default");
+  assert.match(managerServerSource, /fsp\.rename\(stageDir, inst\.dir\)[\s\S]{0,220}?writeLegacyInstanceMigrationReceipt\(\{[\s\S]{0,160}?state: "complete"/, "legacy migration may become complete only after the staged directory is atomically published");
+  assert.match(managerServerSource, /const migrationStages = await listLegacyMigrationStages\(\)[\s\S]{0,1300}?legacy-default-migrated-stage-recovered[\s\S]{0,1600}?LEGACY_INSTANCE_MIGRATION_ORPHAN_STAGE[\s\S]{0,1300}?legacy-default-migrated-stage-recovered-without-receipt/, "legacy migration must recover exact prepared/orphan marked stages and fail closed on ambiguous or partial stages");
+  assert.match(managerServerSource, /err\?\.code !== "ENOENT"[\s\S]{0,220}?Legacy lifecycle authority migration failed/, "legacy PID authority migration must ignore only absence and fail closed on other copy errors");
+  assert.match(managerServerSource, /Legacy diagnostic log copy skipped/, "legacy diagnostic-log migration failures must be surfaced without blocking lifecycle authority migration");
+  assert.match(managerServerSource, /async function readJson\(p, fallback\)[\s\S]{0,460}?err\?\.code === "ENOENT"[\s\S]{0,360}?MANAGER_JSON_INVALID/, "managed JSON authority must fallback only when missing and reject malformed bytes");
+  assert.match(managerServerSource, /async function readPidFile\(p\)[\s\S]{0,420}?err\?\.code === "ENOENT"[\s\S]{0,360}?MANAGER_PID_INVALID/, "managed PID authority must distinguish missing from malformed or unreadable ledger bytes");
+  assert.match(managerServerSource, /async function readInstanceConfig\(name\)[\s\S]{0,420}?autoStart: false/, "missing managed config must default autostart to safe false");
+  assert.match(managerServerSource, /function publicInstanceConfig\(config\)[\s\S]{0,180}?autoStart: config\?\.autoStart === true/, "public managed config must expose autostart only for explicit true authority");
+  assert.match(managerServerSource, /if \(!fs\.existsSync\(instPaths\(name\)\.config\)\) continue;/, "legacy config cleanup must never create a missing managed config and accidentally grant autostart authority");
+  assert.match(managerServerSource, /Cannot save instance environment while config authority is unreadable[\s\S]{0,520}?committed: false/, "env save must preflight companion config authority before committing .env");
+  assert.match(managerServerSource, /updateInstanceConfig\(name, \(config\) => \{[\s\S]{0,180}?config\.healthPort = hp;[\s\S]{0,180}?body\.autoStart[\s\S]{0,700}?atomicWriteFile\(inst\.env, original[\s\S]{0,500}?rollbackFailed: Boolean\(rollbackError\)/, "logical env+healthPort+autoStart save must rollback exact prior .env bytes when companion config sync fails");
+  assert.match(managerServerSource, /async function proveInstanceInactiveWithoutConfig\([\s\S]{0,1800}?tunnel-client\.exe[\s\S]{0,700}?cloudflared\.exe[\s\S]{0,600}?OPENAI_TUNNEL_HEALTH_PORT[\s\S]{0,320}?return \{ ok: true \}/, "corrupt-config delete/rename recovery must require configless proof that server/tunnel candidates and tunnel health listener are absent");
+  assert.match(managerServerSource, /function isExactCurrentServerProcess\(pid\)[\s\S]{0,420}?processesWithCmdLine\("node\.exe", SERVER_ENTRY\)/, "missing server.pid recovery must prove the exact current repo compiled child command line");
+  assert.match(managerServerSource, /const savedPidAlive = Boolean\(savedPid && isPidAlive\(savedPid\)\)[\s\S]{0,220}?if \(\(!savedPid \|\| !savedPidAlive\) && !desiredEnv && isLocalCoderHealth\(health, env, name\)\)[\s\S]{0,900}?portPid === healthPid && isExactCurrentServerProcess\(healthPid\)[\s\S]{0,220}?writePidFile\(inst\.serverPid, healthPid\)/, "Manager must reconstruct only missing/dead server.pid from exact instance/workspace/health/listener/current-process evidence and never overwrite a live mismatched ledger");
+  assert.match(managerServerSource, /owned:\s*exactManagedRuntime \|\| legacyOwnedListener/, "current Server ownership must require exact health PID identity; missing listener scan data must never make a saved PID owned");
+  assert.match(managerServerSource, /if \(!scan\) \{[\s\S]{0,260}?PROCESS_PORT_SCAN_FAILED/, "listener PID discovery must fail closed after bounded netstat retries instead of caching an empty ownership map");
+  assert.match(managerServerSource, /const scanTimeouts = \[3000, 6000, 10000\][\s\S]{0,900}?for \(let attempt = 0; attempt < scanTimeouts\.length; attempt\+\+\)[\s\S]{0,900}?if \(!scan\)[\s\S]{0,220}?PROCESS_PORT_SCAN_FAILED/, "listener ownership discovery must tolerate transient netstat timeouts with bounded retries while still failing closed after exhaustion");
+  assert.doesNotMatch(managerServerSource, /portPidCache = \{ at: Date\.now\(\), pids \};[\s\S]{0,80}?PROCESS_PORT_SCAN_FAILED/, "failed listener scans must never be cached as a successful empty ownership snapshot");
+  assert.doesNotMatch(managerServerSource, /function listeningPortPids\(\)[\s\S]{0,900}?catch\s*\{\}/, "listener ownership scan must not swallow netstat errors");
+  assert.match(managerServerSource, /if \(st\.running && !st\.owned\)[\s\S]{0,260}?refusing false-green start\/adoption/, "Server start must fail closed for a running runtime whose exact ownership cannot be proven");
+  assert.match(managerServerSource, /readFile\(TUNNEL_CLIENT_VERSION_FILE[\s\S]{0,220}?err\?\.code !== "ENOENT"[\s\S]{0,220}?Không đọc được tunnel-client version marker/, "tunnel-client version authority must ignore only a missing marker and surface other read failures");
+  assert.match(managerServerSource, /let rollbackError = null[\s\S]{0,520}?rollbackError = String\(rollbackErr\?\.message \|\| rollbackErr\)[\s\S]{0,520}?rollbackFailed:\s*Boolean\(rollbackError\)[\s\S]{0,180}?backupPath:\s*rollbackError \? backupPath : null/, "tunnel-client failed-install rollback must surface rollback failure and retained backup path instead of swallowing it");
   assert.match(managerServerSource, /if \(stopped\) \{[\s\S]{0,220}?writePidFile\(inst\.tunnelPid, null\)[\s\S]{0,420}?else \{[\s\S]{0,420}?writePidFile\(inst\.tunnelPid, pid\)/, "failed tunnel startup must clear PID only after confirmed exit and preserve exact PID evidence for a survivor");
   assert.match(managerServerSource, /chatgpt-local-coder\.bat/, "Manager autostart must reference the single consolidated launcher bat");
+  assert.match(managerServerSource, /function inspectAutostartLink[\s\S]{0,3000}?expectedLauncher[\s\S]{0,900}?expectedWork[\s\S]{0,900}?expectedArguments[\s\S]{0,900}?StringComparison\]::OrdinalIgnoreCase/, "Manager autostart status must validate exact current-repo launcher + working-directory + full argument identity instead of trusting LNK existence/basename");
+  assert.match(managerServerSource, /String\.Comparison|StringComparison/, "Manager shortcut verifier must use case-insensitive exact identity comparison");
+  assert.match(managerServerSource, /Equals\(\$s\.Arguments,\$expectedArguments,\[StringComparison\]::OrdinalIgnoreCase\)/, "Manager autostart verifier must compare the complete shortcut arguments rather than accept an executable substring");
+  assert.match(launcherSource, /:ensure_autostart[\s\S]{0,2200}?\$ErrorActionPreference='Stop'[\s\S]{0,1200}?if errorlevel 1[\s\S]{0,900}?\$ErrorActionPreference='Stop'/, "batch autostart creation and verification must fail fast on PowerShell errors instead of reporting false success after non-terminating errors");
+  assert.match(launcherSource, /\$singleQuote=\[string\]\[char\]39[\s\S]{0,900}?\.Replace\(\$singleQuote,\(\$singleQuote\+\$singleQuote\)\)/, "batch autostart launcher quoting must use the string Replace overload so apostrophe escaping cannot silently erase the launcher path");
+  assert.match(managerServerSource, /enabled:\s*state\.valid[\s\S]{0,180}?drift:\s*state\.exists && !state\.valid/, "Manager autostart GET must surface stale shortcut drift instead of false-green enabled=true");
   assert.doesNotMatch(managerServerSource, /make-startup-lnk\.ps1|manager-hidden\.ps1/, "autostart must not create auxiliary PowerShell launcher files");
   assert.match(managerServerSource, /workspaceScope\.ok/, "instance bundle must expose workspace-scope validation for self-detection");
   assert.match(managerApp, /!i\.workspaceScope \|\| !i\.workspaceScope\.ok/, "workspace card must surface an invalid workspace scope instead of false-green");
@@ -517,6 +578,10 @@ try {
   );
   assert.match(managerApp, /\/check"\), "POST", currentEditorPayload\(\)/, "Check must use the exact same payload constructor as Save");
   assert.match(managerApp, /const body = currentEditorPayload\(\)/, "Save must use the same raw/form authority payload as Check");
+  assert.match(managerApp, /\$\("f-autostart"\)\.checked = cfg\.autoStart === true;/, "UI must render autostart only from explicit true authority, matching the backend fail-safe contract");
+  assert.match(managerApp, /const body = currentEditorPayload\(\);[\s\S]{0,120}?body\.autoStart = \$\("f-autostart"\)\.checked;[\s\S]{0,180}?\/env"\), "PUT", body/, "UI Save must send env and autoStart through one logical backend mutation");
+  assert.doesNotMatch(managerApp, /async function doSave\(\)[\s\S]{0,1000}?\/config"\), "PUT"/, "UI Save must not false-transactionally commit env and then save autoStart in a second request");
+  assert.match(managerApp, /let saveCommitted = false;[\s\S]{0,500}?saveCommitted = true;[\s\S]{0,1500}?toast\("Đã lưu", "ok"\)[\s\S]{0,500}?Đã lưu, nhưng thao tác sau lưu lỗi:/, "UI must distinguish successful save from failures that happen only after configuration commit");
   assert.match(managerServerSource, /function restoreMaskedRawEnv[\s\S]{0,420}?isSecretKey\(m\[1\]\)/, "raw sentinel restoration must be restricted to actual secret keys");
   assert.match(managerServerSource, /async function checkConfigRequest[\s\S]{0,360}?restoreMaskedRawEnv\(body\.raw, originalValues\)[\s\S]{0,120}?checkConfig\(name, parseDotEnv\(candidateRaw\)\)/, "raw-mode Check must resolve masked secrets with the same semantics as raw-mode Save");
   assert.match(managerServerSource, /p === "\/api\/check"[\s\S]{0,100}?checkConfigRequest\(dname, body\)/, "legacy /api/check must use the same raw/form request semantics as the instance route");
@@ -536,18 +601,36 @@ try {
   assert.match(managerServerSource, /function isManagedInstanceHealth[\s\S]{0,620}?instance_id[\s\S]{0,320}?instanceId === name[\s\S]{0,320}?return allowLegacy/, "Manager must verify managed runtime instance_id and make missing identity an explicit legacy-only path");
   assert.match(managerServerSource, /function isExactManagedRuntimeHealth[\s\S]{0,420}?isManagedInstanceHealth\(health, name\)[\s\S]{0,220}?health\?\.pid[\s\S]{0,180}?healthPid === savedPid/, "current runtime health PID must provide exact ownership proof independent of transient netstat cache state");
   assert.match(managerServerSource, /health = await serverHealth\(configuredPort\);[\s\S]{0,120}?if \(health\) portOpen = true/, "configured-port health identity must not be skipped because a separate TCP snapshot briefly reports closed");
-  assert.match(managerServerSource, /const legacyOwnedListener = Boolean\(savedPid && portPid === savedPid && isPidAlive\(savedPid\)\)/, "legacy health without instance_id must require persisted PID + live listener proof");
-  assert.match(managerServerSource, /isManagedInstanceHealth\(health, name\)[\s\S]{0,260}?invalidatePortPidCache\(\)[\s\S]{0,180}?portPid = pidOnPort\(configuredPort\)/, "managed instance health must trigger a bounded fresh PID snapshot before ownership is lost to a stale netstat cache");
+  assert.match(managerServerSource, /if \(!health && portOpen\)[\s\S]{0,900}?for \(let attempt = 0; attempt < 3 && !health; attempt \+= 1\)[\s\S]{0,260}?health = await serverHealth\(configuredPort\)/, "configured listener health retries must remain available when server.pid is missing so exact crash-window recovery can prove identity");
+  assert.match(managerServerSource, /currentHealthPid = Number\(health\?\.pid\)[\s\S]{0,700}?portPid !== currentHealthPid[\s\S]{0,420}?invalidatePortPidCache\(\)[\s\S]{0,180}?portPid = pidOnPort\(configuredPort\)/, "managed instance health must refresh listener ownership toward health.pid, never toward a possibly stale server.pid ledger");
+  assert.match(managerServerSource, /const legacyOwnedListener = Boolean\([\s\S]{0,180}?!String\(health\?\.instance_id \|\| ""\)\.trim\(\)[\s\S]{0,220}?portPid === savedPid[\s\S]{0,120}?isPidAlive\(savedPid\)/, "legacy listener ownership must be impossible for current identity-bearing health responses");
+  assert.match(managerServerSource, /const currentManagedListener = Boolean\([\s\S]{0,320}?portPid === currentHealthPid[\s\S]{0,220}?isManagedInstanceHealth\(health, name\)/, "current runtime liveness must be proven by exact health.pid == listener PID independently from server.pid ownership authority");
   assert.match(managerServerSource, /isLocalCoderHealth\(health, env, name, \{ allowLegacy: legacyOwnedListener \}\)/, "configured-port legacy recovery must be gated by the saved-PID listener proof");
-  assert.match(managerServerSource, /SERVER_START_TIMEOUT_STRICT_MS = 120000/, "strict AppContainer startup must have a bounded prepare/self-test window larger than trusted startup");
+  assert.match(managerServerSource, /if \(savedPid && isPidAlive\(savedPid\)\)[\s\S]{0,620}?invalidatePortPidCache\(\)[\s\S]{0,180}?actualPorts = portsForPid\(savedPid\)[\s\S]{0,520}?isExactManagedRuntimeHealth\(actualHealth, name, savedPid\)/, "PORT-drift recovery must bypass stale listener cache and require exact current health PID identity");
+  assert.match(managerServerSource, /legacyWithoutInstanceIdentity = Boolean\([\s\S]{0,260}?!String\(actualHealth\?\.instance_id \|\| ""\)\.trim\(\)[\s\S]{0,260}?allowLegacy: true/, "PORT-drift legacy bridge must apply only when the runtime truly lacks current instance identity");
+  assert.match(managerServerSource, /SERVER_START_TIMEOUT_TRUSTED_MS = 120000/, "trusted Windows cold-start must not be killed by the former 20-second startup deadline");
+  assert.match(managerServerSource, /SERVER_START_TIMEOUT_STRICT_MS = 180000/, "strict AppContainer startup must have a bounded prepare/self-test window larger than trusted startup");
   assert.match(managerServerSource, /if \(!isPidAlive\(pid\)\)[\s\S]{0,220}?startupState = "exited"[\s\S]{0,420}?isLocalCoderHealth\(await serverHealth\(st\.port\), env, name\)/, "startup wait must stop early on process exit while still requiring strict instance identity for health");
+  assert.match(managerServerSource, /if \(startupState !== "healthy" && isPidAlive\(pid\)\)[\s\S]{0,220}?finalHealth = await serverHealth\(st\.port\)[\s\S]{0,220}?startupState = "healthy"/, "startup timeout boundary must perform one exact final health check before killing the child");
+  assert.match(managerServerSource, /const startupLogMarker = `\[manager-start\] attempt=\$\{startupAttemptId\}`/, "startup logs must contain an attempt-scoped marker so failure diagnostics cannot be confused with stale historical log lines");
+  assert.match(managerServerSource, /tail\.lastIndexOf\(startupLogMarker\)[\s\S]{0,180}?tail\.slice\(markerOffset\)/, "startup failure diagnostics must slice the log from the current attempt marker instead of exposing stale historical tail lines");
+  assert.match(managerServerSource, /startupElapsedMs[\s\S]{0,260}?pidAliveAtDeadline[\s\S]{0,260}?portOpenAtDeadline/, "startup failure must expose deadline diagnostics instead of a generic false-negative message");
+  assert.match(managerServerSource, /fetch\(`http:\/\/127\.0\.0\.1:\$\{port\}\/healthz`[\s\S]{0,260}?fetch\(`http:\/\/127\.0\.0\.1:\$\{port\}\/readyz`/, "managed OpenAI Tunnel health must require both tunnel-client liveness and readiness endpoints");
+  assert.match(managerServerSource, /liveText\.trim\(\)\.toLowerCase\(\) === "live"[\s\S]{0,180}?readyText\.trim\(\)\.toLowerCase\(\) === "ready"/, "managed OpenAI Tunnel health must validate the tunnel-client endpoint bodies, not only HTTP 200");
+  assert.match(managerServerSource, /async function tunnelClientHealth\(port\)[\s\S]{0,700}?attempt < 3[\s\S]{0,320}?tunnelClientHealthOnce\(port\)/, "managed tunnel health classification must retry bounded transient local probe failures instead of producing one-shot false health drift");
   assert.match(managerServerSource, /async function ensureSandboxCompatibility[\s\S]{0,900}?\["--check"\][\s\S]{0,900}?SANDBOX_COMPAT_SETUP_TIMEOUT_MS[\s\S]{0,900}?\["--check"\]/, "strict managed startup must preflight AppContainer compatibility, prepare it only when stale, then verify the marker");
-  assert.match(managerServerSource, /await migrateLegacyRuntimeState\(name, env, inst\);[\s\S]{0,220}?ensureSandboxCompatibility\(name, env, inst\)[\s\S]{0,800}?spawnDetached/, "strict compatibility must be established before the managed Local Coder child is spawned");
+  {
+    const migratePos = managerServerSource.indexOf("await migrateLegacyRuntimeState(name, env, inst);");
+    const compatibilityPos = managerServerSource.indexOf("ensureSandboxCompatibility(name, env, inst)", migratePos);
+    const spawnPos = managerServerSource.indexOf("spawnDetached(process.execPath", compatibilityPos);
+    assert.ok(migratePos >= 0 && compatibilityPos > migratePos && spawnPos > compatibilityPos, "strict compatibility must be established before the managed Local Coder child is spawned");
+  }
   assert.match(managerServerSource, /for \(const key of Object\.keys\(childEnv\)\)[\s\S]{0,160}?isSecretKey\(key\)[\s\S]{0,320}?WORKSPACE_PATH/, "sandbox compatibility setup must not inherit instance secrets when it may invoke UAC");
   assert.match(sandboxSetupSource, /sandbox-compat-\$\{instanceId\(\)\}\.json/, "sandbox compatibility must use an instance-scoped durable marker");
   assert.match(sandboxSetupSource, /process\.argv\.includes\("--check"\)[\s\S]{0,420}?compatibilityStateMatches/, "sandbox compatibility helper must support a non-elevating marker preflight");
-  assert.match(sandboxSetupSource, /const desiredCompatibilityState = \{[\s\S]{0,700}?version:\s*2,[\s\S]{0,700}?runnerArtifact:\s*path\.basename\(runner\)/, "sandbox compatibility marker must be invalidated when the content-versioned broker artifact changes");
+  assert.match(sandboxSetupSource, /const desiredCompatibilityState = \{[\s\S]{0,700}?version:\s*3,[\s\S]{0,700}?runnerArtifact:\s*path\.basename\(runner\)/, "sandbox compatibility marker must be invalidated when the content-versioned broker artifact changes");
   assert.match(sandboxSetupSource, /recorded\?\.runnerArtifact === desired\.runnerArtifact/, "sandbox compatibility check must compare the recorded broker artifact identity");
+  assert.match(sandboxSetupSource, /os\.uptime\(\)[\s\S]{0,520}?recordedAt >= currentBootStartedAtMs\(\) - 5000/, "NUL kernel-object compatibility must be invalidated across Windows reboot instead of trusting a durable false-green receipt");
   assert.match(sandboxSetupSource, /recordCompatibilityState\(desiredCompatibilityState\)/, "successful compatibility setup must persist the verified fingerprint marker");
   assert.match(runtimeEntrySource, /instance_id:\s*process\.env\.LOCAL_CODER_INSTANCE_ID \|\| process\.env\.MCP_INSTANCE_NAME \|\| null/, "Local Coder /health must expose the Manager-injected instance identity without inventing one for direct launches");
   assert.match(runtimeEntrySource, /pid:\s*process\.pid/, "Local Coder /health must expose its actual PID so Manager can prove current-build ownership during config drift");
@@ -608,6 +691,41 @@ try {
   assert.equal(restartListing.server.running, true, `restarted Local Coder Server was not reflected as running: ${JSON.stringify(restartListing.server)}`);
   assert.equal(restartListing.server.pid, managedRestart.pid);
   assert.equal(restartListing.server.health?.instance_id, "restart-demo", "managed runtime health must carry its injected instance identity");
+
+  // Simulate the exact Manager-crash window where the Local Coder child is live
+  // but server.pid was never/was no longer persisted. Current health identity,
+  // listener PID and exact CURRENT dist/index.js command line must reconstruct
+  // the ledger without restarting or adopting an unrelated process.
+  const restartPidPath = path.join(restartDemo, "server.pid");
+  await fs.rm(restartPidPath, { force: true });
+  assert.equal(await fs.stat(restartPidPath).then(() => true, () => false), false, "fault injection failed to remove server.pid");
+  const recoveredPidListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
+  assert.equal(recoveredPidListing.server.running, true, "live current runtime must remain visible while recovering missing server.pid");
+  assert.equal(recoveredPidListing.server.owned, true, "exact current runtime identity must recover managed ownership after missing server.pid");
+  assert.equal(recoveredPidListing.server.pid, managedRestart.pid, "server.pid recovery must keep the existing exact process rather than restart it");
+  assert.equal(Number((await fs.readFile(restartPidPath, "utf8")).trim()), managedRestart.pid, "server.pid recovery must persist the exact recovered PID");
+  const recoveredPidStart = (await post("/api/instances/restart-demo/server/start")).body;
+  assert.equal(recoveredPidStart.ok, true, `start after PID-ledger recovery must be idempotent: ${JSON.stringify(recoveredPidStart)}`);
+  assert.equal(recoveredPidStart.alreadyRunning, true, "start after exact PID-ledger recovery must not spawn a duplicate runtime");
+  assert.equal(recoveredPidStart.pid, managedRestart.pid, "idempotent start after PID recovery must preserve the existing PID");
+
+  // A live but mismatched PID ledger is materially different from a missing/dead
+  // ledger: never overwrite it automatically. Surface the actual healthy runtime
+  // as unowned and refuse a duplicate start until ownership is explicitly repaired.
+  assert.notEqual(process.pid, managedRestart.pid, "test runner PID unexpectedly equals managed runtime PID");
+  await fs.writeFile(restartPidPath, `${process.pid}\n`, "utf8");
+  const mismatchedLivePidListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
+  assert.equal(mismatchedLivePidListing.server.running, true, "healthy runtime must remain observable with a live mismatched PID ledger");
+  assert.equal(mismatchedLivePidListing.server.owned, false, "live mismatched PID ledger must not be silently adopted/overwritten");
+  assert.equal(mismatchedLivePidListing.server.pid, managedRestart.pid, "status must report the actual listener/runtime PID, not the stale live ledger PID");
+  assert.equal(Number((await fs.readFile(restartPidPath, "utf8")).trim()), process.pid, "live mismatched PID ledger must remain untouched for explicit repair");
+  const mismatchedLivePidStart = (await post("/api/instances/restart-demo/server/start")).body;
+  assert.equal(mismatchedLivePidStart.ok, false, "start must fail closed rather than duplicate a healthy runtime with unproven ownership");
+  assert.match(mismatchedLivePidStart.error || "", /ownership|owned|false-green|prove/i);
+  assert.equal(pidAlive(managedRestart.pid), true, "ownership conflict handling must not kill the actual healthy runtime");
+  await fs.writeFile(restartPidPath, `${managedRestart.pid}\n`, "utf8");
+  const restoredPidListing = (await api("/api/instances")).body.instances.find((x) => x.name === "restart-demo");
+  assert.equal(restoredPidListing.server.owned, true, "restoring the exact runtime PID ledger must restore managed ownership");
 
   // Same-port workspace drift is the dangerous stale-runtime case: the saved
   // .env can change while the already-owned child keeps serving the old project

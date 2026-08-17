@@ -18,10 +18,9 @@ import path from "node:path";
 import os from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpServer } from "../dist/server-factory.js";
 import { getUpstreamManager } from "../dist/lib/mcp-upstream-manager.js";
 import { refreshProxiedTools } from "../dist/lib/mcp-tool-proxy.js";
-import { setDefaultCwd, setWorkspaceRoots } from "../dist/lib/path-security.js";
+import { getDefaultCwd, getWorkspaceRoots, setDefaultCwd, setWorkspaceRoots } from "../dist/lib/path-security.js";
 import {
   CHATGPT_PUBLIC_CONTRACT_VERSION,
   canonicalizeToolList,
@@ -33,6 +32,16 @@ import {
 const fixturePath = path.join(import.meta.dirname, "fixtures", `chatgpt-public-contract-v${CHATGPT_PUBLIC_CONTRACT_VERSION}.json`);
 const { version, document: expected } = await loadExpectedContract(fixturePath);
 const fixtureRaw = JSON.parse(await fs.readFile(fixturePath, "utf8"));
+const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
+const oldRuntimeEnv = Object.fromEntries([
+  "FULL_DISK_ACCESS",
+  "LOCAL_CODER_INSTANCE_ID",
+  "CLC_SANDBOX_PROFILE_NAME",
+  "CLC_SANDBOX_STATE_DIR",
+  "MCP_SHELL_STATE_DIR",
+].map((key) => [key, process.env[key]]));
+const oldCwd = getDefaultCwd();
+const oldRoots = getWorkspaceRoots();
 
 let passed = 0;
 let failed = 0;
@@ -66,9 +75,15 @@ const servers = [];
 let temp;
 try {
   temp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-contract-"));
+  process.env.FULL_DISK_ACCESS = "true";
+  process.env.LOCAL_CODER_INSTANCE_ID = "tests";
+  process.env.CLC_SANDBOX_PROFILE_NAME = "ChatGPTLocalCoder.tests";
+  process.env.CLC_SANDBOX_STATE_DIR = path.join(temp, ".sandbox-state");
+  process.env.MCP_SHELL_STATE_DIR = path.join(temp, ".shell-state");
   setDefaultCwd(temp);
   setWorkspaceRoots([temp]);
   process.env.CHATGPT_TOOL_PROFILE = "slim";
+  const { createMcpServer } = await import("../dist/server-factory.js");
 
   // --- 1. exact fixture match, no manager ---------------------------------
   const noMgr = await createMcpServer(temp, 10, [temp], false);
@@ -128,10 +143,15 @@ try {
 } catch (e) {
   fail("setup", e.stack ?? e);
 } finally {
-  delete process.env.CHATGPT_TOOL_PROFILE;
-  setDefaultCwd(os.homedir());
-  setWorkspaceRoots([]);
   for (const s of servers) await s.close().catch(() => undefined);
+  if (oldProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
+  else process.env.CHATGPT_TOOL_PROFILE = oldProfile;
+  for (const [key, value] of Object.entries(oldRuntimeEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+  setDefaultCwd(oldCwd);
+  setWorkspaceRoots(oldRoots);
   // Temp dir is left for OS-managed cleanup in os.tmpdir(): direct recursive
   // removal is prohibited by the repo P0 safety policy.
 }

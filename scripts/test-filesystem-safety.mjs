@@ -35,16 +35,24 @@ async function getTwoFreePorts() {
   return ports;
 }
 
-async function waitForHealth(port, timeoutMs = 10000) {
+async function waitForHealth(port, timeoutMs = 10000, child = null, getChildLog = () => "") {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (child?.exitCode != null) {
+      const detail = String(getChildLog() || "").trim().slice(-4000);
+      throw new Error(
+        `isolated MCP server exited before health (exit ${child.exitCode})` +
+        (detail ? `:\n${detail}` : "")
+      );
+    }
     try {
       const response = await fetch(`http://127.0.0.1:${port}/health`);
       if (response.ok) return;
     } catch {}
     await delay(50);
   }
-  throw new Error("isolated MCP server did not become healthy");
+  const detail = String(getChildLog() || "").trim().slice(-4000);
+  throw new Error("isolated MCP server did not become healthy" + (detail ? `:\n${detail}` : ""));
 }
 
 async function initialize(port, id) {
@@ -307,6 +315,10 @@ try {
   }
 
   const [port, adminPort] = await getTwoFreePorts();
+  let serverDiagnosticLog = "";
+  const appendServerDiagnostic = (chunk) => {
+    serverDiagnosticLog = (serverDiagnosticLog + String(chunk)).slice(-12000);
+  };
   const server = spawn(process.execPath, ["dist/index.js"], {
     cwd: repo,
     env: {
@@ -326,14 +338,16 @@ try {
       CLC_SANDBOX_PROFILE_NAME: "ChatGPTLocalCoder.tests",
       CLC_SANDBOX_STATE_DIR: path.join(root, "sandbox-state"),
     },
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
   });
+  server.stdout?.on("data", appendServerDiagnostic);
+  server.stderr?.on("data", appendServerDiagnostic);
 
   try {
     // First-time sandbox prepare + self-test on a fresh policy ledger is a real
     // OS operation and legitimately takes several seconds; give the isolated
     // server a bounded but realistic window.
-    await waitForHealth(port, 30000);
+    await waitForHealth(port, 30000, server, () => serverDiagnosticLog);
 
     const [sessionA, sessionB] = await Promise.all([initialize(port, 1), initialize(port, 2)]);
     await Promise.all([

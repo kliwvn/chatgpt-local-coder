@@ -4,6 +4,22 @@ import { spawnSync } from "node:child_process";
 
 let writeSeq = 0;
 
+function atomicRollbackFailure(commitError, rollbackError, backupPath) {
+  const commitDetail = String(commitError?.message || commitError).slice(0, 600);
+  const rollbackDetail = String(rollbackError?.message || rollbackError).slice(0, 600);
+  const error = new Error(
+    `ATOMIC_REPLACE_ROLLBACK_FAILED: replace failed and rollback also failed; previous bytes are preserved at ${backupPath}. ` +
+    `Commit error: ${commitDetail}; rollback error: ${rollbackDetail}`
+  );
+  error.code = "ATOMIC_REPLACE_ROLLBACK_FAILED";
+  error.rollbackFailed = true;
+  error.backupPath = backupPath;
+  error.commitCode = commitError?.code || null;
+  error.rollbackCode = rollbackError?.code || null;
+  error.cause = commitError;
+  return error;
+}
+
 /** Serialize mutations by key and release the key once the newest mutation settles. */
 export function enqueueKeyedMutation(chains, key, operation) {
   const previous = chains.get(key) || Promise.resolve();
@@ -236,12 +252,15 @@ export async function streamResponseToFileBounded(response, file, maxBytes, labe
         await fs.rename(tmp, file);
         committed = true;
       } catch (commitError) {
+        let rollbackError = null;
         try {
           await fs.rename(backup, file);
           backupCreated = false;
-        } catch {
+        } catch (err) {
           // Preserve backup for manual recovery if rollback itself fails.
+          rollbackError = err;
         }
+        if (rollbackError) throw atomicRollbackFailure(commitError, rollbackError, backup);
         throw commitError;
       }
     }
@@ -341,12 +360,15 @@ export async function atomicWriteFile(file, data, encoding = "utf8") {
         await fs.rename(tmp, file);
         committed = true;
       } catch (commitError) {
+        let rollbackError = null;
         try {
           await fs.rename(backup, file);
           backupCreated = false;
-        } catch {
+        } catch (err) {
           // Leave the backup on disk for manual recovery if rollback itself fails.
+          rollbackError = err;
         }
+        if (rollbackError) throw atomicRollbackFailure(commitError, rollbackError, backup);
         throw commitError;
       }
     }

@@ -482,7 +482,7 @@ async function selectInstance(name, initial) {
 
   // form
   fillForm(env, env.OPENAI_TUNNEL_API_KEY_SET ? { set: true, last4: "••••" } : null);
-  $("f-autostart").checked = cfg.autoStart !== false;
+  $("f-autostart").checked = cfg.autoStart === true;
   $("cfg-inst-name").textContent = name;
   $("log-inst-name").textContent = name;
   $("foot-admin").href = `/admin/ui/?instance=${encodeURIComponent(name)}`;
@@ -564,15 +564,14 @@ async function doCheck() {
 async function doSave() {
   if (!state.current) return;
   const name = state.current;
+  let saveCommitted = false;
   setBusy(true);
   try {
     const body = currentEditorPayload();
+    body.autoStart = $("f-autostart").checked;
     const envRes = await api(instUrl(name, "/env"), "PUT", body);
-    if (!envRes.ok) throw new Error(envRes.error || "Lưu .env thất bại");
-    const cfgRes = await api(instUrl(name, "/config"), "PUT", {
-      autoStart: $("f-autostart").checked,
-    });
-    if (!cfgRes.ok) throw new Error(cfgRes.error || "Lưu cấu hình thất bại");
+    if (!envRes.ok) throw new Error(envRes.error || "Lưu cấu hình thất bại");
+    saveCommitted = true;
     rawDirty = false;
     if ($("chk-restart").checked) {
       const b = state.lastBundle;
@@ -591,10 +590,11 @@ async function doSave() {
         if (!startedTunnel.ok) throw new Error(startedTunnel.error || "Khởi động Tunnel thất bại");
       }
     }
+    toast("Đã lưu", "ok");
     await loadInstances(false);
     await selectInstance(name);
   } catch (err) {
-    toast("Lưu lỗi: " + err.message, "err");
+    toast((saveCommitted ? "Đã lưu, nhưng thao tác sau lưu lỗi: " : "Lưu lỗi: ") + err.message, "err");
   }
   setBusy(false);
 }

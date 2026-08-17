@@ -18,7 +18,6 @@ import {
 } from "../dist/lib/mcp-upstream-config.js";
 import { McpUpstreamManager } from "../dist/lib/mcp-upstream-manager.js";
 import { formatUpstreamResult, refreshProxiedTools, jsonSchemaToZodShape } from "../dist/lib/mcp-tool-proxy.js";
-import { createMcpServer } from "../dist/server-factory.js";
 import { registerMcpBridgeTools } from "../dist/tools/mcp-bridge.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -29,10 +28,23 @@ const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "clc-mcp-upstream-"));
 // slim-specific cases override CHATGPT_TOOL_PROFILE themselves.
 const suiteProfile = process.env.CHATGPT_TOOL_PROFILE;
 const suiteFullDiskAccess = process.env.FULL_DISK_ACCESS;
+const suiteRuntimeEnv = Object.fromEntries([
+  "LOCAL_CODER_INSTANCE_ID",
+  "CLC_SANDBOX_PROFILE_NAME",
+  "CLC_SANDBOX_STATE_DIR",
+  "MCP_SHELL_STATE_DIR",
+].map((key) => [key, process.env[key]]));
 process.env.CHATGPT_TOOL_PROFILE = "full";
 // Existing upstream feature tests intentionally exercise trusted local HTTP and
 // stdio transports. Strict-mode denial is tested separately below.
 process.env.FULL_DISK_ACCESS = "true";
+process.env.LOCAL_CODER_INSTANCE_ID = "tests";
+process.env.CLC_SANDBOX_PROFILE_NAME = "ChatGPTLocalCoder.tests";
+process.env.CLC_SANDBOX_STATE_DIR = path.join(tmpDir, "sandbox-state");
+process.env.MCP_SHELL_STATE_DIR = path.join(tmpDir, "shell-state");
+// server-factory imports the persistent shell state-path module, whose root is
+// resolved at import time. Keep the import after test-owned state paths are set.
+const { createMcpServer } = await import("../dist/server-factory.js");
 
 let passed = 0;
 let failed = 0;
@@ -801,6 +813,10 @@ if (suiteProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
 else process.env.CHATGPT_TOOL_PROFILE = suiteProfile;
 if (suiteFullDiskAccess === undefined) delete process.env.FULL_DISK_ACCESS;
 else process.env.FULL_DISK_ACCESS = suiteFullDiskAccess;
+for (const [key, value] of Object.entries(suiteRuntimeEnv)) {
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
 
 await fs.rm(tmpDir, { recursive: true, force: true });
 

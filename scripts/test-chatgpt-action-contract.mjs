@@ -4,7 +4,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpServer } from "../dist/server-factory.js";
 import {
   getDefaultCwd,
   getWorkspaceRoots,
@@ -21,6 +20,13 @@ import {
 import { SESSION_NOT_FOUND_MESSAGE } from "../dist/lib/mcp-session-manager.js";
 
 const oldProfile = process.env.CHATGPT_TOOL_PROFILE;
+const oldRuntimeEnv = Object.fromEntries([
+  "FULL_DISK_ACCESS",
+  "LOCAL_CODER_INSTANCE_ID",
+  "CLC_SANDBOX_PROFILE_NAME",
+  "CLC_SANDBOX_STATE_DIR",
+  "MCP_SHELL_STATE_DIR",
+].map((key) => [key, process.env[key]]));
 const oldCwd = getDefaultCwd();
 const oldRoots = getWorkspaceRoots();
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -122,9 +128,15 @@ let client;
 let fullServer;
 try {
   process.env.CHATGPT_TOOL_PROFILE = "slim";
+  process.env.FULL_DISK_ACCESS = "true";
+  process.env.LOCAL_CODER_INSTANCE_ID = "tests";
+  process.env.CLC_SANDBOX_PROFILE_NAME = "ChatGPTLocalCoder.tests";
+  process.env.CLC_SANDBOX_STATE_DIR = path.join(temp, ".sandbox-state");
+  process.env.MCP_SHELL_STATE_DIR = path.join(temp, ".shell-state");
   setDefaultCwd(temp);
   setWorkspaceRoots([temp]);
 
+  const { createMcpServer } = await import("../dist/server-factory.js");
   server = await createMcpServer(temp, 10, [temp], false);
   client = new Client({ name: "chatgpt-action-contract-test", version: "1" }, { capabilities: {} });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -317,5 +329,9 @@ try {
   setWorkspaceRoots(oldRoots);
   if (oldProfile === undefined) delete process.env.CHATGPT_TOOL_PROFILE;
   else process.env.CHATGPT_TOOL_PROFILE = oldProfile;
+  for (const [key, value] of Object.entries(oldRuntimeEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   await fs.rm(temp, { recursive: true, force: true });
 }

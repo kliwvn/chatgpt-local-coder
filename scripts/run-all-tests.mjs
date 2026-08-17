@@ -86,7 +86,12 @@ const unitScripts = [
   "scripts/test-manager-runtime-state.mjs",
   "scripts/test-manager-workspace-scope.mjs",
   "scripts/test-manager-env-redaction.mjs",
+  "scripts/test-manager-tunnel-state.mjs",
+  "scripts/test-manager-autostart-policy.mjs",
   "scripts/test-manager-safety.mjs",
+  "scripts/test-manager-authority-state.mjs",
+  "scripts/test-manager-migration-recovery.mjs",
+  "scripts/test-manager-zero-instance.mjs",
   "scripts/test-admin-auth.mjs",
   "scripts/test-session-leak.mjs",
   "scripts/test-project-memory.mjs",
@@ -109,6 +114,30 @@ const discoveredTestFiles = (await fs.readdir(path.join(root, "scripts")))
 const omittedTestFiles = discoveredTestFiles.filter((name) => !coveredTestFiles.has(name));
 if (omittedTestFiles.length > 0) {
   throw new Error(`test:all coverage drift: unreferenced test scripts: ${omittedTestFiles.join(", ")}`);
+}
+
+// Tests run as children of the live Local Coder process and therefore inherit
+// production MCP_SHELL_STATE_DIR / sandbox identity by default. server-factory
+// imports persistent-shell/state-path at module load time, so any test that
+// constructs an MCP server must install test-owned state roots before dynamically
+// importing server-factory. Enforce that contract centrally to prevent fixtures
+// from ever writing shell/sandbox authority into a managed production instance.
+for (const name of discoveredTestFiles) {
+  const source = await fs.readFile(path.join(root, "scripts", name), "utf8");
+  if (!/createMcpServer\s*\(/.test(source)) continue;
+  if (/import\s+[^;\n]*createMcpServer[^;\n]*server-factory\.js/.test(source)) {
+    throw new Error(`test environment isolation drift: ${name} statically imports createMcpServer`);
+  }
+  for (const required of [
+    "MCP_SHELL_STATE_DIR",
+    "CLC_SANDBOX_STATE_DIR",
+    "LOCAL_CODER_INSTANCE_ID",
+    "await import(\"../dist/server-factory.js\")",
+  ]) {
+    if (!source.includes(required)) {
+      throw new Error(`test environment isolation drift: ${name} is missing ${required}`);
+    }
+  }
 }
 
 console.log("\n=== Unit tests ===");

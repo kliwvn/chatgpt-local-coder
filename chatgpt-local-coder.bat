@@ -141,12 +141,14 @@ if errorlevel 1 (
   exit /b 0
 )
 "%PS%" -NoProfile -Command "try { $m=Invoke-RestMethod 'http://127.0.0.1:%MGR_PORT%/api/health' -TimeoutSec 3 } catch { Write-Host 'Khong doc duoc manager health.'; exit 1 }; $p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$m.pid) -ErrorAction SilentlyContinue; if (-not $p -or $p.Name -notmatch '^node') { Write-Host ('PID '+$m.pid+' khong phai node - khong dung.'); exit 1 }; if ($p.CommandLine -notmatch 'manager[\\/]server\.mjs') { Write-Host ('PID '+$m.pid+' khong phai Local Coder Manager - khong dung.'); exit 1 }; Stop-Process -Id $m.pid -Force; Write-Host ('Da dung Manager PID '+$m.pid+' (Server + Tunnel cac workspace giu nguyen)')"
+if errorlevel 1 exit /b 1
 exit /b 0
 
 REM =====================================================================
 :cmd_status
 REM =====================================================================
-"%PS%" -NoProfile -Command "$m=$null; try { $m=Invoke-RestMethod 'http://127.0.0.1:%MGR_PORT%/api/health' -TimeoutSec 3 } catch {}; if (-not $m) { Write-Host ('Manager: KHONG chay (http://127.0.0.1:%MGR_PORT%) - chay: %~nx0 start'); exit 1 }; Write-Host ('Manager: dang chay - PID ' + $m.pid + ' @ http://127.0.0.1:%MGR_PORT%'); $i=Invoke-RestMethod 'http://127.0.0.1:%MGR_PORT%/api/instances' -TimeoutSec 5; foreach ($x in $i.instances) { $sv=if ($x.server.running) {'chay'} else {'dung'}; $tn=if ($x.tunnel.running) {'chay'} else {'dung'}; $ws=$x.env.WORKSPACE_PATH; if (-not $ws) { $ws='(chua dat)' }; Write-Host (' - ' + $x.name + ': server=' + $sv + ' | tunnel=' + $tn + ' | ws=' + $ws) }"
+"%PS%" -NoProfile -Command "$m=$null; try { $m=Invoke-RestMethod 'http://127.0.0.1:%MGR_PORT%/api/health' -TimeoutSec 3 } catch {}; if (-not $m -or $m.ok -ne $true -or $m.name -ne 'chatgpt-local-coder-manager') { Write-Host ('Manager: KHONG chay/dung identity (http://127.0.0.1:%MGR_PORT%) - chay: %~nx0 start'); exit 1 }; Write-Host ('Manager: dang chay - PID ' + $m.pid + ' @ http://127.0.0.1:%MGR_PORT%'); try { $i=Invoke-RestMethod 'http://127.0.0.1:%MGR_PORT%/api/instances' -TimeoutSec 5 } catch { Write-Host ('Khong doc duoc instance status: '+$_.Exception.Message); exit 1 }; foreach ($x in $i.instances) { $sv=if ($x.server.running) {'chay'} else {'dung'}; $tn=if ($x.tunnel.running) {'chay'} else {'dung'}; $ws=$x.env.WORKSPACE_PATH; if (-not $ws) { $ws='(chua dat)' }; Write-Host (' - ' + $x.name + ': server=' + $sv + ' | tunnel=' + $tn + ' | ws=' + $ws) }"
+if errorlevel 1 exit /b 1
 exit /b 0
 
 REM =====================================================================
@@ -154,11 +156,20 @@ REM =====================================================================
 REM =====================================================================
 if /i "%~2"=="off" goto :autostart_off
 call :ensure_autostart
+if errorlevel 1 exit /b 1
 exit /b 0
 :autostart_off
 set "LNK=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\ChatGPT Local Coder Manager.lnk"
 if exist "%LNK%" (
-  del "%LNK%"
+  del /q "%LNK%" >nul 2>nul
+  if errorlevel 1 (
+    echo [LOI] Khong xoa duoc autostart LNK: "%LNK%"
+    exit /b 1
+  )
+  if exist "%LNK%" (
+    echo [LOI] Autostart LNK van con sau khi xoa: "%LNK%"
+    exit /b 1
+  )
   echo [OK] Da tat autostart (xoa LNK).
 ) else (
   echo [OK] Autostart da tat san.
@@ -173,33 +184,45 @@ if errorlevel 1 (
   echo [LOI] Manager chua chay. Chay: %~nx0 start
   exit /b 1
 )
-if /i "%~2"=="start" (
-  "%PS%" -NoProfile -Command "try { $r=Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:%MGR_PORT%/api/instances/default/tunnel/start' -ContentType 'application/json' -Body '{}' -TimeoutSec 60; if ($r.ok) { Write-Host ('Tunnel da bat: ' + $r.mode + ' ' + $r.url) } else { Write-Host ('LOI: ' + $r.error); exit 1 } } catch { Write-Host ('LOI: ' + $_.Exception.Message); exit 1 }"
-  exit /b 0
-)
-if /i "%~2"=="stop" (
-  "%PS%" -NoProfile -Command "try { $r=Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:%MGR_PORT%/api/instances/default/tunnel/stop' -ContentType 'application/json' -Body '{}' -TimeoutSec 60; if ($r.ok) { Write-Host 'Tunnel da dung.' } else { Write-Host ('LOI: ' + $r.error); exit 1 } } catch { Write-Host ('LOI: ' + $_.Exception.Message); exit 1 }"
-  exit /b 0
-)
+if /i "%~2"=="start" goto :tunnel_start
+if /i "%~2"=="stop" goto :tunnel_stop
 echo Lenh tunnel khong hop le: %~2  ^(start^|stop^)
 exit /b 1
+
+:tunnel_start
+"%PS%" -NoProfile -Command "try { $r=Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:%MGR_PORT%/api/instances/default/tunnel/start' -ContentType 'application/json' -Body '{}' -TimeoutSec 60; if ($r.ok) { Write-Host ('Tunnel da bat: ' + $r.mode + ' ' + $r.url) } else { Write-Host ('LOI: ' + $r.error); exit 1 } } catch { Write-Host ('LOI: ' + $_.Exception.Message); exit 1 }"
+if errorlevel 1 exit /b 1
+exit /b 0
+
+:tunnel_stop
+"%PS%" -NoProfile -Command "try { $r=Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:%MGR_PORT%/api/instances/default/tunnel/stop' -ContentType 'application/json' -Body '{}' -TimeoutSec 60; if ($r.ok) { Write-Host 'Tunnel da dung.' } else { Write-Host ('LOI: ' + $r.error); exit 1 } } catch { Write-Host ('LOI: ' + $_.Exception.Message); exit 1 }"
+if errorlevel 1 exit /b 1
+exit /b 0
 
 REM =====================================================================
 :ensure_autostart
 REM =====================================================================
 set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
 set "LNK=%STARTUP%\ChatGPT Local Coder Manager.lnk"
+set "CLC_AUTOSTART_LNK=%LNK%"
+set "CLC_AUTOSTART_TARGET=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+set "CLC_AUTOSTART_LAUNCHER=%~dp0chatgpt-local-coder.bat"
+set "CLC_AUTOSTART_WORKDIR=%~dp0"
 if not exist "%~dp0manager\state" mkdir "%~dp0manager\state"
 REM LNK tro powershell an -> chay chinh file nay voi lenh "start".
 REM Khong dung VBS/wscript (VBScript engine khong dang ky san tren nhieu Windows).
-"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut('%LNK%'); $s.TargetPath='%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe'; $s.Arguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ' + [char]34 + '& ''%~dp0chatgpt-local-coder.bat'' start' + [char]34; $s.WorkingDirectory='%~dp0'; $s.WindowStyle=7; $s.Description='ChatGPT Local Coder Manager (hidden)'; $s.Save()"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($env:CLC_AUTOSTART_LNK); $singleQuote=[string][char]39; $launcherLiteral=$singleQuote + $env:CLC_AUTOSTART_LAUNCHER.Replace($singleQuote,($singleQuote+$singleQuote)) + $singleQuote; $s.TargetPath=$env:CLC_AUTOSTART_TARGET; $s.Arguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ' + [char]34 + '& ' + $launcherLiteral + ' start' + [char]34; $s.WorkingDirectory=$env:CLC_AUTOSTART_WORKDIR; $s.WindowStyle=7; $s.Description='ChatGPT Local Coder Manager (hidden)'; $s.Save()"
+if errorlevel 1 (
+  echo [LOI] Tao LNK autostart that bai.
+  exit /b 1
+)
 if not exist "%LNK%" (
   echo [LOI] Khong tao duoc autostart LNK.
   exit /b 1
 )
-"%PS%" -NoProfile -Command "$w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut('%LNK%'); if ($s.Arguments -notmatch 'chatgpt-local-coder\.bat') { exit 1 }"
+"%PS%" -NoProfile -Command "$ErrorActionPreference='Stop'; $w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut($env:CLC_AUTOSTART_LNK); $expectedTarget=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_TARGET); $expectedLauncher=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_LAUNCHER); $expectedWork=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_WORKDIR).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar); $singleQuote=[string][char]39; $launcherLiteral=$singleQuote + $expectedLauncher.Replace($singleQuote,($singleQuote+$singleQuote)) + $singleQuote; $expectedArguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ' + [char]34 + '& ' + $launcherLiteral + ' start' + [char]34; $actualTarget=[IO.Path]::GetFullPath($s.TargetPath); $actualWork=[IO.Path]::GetFullPath($s.WorkingDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar); if (-not [string]::Equals($actualTarget,$expectedTarget,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($actualWork,$expectedWork,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($s.Arguments,$expectedArguments,[StringComparison]::OrdinalIgnoreCase)) { exit 1 }"
 if errorlevel 1 (
-  echo [LOI] LNK autostart tao ra khong tro toi chatgpt-local-coder.bat.
+  echo [LOI] LNK autostart khong khop exact CURRENT repo launcher/working directory.
   exit /b 1
 )
 echo [OK] Autostart da cai: "%LNK%"
@@ -263,5 +286,5 @@ exit /b 0
 REM =====================================================================
 :manager_running
 REM =====================================================================
-"%PS%" -NoProfile -Command "try { $r=Invoke-WebRequest -Uri 'http://127.0.0.1:%MGR_PORT%/api/health' -UseBasicParsing -TimeoutSec 3; if ($r.StatusCode -eq 200) { exit 0 } } catch {} exit 1"
+"%PS%" -NoProfile -Command "try { $r=Invoke-RestMethod -Uri 'http://127.0.0.1:%MGR_PORT%/api/health' -TimeoutSec 3; if ($r.ok -eq $true -and $r.name -eq 'chatgpt-local-coder-manager') { exit 0 } } catch {} exit 1"
 exit /b %errorlevel%

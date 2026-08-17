@@ -26,6 +26,37 @@ function normalizeStringSet(values) {
   return result;
 }
 
+function sameStringSet(left, right) {
+  const keys = (values) => normalizeStringSet(values)
+    .map((value) => process.platform === "win32" ? value.toLowerCase() : value)
+    .sort();
+  return JSON.stringify(keys(left)) === JSON.stringify(keys(right));
+}
+
+function pathCoveredByRoots(candidate, roots) {
+  const candidatePath = path.resolve(candidate);
+  for (const root of normalizeStringSet(roots)) {
+    const rootPath = path.resolve(root);
+    const relative = path.relative(rootPath, candidatePath);
+    if (relative === "") return true;
+    if (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative)) return true;
+  }
+  return false;
+}
+
+function mergeHistoricalPathRoots(sourceRoots, targetRoots) {
+  const merged = normalizeStringSet(targetRoots);
+  for (const source of normalizeStringSet(sourceRoots)) {
+    // A current broader parent grant already subsumes a historical child grant.
+    // Do not retain the redundant child forever. The opposite direction is not
+    // safe to collapse: a historical broader parent must remain in the ledger so
+    // privileged reconciliation can revoke that broader ACL explicitly.
+    if (pathCoveredByRoots(source, merged)) continue;
+    merged.push(source);
+  }
+  return normalizeStringSet(merged);
+}
+
 function parsePolicyManifest(raw, file) {
   let parsed;
   try {
@@ -78,12 +109,28 @@ export async function preserveLegacySandboxPolicyManifest({ legacyDir, targetDir
   // Union old roots so the next ProcessExecutor initialization can revoke every
   // historically granted RW root. Exec-root differences intentionally survive
   // into the merged manifest and trigger the existing privileged setup gate.
+  const mergedRwRoots = mergeHistoricalPathRoots(sourcePolicy.rwRoots, targetPolicy.rwRoots);
+  const mergedExecRoots = mergeHistoricalPathRoots(sourcePolicy.execRoots, targetPolicy.execRoots);
+
+  // A preserved historical orphan is intentionally kept for audit/recovery. Once
+  // every source root is already represented by the managed ledger, re-merging it
+  // on every Manager boot only churns updatedAt, causes false "Recovered ...
+  // (merged)" diagnostics, and makes durable authority look perpetually dirty.
+  // Treat semantic set coverage as an idempotent terminal state without rewriting
+  // the target bytes.
+  if (
+    sameStringSet(mergedRwRoots, targetPolicy.rwRoots) &&
+    sameStringSet(mergedExecRoots, targetPolicy.execRoots)
+  ) {
+    return { action: "covered", source, target, policy: targetPolicy };
+  }
+
   const merged = {
     version: 1,
     profileName: targetPolicy.profileName,
     sid: targetPolicy.sid,
-    rwRoots: normalizeStringSet([...sourcePolicy.rwRoots, ...targetPolicy.rwRoots]),
-    execRoots: normalizeStringSet([...sourcePolicy.execRoots, ...targetPolicy.execRoots]),
+    rwRoots: mergedRwRoots,
+    execRoots: mergedExecRoots,
     updatedAt: new Date().toISOString(),
   };
   await atomicWriteFile(target, `${JSON.stringify(merged, null, 2)}\n`, "utf8");

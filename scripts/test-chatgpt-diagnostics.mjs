@@ -16,7 +16,6 @@ import path from "node:path";
 import os from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createMcpServer } from "../dist/server-factory.js";
 import { setDefaultCwd, setWorkspaceRoots } from "../dist/lib/path-security.js";
 import {
   initializeProcessSecurity,
@@ -38,6 +37,7 @@ const oldEnv = Object.fromEntries([
   "LOCAL_CODER_INSTANCE_ID",
   "CLC_SANDBOX_PROFILE_NAME",
   "CLC_SANDBOX_STATE_DIR",
+  "MCP_SHELL_STATE_DIR",
   "SANDBOX_NETWORK_MODE",
 ].map((key) => [key, process.env[key]]));
 function ok(m) { console.log(`OK  ${m}`); passed++; }
@@ -75,11 +75,15 @@ try {
   process.env.LOCAL_CODER_INSTANCE_ID = "tests";
   process.env.CLC_SANDBOX_PROFILE_NAME = "ChatGPTLocalCoder.tests";
   process.env.CLC_SANDBOX_STATE_DIR = path.join(temp, ".sandbox-state");
+  process.env.MCP_SHELL_STATE_DIR = path.join(temp, ".shell-state");
   process.env.SANDBOX_NETWORK_MODE = "none";
   resetProcessSecurityForTests();
   const sandbox = await initializeProcessSecurity();
   check("strict sandbox self-test passed", sandbox.sandbox_self_test === "passed", sandbox.sandbox_error || sandbox.sandbox_self_test);
 
+  // server-factory imports persistent-shell/state-path, so load it only after
+  // this suite has installed test-owned state roots.
+  const { createMcpServer } = await import("../dist/server-factory.js");
   const server = await createMcpServer(temp, 10, [temp], false);
   servers.push(server);
 

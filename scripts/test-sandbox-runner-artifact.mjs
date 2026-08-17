@@ -37,13 +37,18 @@ assert.match(expectedHash, /^[a-f0-9]{64}$/, "sandbox runner sidecar hash is mal
 assert.equal(actualHash, expectedHash, "sandbox runner binary does not match its integrity sidecar");
 assert.match(
   setupSource,
-  /const desiredCompatibilityState = \{[\s\S]{0,700}?version:\s*2,[\s\S]{0,700}?runnerArtifact:\s*path\.basename\(runner\)/,
+  /const desiredCompatibilityState = \{[\s\S]{0,700}?version:\s*3,[\s\S]{0,700}?runnerArtifact:\s*path\.basename\(runner\)/,
   "privileged compatibility marker must be tied to the content-versioned runner artifact",
 );
 assert.match(
   setupSource,
   /recorded\?\.runnerArtifact === desired\.runnerArtifact/,
   "compatibility preflight must invalidate a marker produced by an older runner artifact",
+);
+assert.match(
+  setupSource,
+  /os\.uptime\(\)[\s\S]{0,520}?recordedAt >= currentBootStartedAtMs\(\) - 5000/,
+  "NUL compatibility receipt must be current-boot scoped because the kernel-object ACL does not survive reboot",
 );
 
 const prepareIdentityBlock = sourceText.match(

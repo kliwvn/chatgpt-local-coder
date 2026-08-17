@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
+import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
@@ -122,6 +123,14 @@ function normalizePathSet(values) {
   return [...new Set(values.map((value) => path.resolve(value).toLowerCase()))].sort();
 }
 
+function currentBootStartedAtMs() {
+  // NUL is a kernel object; its AppContainer ACE does not survive a Windows
+  // reboot. Bind the durable compatibility receipt to the current OS boot by
+  // requiring that the receipt was written after this boot began. os.uptime()
+  // is monotonic enough for this comparison; allow a tiny clock/rounding margin.
+  return Date.now() - (os.uptime() * 1000);
+}
+
 async function readCompatibilityState() {
   try {
     return JSON.parse(await fsp.readFile(sandboxCompatibilityStatePath(), "utf8"));
@@ -132,11 +141,14 @@ async function readCompatibilityState() {
 }
 
 function compatibilityStateMatches(recorded, desired) {
+  const recordedAt = Date.parse(String(recorded?.updatedAt || ""));
+  const preparedThisBoot = Number.isFinite(recordedAt) && recordedAt >= currentBootStartedAtMs() - 5000;
   return Boolean(
     recorded?.version === desired.version &&
     recorded?.profileName === desired.profileName &&
     recorded?.runnerArtifact === desired.runnerArtifact &&
     recorded?.nulPrepared === true &&
+    preparedThisBoot &&
     JSON.stringify(normalizePathSet(recorded?.traverseRoots || [])) === JSON.stringify(normalizePathSet(desired.traverseRoots)) &&
     JSON.stringify(normalizePathSet(recorded?.execRoots || [])) === JSON.stringify(normalizePathSet(desired.execRoots))
   );
@@ -235,12 +247,14 @@ function traversePathsForProfile(profile) {
 }
 
 const desiredCompatibilityState = {
-  version: 2,
+  version: 3,
   profileName: productionProfile,
   // The runner filename is content-versioned from SandboxRunner.cs. Binding the
   // privileged compatibility marker to it ensures a broker behavior update
   // cannot silently reuse grants prepared under an older broker contract.
   runnerArtifact: path.basename(runner),
+  // This flag is only trustworthy together with compatibilityStateMatches'
+  // current-boot receipt check because the NUL kernel object is recreated on reboot.
   nulPrepared: true,
   traverseRoots: traversePathsForProfile(productionProfile),
   execRoots: [...execRoots],

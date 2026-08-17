@@ -146,6 +146,58 @@ try {
   assert((await fs.readFile(path.join(targetDual, "managed-shell.json"), "utf8")) === "managed-shell\n", "managed shell state was overwritten during dual-state reconciliation");
   assert(dualShell.preserved && await exists(path.join(dualShell.preserved, "legacy-shell.json")), "legacy dual shell state was not archived intact");
 
+  // A preserved historical policy can remain on disk indefinitely for audit.
+  // Once its root sets are already covered by the managed ledger, re-reading it
+  // must be a byte-stable no-op rather than churning updatedAt on every boot.
+  const coveredLegacy = path.join(repoRoot, ".mcp-state-covered");
+  const coveredTarget = path.join(instanceDir, "shell-state-covered");
+  await fs.mkdir(coveredLegacy, { recursive: true });
+  await fs.mkdir(coveredTarget, { recursive: true });
+  const coveredSourcePolicy = {
+    ...legacyPolicy,
+    rwRoots: [path.join(currentRoot, "legacy-child")],
+    execRoots: [path.join(currentExec, "legacy-child")],
+  };
+  const coveredManagedPolicy = {
+    ...legacyPolicy,
+    rwRoots: [currentRoot],
+    execRoots: [currentExec],
+    updatedAt: "2026-08-17T00:00:00.000Z",
+  };
+  await fs.writeFile(path.join(coveredLegacy, policyFile), `${JSON.stringify(coveredSourcePolicy, null, 2)}\n`);
+  const coveredTargetFile = path.join(coveredTarget, policyFile);
+  const coveredBefore = `${JSON.stringify(coveredManagedPolicy, null, 2)}\n`;
+  await fs.writeFile(coveredTargetFile, coveredBefore);
+  const covered = await preserveLegacySandboxPolicyManifest({
+    legacyDir: coveredLegacy,
+    targetDir: coveredTarget,
+    instanceId: "default",
+  });
+  assert(covered.action === "covered", `already-covered sandbox policy was rewritten instead of no-op: ${covered.action}`);
+  assert((await fs.readFile(coveredTargetFile, "utf8")) === coveredBefore, "covered sandbox policy target bytes changed unexpectedly");
+
+  // Direction matters: when history granted a broader parent and the managed
+  // ledger now contains only a child, the historical parent must survive until
+  // privileged setup can explicitly revoke that broader ACL.
+  const broaderLegacy = path.join(repoRoot, ".mcp-state-broader");
+  const broaderTarget = path.join(instanceDir, "shell-state-broader");
+  await fs.mkdir(broaderLegacy, { recursive: true });
+  await fs.mkdir(broaderTarget, { recursive: true });
+  const broaderSourcePolicy = { ...legacyPolicy, rwRoots: [repoRoot], execRoots: [repoRoot] };
+  const narrowerManagedPolicy = { ...legacyPolicy, rwRoots: [currentRoot], execRoots: [currentExec] };
+  await fs.writeFile(path.join(broaderLegacy, policyFile), `${JSON.stringify(broaderSourcePolicy, null, 2)}\n`);
+  const broaderTargetFile = path.join(broaderTarget, policyFile);
+  await fs.writeFile(broaderTargetFile, `${JSON.stringify(narrowerManagedPolicy, null, 2)}\n`);
+  const broader = await preserveLegacySandboxPolicyManifest({
+    legacyDir: broaderLegacy,
+    targetDir: broaderTarget,
+    instanceId: "default",
+  });
+  assert(broader.action === "merged", `historical broader parent was incorrectly treated as covered: ${broader.action}`);
+  const broaderMerged = JSON.parse(await fs.readFile(broaderTargetFile, "utf8"));
+  assert(broaderMerged.rwRoots.includes(repoRoot), "historical broader RW parent was lost before ACL revocation");
+  assert(broaderMerged.execRoots.includes(repoRoot), "historical broader exec parent was lost before ACL revocation");
+
   // Two different AppContainer identities are not safe to merge silently.
   const identityLegacy = path.join(repoRoot, ".mcp-state-identity");
   const identityTarget = path.join(instanceDir, "shell-state-identity");

@@ -18,6 +18,15 @@ import {
 } from "../manager/fs-utils.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const managerFsUtilsSource = await fs.readFile(path.resolve("manager", "fs-utils.mjs"), "utf8");
+
+assert.match(
+  managerFsUtilsSource,
+  /function atomicRollbackFailure\([\s\S]{0,900}?ATOMIC_REPLACE_ROLLBACK_FAILED[\s\S]{0,500}?rollbackFailed = true[\s\S]{0,220}?backupPath = backupPath/,
+  "atomic replace rollback failure must surface a typed error and exact retained backup path",
+);
+const rollbackEscalations = [...managerFsUtilsSource.matchAll(/if \(rollbackError\) throw atomicRollbackFailure\(commitError, rollbackError, backup\);/g)];
+assert.equal(rollbackEscalations.length, 2, "both streamed-download and atomic config writes must surface rollback-recovery evidence");
 
 // A rebuild after Gateway startup must be surfaced as runtime artifact drift.
 {
