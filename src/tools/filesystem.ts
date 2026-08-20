@@ -3,7 +3,7 @@ import { createReadStream } from "node:fs";
 import path from "path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { validatePath } from "../lib/path-security.js";
+import { validateContextReadPath, validatePath } from "../lib/path-security.js";
 import { audit } from "../lib/audit.js";
 import { requireWriteAllowed } from "../lib/permissions.js";
 import { applyMultiFilePatch, applyUnifiedPatchToText, buildSimpleDiff, isMultiFilePatch, parseMultiFilePatch } from "../lib/patch.js";
@@ -278,7 +278,7 @@ export function registerFilesystemTools(server: McpServer): void {
       annotations: toolAnnotations("read"),
     },
     async ({ path: filePath, offset, limit, head, tail }) => {
-      const validPath = await validatePath(filePath);
+      const validPath = await validateContextReadPath(filePath);
 
       if (offset !== undefined) {
         const slice = await readTextLinesFrom(validPath, offset, limit);
@@ -909,7 +909,7 @@ export function registerFilesystemTools(server: McpServer): void {
   });
 
   server.registerTool("list_allowed_directories", { title: "List Allowed Directories", description: "Show default working directory and machine access scope.", inputSchema: {}, annotations: toolAnnotations("read") }, async () => {
-    const { getDefaultCwd, getFullDiskAccess, getMachineRoots } = await import("../lib/path-security.js");
+    const { getContextReadFiles, getContextReadRoots, getDefaultCwd, getFullDiskAccess, getMachineRoots } = await import("../lib/path-security.js");
     const { describePermissionProfile } = await import("../lib/permissions.js");
     const machineRoots = getMachineRoots();
     return toolResult("list_allowed_directories", {
@@ -919,6 +919,8 @@ export function registerFilesystemTools(server: McpServer): void {
       permission: describePermissionProfile(),
       default_cwd: getDefaultCwd(),
       machine_roots: machineRoots,
+      context_read_roots: getContextReadRoots(),
+      context_read_files: getContextReadFiles(),
     });
   });
 }

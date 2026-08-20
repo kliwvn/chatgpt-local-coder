@@ -11,6 +11,7 @@ import {
   setDefaultCwd,
   setWorkspaceRoots,
   validateConfiguredWorkspaceRoot,
+  validateContextReadPath,
   validatePath,
 } from "../dist/lib/path-security.js";
 
@@ -154,6 +155,30 @@ try {
     createEscapeBlocked = true;
   }
   assert(createEscapeBlocked, "validatePath allowed create path through symlink/junction escape");
+
+  // The injected user bootstrap may selectively load exact Global Harness text
+  // from ~/.agents while strict mode is active, but this must remain read-only:
+  // ordinary path validation (used by mutations/processes) still rejects it.
+  const harnessProbe = path.join(os.homedir(), ".agents", "skills", "__clc-read-contract-probe__", "SKILL.md");
+  const harnessReadPath = await validateContextReadPath(harnessProbe);
+  assert(
+    path.normalize(harnessReadPath).toLowerCase().includes(`${path.sep}.agents${path.sep}`.toLowerCase()),
+    "context read path did not authorize canonical ~/.agents Global Harness tree"
+  );
+  let harnessMutationPathRejected = false;
+  try {
+    await validatePath(harnessProbe);
+  } catch {
+    harnessMutationPathRejected = true;
+  }
+  assert(harnessMutationPathRejected, "Global Harness read exception widened ordinary path/mutation authority");
+  let unrelatedOutsideReadRejected = false;
+  try {
+    await validateContextReadPath(path.join(outsideDir, "secret.txt"));
+  } catch {
+    unrelatedOutsideReadRejected = true;
+  }
+  assert(unrelatedOutsideReadRejected, "context read exception widened arbitrary outside-workspace reads");
 
   // Project-controlled memory cannot use @import or a .claude junction to read
   // outside the configured workspace while the path sandbox is enabled.

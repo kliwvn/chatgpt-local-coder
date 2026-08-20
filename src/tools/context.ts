@@ -5,13 +5,14 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validateConfiguredWorkspaceRoot, validatePath } from "../lib/path-security.js";
 import { audit, getAuditPath } from "../lib/audit.js";
 import { describePermissionProfile, getPermissionProfile } from "../lib/permissions.js";
-import { getDefaultCwd, getFullDiskAccess, getMachineRoots } from "../lib/path-security.js";
+import { getContextReadFiles, getContextReadRoots, getDefaultCwd, getFullDiskAccess, getMachineRoots } from "../lib/path-security.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { MCP_QUICKSTART } from "../lib/quickstart.js";
 import { getCheckpointConfig } from "../lib/checkpoint.js";
 import { getUpstreamManager, type UpstreamServerStatus } from "../lib/mcp-upstream-manager.js";
 import { getBootId, getContractFingerprint } from "../lib/contract-fingerprint.js";
 import { appendAutoMemory } from "../lib/auto-memory.js";
+import { resolveCanonicalGlobalHarnessBootstrap } from "../lib/project-memory.js";
 import { loadPathRulesForFile } from "../lib/path-rules.js";
 import { toolResult } from "../lib/tool-result.js";
 import { readUtf8FilePrefix } from "../lib/bounded-file.js";
@@ -158,6 +159,8 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
         process_security: processSecurity,
         default_cwd: getDefaultCwd(),
         machine_roots: getMachineRoots(),
+        context_read_roots: getContextReadRoots(),
+        context_read_files: getContextReadFiles(),
         audit_log: getAuditPath(),
         boot: {
           boot_id: getBootId(),
@@ -190,6 +193,27 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       annotations: toolAnnotations("edit"),
     },
     async ({ note }) => {
+      const harnessBootstrap = await resolveCanonicalGlobalHarnessBootstrap();
+      if (harnessBootstrap) {
+        await audit({
+          tool: "remember",
+          action: "append",
+          target: harnessBootstrap,
+          status: "ok",
+          details: { skipped: true, reason: "canonical_global_harness_memory_owner_active" },
+        });
+        return toolResult(
+          "remember",
+          {
+            saved: false,
+            inactive: true,
+            canonical_memory_owner: "global_harness_project_memory",
+            bootstrap: harnessBootstrap,
+            note,
+          },
+          { summary: "legacy auto memory inactive: canonical Global Harness memory owner is active" }
+        );
+      }
       const file = await appendAutoMemory(workspaceRoot, note);
       await audit({ tool: "remember", action: "append", target: file, status: "ok" });
       return toolResult("remember", { saved_to: file, note }, { summary: "saved to auto memory" });

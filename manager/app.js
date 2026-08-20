@@ -185,7 +185,7 @@ function renderServerTunnel(s) {
   setDot("inst-server-dot", serverCurrent, srv.running ? (buildDrift ? "Server: source chưa build" : artifactDrift ? "Server: cần restart" : configDrift ? "Server: cấu hình cũ" : "Server: chạy") : serverConflict ? "Server: xung đột cổng" : "Server: dừng");
   $("btn-server").textContent = srv.running ? "Tắt" : "Bật";
   $("btn-server").disabled = busy || serverConflict;
-  $("btn-server-restart").disabled = busy || !srv.running || serverConflict || buildDrift;
+  $("btn-server-restart").disabled = busy || !srv.running || serverConflict;
   const roots =
     (srv.health && srv.health.instructions && srv.health.instructions.workspace_roots) ||
     (s.env.WORKSPACE_PATH ? [s.env.WORKSPACE_PATH] : []);
@@ -194,7 +194,7 @@ function renderServerTunnel(s) {
       ? `${roots[0]} (+${roots.length - 1} path mở rộng)`
       : roots[0] || (srv.health && srv.health.defaultCwd) || "—";
   $("server-detail").textContent = srv.running
-    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}${buildDrift ? " • source mới hơn dist — cần Build rồi restart Gateway" : artifactDrift ? " • build mới hơn process — cần Khởi động lại Gateway" : configDrift ? " • process đang dùng cấu hình cũ — cần Khởi động lại Gateway" : ""}`
+    ? `PID ${srv.pid || "?"} • cổng ${srv.port} • workspace: ${wsLabel} • ${srv.health ? `${srv.health.activeSessions ?? 0} phiên đã đăng ký${srv.health.connectedSessions != null ? ` (${srv.health.connectedSessions} đang kết nối)` : ""}` : "health: —"}${buildDrift ? " • source mới hơn dist — Bật/Khởi động lại sẽ tự build + deploy" : artifactDrift ? " • build mới hơn process — cần Khởi động lại Gateway" : configDrift ? " • process đang dùng cấu hình cũ — cần Khởi động lại Gateway" : ""}`
     : serverConflict
       ? `Cổng ${srv.port} đang bị process khác chiếm${srv.pid ? ` (PID ${srv.pid})` : ""}. Đổi PORT hoặc dừng process đó trước khi bật Local Coder.`
       : `Server chưa chạy — cổng ${srv.port}. Bấm "Bật" để khởi động.`;
@@ -214,7 +214,7 @@ function renderServerTunnel(s) {
   setDot("tunnel-dot", tunnelCurrent, tunnelFocusedLabel);
   setDot("inst-tunnel-dot", tunnelCurrent, tunnelInstanceLabel);
   $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
-  $("btn-tunnel").disabled = busy || tunnelConflict || (!tun.running && (artifactDrift || buildDrift));
+  $("btn-tunnel").disabled = busy || tunnelConflict;
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
   if (tun.running && tunnelConfigDrift) {
     $("tunnel-detail").textContent = tun.kind === "mixed"

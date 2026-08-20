@@ -1,6 +1,7 @@
 ﻿import fs from "node:fs/promises";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 let writeSeq = 0;
 
@@ -81,6 +82,61 @@ async function newestMatchingMtime(root, suffixes, maxNodes = 20_000) {
   }
   try { await walk(root); } catch (err) { if (err?.code !== "ENOENT") throw err; }
   return { newestMtimeMs, files };
+}
+
+/**
+ * Content fingerprint for runtime sources plus explicit build-input files.
+ * File names are normalized relative to baseDir and hashed in sorted order so
+ * concurrent edits are detected even when filesystem mtimes are coarse.
+ */
+export async function fingerprintRuntimeSources({
+  sourceRoot = null,
+  sourceFiles = [],
+  suffixes = [".ts"],
+  maxNodes = 20_000,
+  baseDir = sourceRoot ? path.dirname(sourceRoot) : process.cwd(),
+}) {
+  const files = [];
+  let nodes = 0;
+  const wanted = suffixes.map((suffix) => String(suffix).toLowerCase());
+  async function walk(dir) {
+    const handle = await fs.opendir(dir);
+    try {
+      for await (const entry of handle) {
+        nodes++;
+        if (nodes > maxNodes) throw new Error(`Runtime fingerprint scan exceeded ${maxNodes} nodes under ${sourceRoot}`);
+        if (entry.isSymbolicLink()) continue;
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { await walk(full); continue; }
+        if (!entry.isFile()) continue;
+        const lower = entry.name.toLowerCase();
+        if (wanted.some((suffix) => lower.endsWith(suffix))) files.push(full);
+      }
+    } finally {
+      await handle.close().catch((err) => { if (err?.code !== "ERR_DIR_CLOSED") throw err; });
+    }
+  }
+  if (sourceRoot) {
+    try { await walk(sourceRoot); } catch (err) { if (err?.code !== "ENOENT") throw err; }
+  }
+  for (const file of sourceFiles) {
+    try {
+      const stat = await fs.stat(file);
+      if (stat.isFile()) files.push(file);
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+  }
+  const unique = [...new Set(files.map((file) => path.resolve(file)))].sort((a, b) => a.localeCompare(b));
+  const hash = createHash("sha256");
+  for (const file of unique) {
+    const label = path.relative(baseDir, file).replaceAll("\\", "/");
+    const bytes = await fs.readFile(file);
+    hash.update(`${label}\0${bytes.length}\0`);
+    hash.update(bytes);
+    hash.update("\0");
+  }
+  return { fingerprint: hash.digest("hex"), fileCount: unique.length };
 }
 
 export async function inspectRuntimeBuildFreshness({

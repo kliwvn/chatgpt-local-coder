@@ -158,7 +158,7 @@ export function formatEnvironmentForInstructions(opts: {
     opts.workspaceRoots.length > 1
       ? `Additional workspace roots:\n${opts.workspaceRoots.slice(1).map((r) => `- ${r}`).join("\n")}`
       : "",
-    "Relative paths resolve from default cwd. Absolute paths are allowed only when they remain inside an explicitly configured workspace root.",
+    "Relative paths resolve from default cwd. Normal absolute project/work paths must remain inside an explicitly configured workspace root; read_text_file alone may additionally read canonical Global Harness context (~/.agents plus exact allowlisted Harness-owned ~/.codex text files).",
   ]
     .filter(Boolean)
     .join("\n");

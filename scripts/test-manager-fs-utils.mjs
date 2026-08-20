@@ -8,6 +8,7 @@ import {
   appendBoundedTail,
   enqueueKeyedMutation,
   extractSingleZipEntryBoundedWindows,
+  fingerprintRuntimeSources,
   isRuntimeArtifactStale,
   inspectRuntimeBuildFreshness,
   pruneExpiredCache,
@@ -74,6 +75,38 @@ assert.equal(rollbackEscalations.length, 2, "both streamed-download and atomic c
     );
   } finally {
     await fs.rm(freshRoot, { recursive: true, force: true });
+  }
+}
+
+// Build/deploy stability must use content identity, not only filesystem mtimes.
+{
+  const fingerprintRoot = await fs.mkdtemp(path.join(os.tmpdir(), "clc-runtime-fingerprint-"));
+  const src = path.join(fingerprintRoot, "src");
+  try {
+    await fs.mkdir(src, { recursive: true });
+    const sourceFile = path.join(src, "index.ts");
+    const packageFile = path.join(fingerprintRoot, "package.json");
+    await fs.writeFile(sourceFile, "export const generation = 1;\n", "utf8");
+    await fs.writeFile(packageFile, "{\"name\":\"fixture\"}\n", "utf8");
+    const fixedTime = new Date(Date.now() - 60_000);
+    await fs.utimes(sourceFile, fixedTime, fixedTime);
+    const first = await fingerprintRuntimeSources({
+      sourceRoot: src,
+      sourceFiles: [packageFile],
+      baseDir: fingerprintRoot,
+    });
+    await fs.writeFile(sourceFile, "export const generation = 2;\n", "utf8");
+    await fs.utimes(sourceFile, fixedTime, fixedTime);
+    const second = await fingerprintRuntimeSources({
+      sourceRoot: src,
+      sourceFiles: [packageFile],
+      baseDir: fingerprintRoot,
+    });
+    assert.notEqual(second.fingerprint, first.fingerprint, "same-mtime source byte changes must move the runtime generation fingerprint");
+    assert.equal(first.fileCount, 2);
+    assert.equal(second.fileCount, 2);
+  } finally {
+    await fs.rm(fingerprintRoot, { recursive: true, force: true });
   }
 }
 
@@ -235,4 +268,4 @@ assert.equal(rollbackEscalations.length, 2, "both streamed-download and atomic c
   assert.equal(attempts, 2);
 }
 
-console.log("manager-fs-utils: ok (artifact drift, mutation keys/cache/retries plus bounded state reads/output)");
+console.log("manager-fs-utils: ok (artifact/build drift, byte fingerprints, mutation keys/cache/retries plus bounded state reads/output)");

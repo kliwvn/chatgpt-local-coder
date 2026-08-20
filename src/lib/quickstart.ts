@@ -42,8 +42,8 @@ All tools return JSON: { ok, tool, summary, data }
 *** End Patch
 
 ## Paths
-Path-aware tools follow FULL_DISK_ACCESS + workspace roots. Relative paths resolve from default cwd.
-With FULL_DISK_ACCESS=false, agent-triggered shell/Git/hook/child process trees must pass the Windows AppContainer self-test and stay within configured workspace roots; sandbox failure is fail-closed. FULL_DISK_ACCESS=true is explicit trusted native full-machine mode.
+Mutation/project-discovery paths follow FULL_DISK_ACCESS + workspace roots. Relative paths resolve from default cwd. read_text_file additionally has narrow read-only access to canonical Global Harness context (~/.agents plus exact allowlisted Harness-owned ~/.codex text files) so the injected bootstrap/router can selectively load what it requests.
+With FULL_DISK_ACCESS=false, write/shell/Git/hook/upstream/project authority remains workspace-scoped and agent-triggered shell/Git/hook/child process trees must pass the Windows AppContainer self-test; sandbox failure is fail-closed. FULL_DISK_ACCESS=true is explicit trusted native full-machine mode.
 `.trim();
 
 export function buildServerInstructions(
@@ -57,7 +57,7 @@ export function buildServerInstructions(
     `Default project: ${workspaceRoot}`,
     fullDiskAccess
       ? "Path-aware/process access: explicit trusted native full-machine mode."
-      : "Path-aware access: exact workspace roots only. Agent-triggered local process trees require the Windows AppContainer sandbox and fail closed if its self-test is unhealthy.",
+      : "Mutation/project/process access: exact workspace roots. read_text_file also has narrow read-only access to canonical Global Harness context (~/.agents plus exact allowlisted Harness-owned ~/.codex text files). Agent-triggered local process trees require the Windows AppContainer sandbox and fail closed if its self-test is unhealthy.",
     "Tag this connector in ChatGPT before every task.",
   ].join("\n");
 

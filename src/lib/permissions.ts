@@ -802,7 +802,7 @@ export function shouldBlockCommand(command: string): boolean {
 export function describePermissionProfile(): string {
   const diskScope = getFullDiskAccess()
     ? "path-aware tools have full-disk access"
-    : "path-aware tools are limited to workspace roots";
+    : "mutation/project-discovery paths are limited to workspace roots; read_text_file additionally has read-only access to canonical Global Harness context (~/.agents plus exact allowlisted Harness-owned ~/.codex text files)";
   const processScope = getFullDiskAccess()
     ? "permitted child processes run natively in explicit trusted full-machine mode"
     : "permitted child processes require the Windows AppContainer workspace sandbox and fail closed if its self-test is unhealthy";

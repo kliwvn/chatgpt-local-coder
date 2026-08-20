@@ -84,6 +84,12 @@ if not exist "%~dp0node_modules" (
 )
 call :ensure_build
 if errorlevel 1 exit /b 1
+echo [..] Dang kiem tra patched OpenAI Tunnel runtime...
+node "%~dp0scripts\ensure-tunnel-client-lazy-codex.mjs"
+if errorlevel 1 (
+  echo [LOI] Patched OpenAI Tunnel runtime bat buoc khong san sang. Khong fallback sang official tunnel-client.
+  exit /b 1
+)
 exit /b 0
 
 REM =====================================================================

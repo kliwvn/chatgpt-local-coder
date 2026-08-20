@@ -29,9 +29,13 @@ function pidAlive(pid) {
 }
 
 async function fetchJson(url, options = {}) {
-  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(3000) });
-  const body = await response.json();
-  return { status: response.status, body };
+  try {
+    const response = await fetch(url, { ...options, signal: AbortSignal.timeout(3000) });
+    const body = await response.json();
+    return { status: response.status, body };
+  } catch (err) {
+    throw new Error(`${String(options.method || "GET").toUpperCase()} ${url} failed: ${String(err?.message || err)}`, { cause: err });
+  }
 }
 
 async function waitForHealth(baseUrl, predicate = () => true, timeoutMs = 12000) {

@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { getWorkspaceRoots, setWorkspaceRoots, validatePath } from "./path-security.js";
+import { getWorkspaceRoots, setWorkspaceRoots, validateContextReadPath, validatePath } from "./path-security.js";
 import { readUtf8FilePrefix } from "./bounded-file.js";
 
 const ROOT_MEMORY_FILES = [
@@ -12,20 +13,31 @@ const ROOT_MEMORY_FILES = [
 ] as const;
 
 const USER_MEMORY_CANDIDATES = [
+  path.join(os.homedir(), ".codex", "AGENTS.md"),
   path.join(os.homedir(), ".codex", "CLAUDE.md"),
   path.join(os.homedir(), ".claude", "CLAUDE.md"),
 ] as const;
 
 const RULES_GLOB_MAX = 12;
 const IMPORT_MAX_DEPTH = 4;
-const DEFAULT_MAX_BYTES = parseLimit(process.env.PROJECT_MEMORY_MAX_BYTES, 25000);
-const DEFAULT_MAX_LINES = parseLimit(process.env.PROJECT_MEMORY_MAX_LINES, 200);
+const DEFAULT_MAX_BYTES = parseLimit(process.env.PROJECT_MEMORY_MAX_BYTES, Infinity);
+const DEFAULT_MAX_LINES = parseLimit(process.env.PROJECT_MEMORY_MAX_LINES, Infinity);
 
-/** 0 = không giới hạn; trống / không hợp lệ = fallback (mặc định). */
+type ImportScope = "workspace" | "context";
+
+/** 0 = không giới hạn; trống / không hợp lệ = fallback (mặc định không giới hạn). */
 function parseLimit(raw: string | undefined, fallback: number): number {
-  const n = Number(raw?.trim() || "NaN");
+  const value = raw?.trim();
+  if (!value) return fallback;
+  const n = Number(value);
   if (n === 0) return Infinity;
   return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
+function resolveLimit(value: number | undefined, fallback: number): number {
+  if (value === undefined) return fallback;
+  if (value === 0) return Infinity;
+  return Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 export interface ProjectMemorySection {
@@ -33,6 +45,8 @@ export interface ProjectMemorySection {
   content: string;
   truncated: boolean;
   kind: "user" | "project" | "rule" | "import";
+  source_bytes: number;
+  source_sha256: string;
 }
 
 export interface ProjectMemoryBundle {
@@ -49,6 +63,39 @@ async function fileExists(filePath: string): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function validateUserMemoryEntrypoint(filePath: string): Promise<string> {
+  const lexical = path.resolve(filePath);
+  const stat = await fs.lstat(lexical);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`User memory entrypoint is not a canonical regular file: ${lexical}`);
+  }
+  const canonical = await fs.realpath(lexical);
+  const same = process.platform === "win32"
+    ? canonical.toLowerCase() === lexical.toLowerCase()
+    : canonical === lexical;
+  if (!same) throw new Error(`User memory entrypoint resolves through an alias/reparse path: ${lexical}`);
+  return canonical;
+}
+
+export function getCanonicalGlobalHarnessBootstrapPath(): string {
+  return path.join(os.homedir(), ".codex", "AGENTS.md");
+}
+
+/**
+ * Resolve the canonical Global Harness bootstrap only when it is an exact regular
+ * file at the expected user-home path. A symlink/junction/reparse redirect is not
+ * an active bootstrap and must never silently inherit Global Harness trust.
+ */
+export async function resolveCanonicalGlobalHarnessBootstrap(): Promise<string | null> {
+  const candidate = getCanonicalGlobalHarnessBootstrapPath();
+  if (!(await fileExists(candidate))) return null;
+  try {
+    return await validateUserMemoryEntrypoint(candidate);
+  } catch {
+    return null;
   }
 }
 
@@ -69,11 +116,13 @@ async function readTextLimited(
   kind: ProjectMemorySection["kind"]
 ): Promise<ProjectMemorySection | null> {
   try {
-    // User-level memory is an explicit trusted source outside the project.
-    // Project/rule memory must obey the same path sandbox as path-aware tools;
-    // otherwise a repository-controlled symlink or @import can exfiltrate an
-    // arbitrary local file into MCP instructions during server startup.
-    const resolvedPath = kind === "user" ? path.resolve(filePath) : await validatePath(filePath);
+    // User-level memory is an explicit trusted source outside the project, but its
+    // entrypoint must still be the exact canonical file rather than a symlink,
+    // junction/reparse alias, or other redirected path. Project/rule memory obeys
+    // the normal workspace sandbox.
+    const resolvedPath = kind === "user"
+      ? await validateUserMemoryEntrypoint(filePath)
+      : await validatePath(filePath);
     let sourceText: string;
     let sourceTruncated = false;
     if (Number.isFinite(maxBytes)) {
@@ -83,8 +132,15 @@ async function readTextLimited(
     } else {
       sourceText = await fs.readFile(resolvedPath, "utf8");
     }
+    const sourceBuffer = Buffer.from(sourceText, "utf8");
+    const sourceSha256 = createHash("sha256").update(sourceBuffer).digest("hex");
     let full = stripHtmlComments(sourceText);
-    const expanded = await expandImportsInContent(full, path.dirname(resolvedPath), kind !== "user", maxBytes);
+    const expanded = await expandImportsInContent(
+      full,
+      path.dirname(resolvedPath),
+      kind === "user" ? "context" : "workspace",
+      maxBytes
+    );
     full = expanded.content;
 
     const fullLines = full.split(/\r?\n/);
@@ -101,7 +157,14 @@ async function readTextLimited(
 
     const trimmed = byteLimited.trim();
     if (!trimmed) return null;
-    return { path: resolvedPath, content: trimmed, truncated, kind };
+    return {
+      path: resolvedPath,
+      content: trimmed,
+      truncated,
+      kind,
+      source_bytes: sourceBuffer.length,
+      source_sha256: sourceSha256,
+    };
   } catch {
     return null;
   }
@@ -110,11 +173,11 @@ async function readTextLimited(
 async function expandImportsInContent(
   content: string,
   baseDir: string,
-  restrictToWorkspace: boolean,
+  importScope: ImportScope,
   maxBytes: number
 ): Promise<{ content: string; truncated: boolean }> {
   const visited = new Set<string>();
-  return expandMemoryImportsAsync(content, baseDir, visited, 0, restrictToWorkspace, maxBytes);
+  return expandMemoryImportsAsync(content, baseDir, visited, 0, importScope, maxBytes);
 }
 
 async function expandMemoryImportsAsync(
@@ -122,7 +185,7 @@ async function expandMemoryImportsAsync(
   baseDir: string,
   visited: Set<string>,
   depth: number,
-  restrictToWorkspace: boolean,
+  importScope: ImportScope,
   maxBytes: number
 ): Promise<{ content: string; truncated: boolean }> {
   if (depth >= IMPORT_MAX_DEPTH) {
@@ -183,13 +246,16 @@ async function expandMemoryImportsAsync(
     }
 
     let resolved = path.resolve(importPath);
-    if (restrictToWorkspace) {
-      try {
-        resolved = await validatePath(resolved);
-      } catch {
-        if (!append("<!-- import blocked: outside configured workspace roots -->")) break;
-        continue;
-      }
+    try {
+      resolved = importScope === "context"
+        ? await validateContextReadPath(resolved)
+        : await validatePath(resolved);
+    } catch {
+      const blocked = importScope === "context"
+        ? "<!-- import blocked: outside canonical Global Harness context -->"
+        : "<!-- import blocked: outside configured workspace roots -->";
+      if (!append(blocked)) break;
+      continue;
     }
     if (visited.has(resolved)) {
       if (!append(`<!-- skipped circular import ${resolved} -->`)) break;
@@ -213,7 +279,7 @@ async function expandMemoryImportsAsync(
         path.dirname(resolved),
         visited,
         depth + 1,
-        restrictToWorkspace,
+        importScope,
         remaining
       );
       if (!append(`<!-- @import ${resolved} -->`)) break;
@@ -301,8 +367,8 @@ export async function loadProjectMemory(
   workspaceRoot: string,
   opts?: { maxBytes?: number; maxLines?: number; workspaceRoots?: string[]; includeUserMemory?: boolean }
 ): Promise<ProjectMemoryBundle> {
-  const maxBytes = opts?.maxBytes ?? DEFAULT_MAX_BYTES;
-  const maxLines = opts?.maxLines ?? DEFAULT_MAX_LINES;
+  const maxBytes = resolveLimit(opts?.maxBytes, DEFAULT_MAX_BYTES);
+  const maxLines = resolveLimit(opts?.maxLines, DEFAULT_MAX_LINES);
   const root = path.resolve(workspaceRoot);
   const workspace_roots =
     opts?.workspaceRoots && opts.workspaceRoots.length > 0 ? opts.workspaceRoots : [root];
@@ -385,7 +451,7 @@ export function formatProjectMemoryForInstructions(bundle: ProjectMemoryBundle):
   return [
     "## Project memory (auto-loaded like Claude Code CLAUDE.md)",
     `Primary root: ${bundle.root}`,
-    "Treat content below as ground truth for conventions, build commands, and architecture.",
+    "Apply the content below according to its own scope and the active authority order; auto-loading does not promote a lower-authority user/global/project/rule surface over a higher-authority current instruction or canonical owner.",
     bundle.workspace_roots.length > 1
       ? `All workspace roots:\n${bundle.workspace_roots.map((r) => `- ${r}`).join("\n")}`
       : "",

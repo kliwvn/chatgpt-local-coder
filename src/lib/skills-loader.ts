@@ -66,7 +66,7 @@ export async function loadProjectSkills(workspaceRoot: string): Promise<SkillSum
 export function formatSkillsForInstructions(skills: SkillSummary[]): string {
   if (!skills.length) return "";
   return [
-    "## Skills (invoke manually — ChatGPT has no /slash; describe the skill in your prompt)",
+    "## Project capability catalog (discovery only — selection/invocation remains subject to current authority and the active semantic router)",
     ...skills.map((s) => `- **${s.name}**: ${s.description}`),
   ].join("\n");
 }

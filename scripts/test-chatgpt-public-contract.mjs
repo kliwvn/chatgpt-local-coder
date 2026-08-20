@@ -128,6 +128,17 @@ try {
   check("mcp_tools errors cleanly without manager", Boolean(toolsRes.isError));
   check("mcp_call errors cleanly without manager", Boolean(callRes.isError));
 
+  // The public remember tool stays in the frozen ABI, but when the canonical
+  // Global Harness bootstrap is active its legacy Local Coder memory write plane
+  // must be inactive rather than competing with project/Harness Memory.
+  const rememberRes = await callTool(noMgr, "remember", { note: "contract probe: must not persist under Global Harness" });
+  const rememberText = JSON.stringify(rememberRes);
+  check(
+    "remember stays ABI-compatible but is no-write under canonical Global Harness",
+    rememberText.includes('"saved":false') && rememberText.includes('"inactive":true') && rememberText.includes("global_harness_project_memory"),
+    rememberText
+  );
+
   // --- 6. full profile stays dynamic --------------------------------------
   process.env.CHATGPT_TOOL_PROFILE = "full";
   const full = await createMcpServer(temp, 10, [temp], false);
