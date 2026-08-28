@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   evaluateOpenAiTunnelLaunchState,
+  legacyOpenAiTunnelLaunchFingerprintV1,
   legacyPidFileMatchesProcessStart,
   openAiTunnelLaunchFingerprint,
   waitForTunnelPortRelease,
@@ -11,17 +12,21 @@ const base = {
   apiKey: "sk-test-secret-not-persisted",
   healthPort: 4411,
   serverPort: 3000,
+  runtimeIdentity: "sha256:runtime-a",
 };
 const fingerprint = openAiTunnelLaunchFingerprint(base);
+const legacyFingerprint = legacyOpenAiTunnelLaunchFingerprintV1(base);
 const processStartedAt = "2026-08-14T12:00:00.0000000Z";
 assert.match(fingerprint, /^[0-9a-f]{64}$/);
 assert.ok(!fingerprint.includes(base.apiKey), "fingerprint must never contain plaintext secret");
+assert.notEqual(legacyFingerprint, fingerprint, "runtime-bound launch contract must differ from legacy v1 fingerprint");
 
 for (const [field, value] of [
   ["tunnelId", "tunnel_fedcba9876543210fedcba9876543210"],
   ["apiKey", "sk-different-secret"],
   ["healthPort", 4412],
   ["serverPort", 3002],
+  ["runtimeIdentity", "sha256:runtime-b"],
 ]) {
   const changed = openAiTunnelLaunchFingerprint({ ...base, [field]: value });
   assert.notEqual(changed, fingerprint, `${field} drift must change launch fingerprint`);
@@ -36,6 +41,7 @@ const exact = evaluateOpenAiTunnelLaunchState({
   savedProcessStartedAt: processStartedAt,
   savedFingerprint: fingerprint,
   desiredFingerprint: fingerprint,
+  runtimePathMatches: true,
 });
 assert.equal(exact.desired, true);
 assert.equal(exact.launchIdentityMatches, true);
@@ -45,6 +51,7 @@ assert.equal(exact.ambiguous, false);
 assert.equal(exact.pidMatch, true);
 assert.equal(exact.processStartedAtMatch, true);
 assert.equal(exact.fingerprintMatch, true);
+assert.equal(exact.runtimePathMatches, true);
 
 for (const [label, override] of [
   ["legacy missing fingerprint", { savedFingerprint: undefined }],
@@ -54,6 +61,7 @@ for (const [label, override] of [
   ["missing saved process start", { savedProcessStartedAt: undefined }],
   ["pid reuse/process-start mismatch", { savedProcessStartedAt: "2026-08-14T11:59:59.0000000Z" }],
   ["fingerprint/config drift", { desiredFingerprint: openAiTunnelLaunchFingerprint({ ...base, apiKey: "sk-new" }) }],
+  ["runtime path drift", { runtimePathMatches: false }],
   ["wrong mode", { mode: "cloudflare" }],
 ]) {
   const state = evaluateOpenAiTunnelLaunchState({
@@ -65,6 +73,7 @@ for (const [label, override] of [
     savedProcessStartedAt: processStartedAt,
     savedFingerprint: fingerprint,
     desiredFingerprint: fingerprint,
+    runtimePathMatches: true,
     ...override,
   });
   assert.equal(state.desired, false, `${label} must not be accepted as desired`);
@@ -81,6 +90,7 @@ const unhealthy = evaluateOpenAiTunnelLaunchState({
   savedProcessStartedAt: processStartedAt,
   savedFingerprint: fingerprint,
   desiredFingerprint: fingerprint,
+  runtimePathMatches: true,
 });
 assert.equal(unhealthy.desired, false, "unhealthy transport must never be accepted as desired");
 assert.equal(unhealthy.launchIdentityMatches, true, "health failure must preserve a matching launch identity");
@@ -96,6 +106,7 @@ const duplicate = evaluateOpenAiTunnelLaunchState({
   savedProcessStartedAt: processStartedAt,
   savedFingerprint: fingerprint,
   desiredFingerprint: fingerprint,
+  runtimePathMatches: true,
 });
 assert.equal(duplicate.desired, false);
 assert.equal(duplicate.configDrift, true);
@@ -148,4 +159,4 @@ assert.equal(notReleased, false, "stop settlement must fail closed when health l
 
 assert.equal(await waitForTunnelPortRelease({ port: 0, isPortOpen: async () => false }), false, "invalid health ports must not false-pass settlement");
 
-console.log("manager-tunnel-state: ok (secret-safe PID+CreationDate launch identity + bounded process/listener stop settlement)");
+console.log("manager-tunnel-state: ok (secret-safe PID+CreationDate+runtime launch identity + bounded process/listener stop settlement)");

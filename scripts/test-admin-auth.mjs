@@ -70,6 +70,50 @@ try {
   const health = await allowed.json();
   assert.equal(health.mcp_port, mcpPort);
 
+  const blockedDrain = await fetch(`http://127.0.0.1:${adminPort}/api/process/drain`, { method: "POST" });
+  assert.equal(blockedDrain.status, 401, "MCP admission drain must remain behind Admin auth");
+
+  const drain = await fetch(`http://127.0.0.1:${adminPort}/api/process/drain`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(drain.status, 202, "authenticated Manager must be able to close MCP admission atomically");
+  const drainBody = await drain.json();
+  assert.equal(drainBody.ok, true);
+  assert.equal(drainBody.lifecycle?.admission, "draining");
+
+  const drainingHealthResponse = await fetch(`http://127.0.0.1:${mcpPort}/health`);
+  assert.equal(drainingHealthResponse.status, 200);
+  const drainingHealth = await drainingHealthResponse.json();
+  assert.equal(drainingHealth.mcpTraffic?.admission, "draining");
+  assert.equal(drainingHealth.mcpTraffic?.draining, true);
+  assert.equal(drainingHealth.mcpTraffic?.activeRequests, 0);
+
+  const rejectedDuringDrain = await fetch(`http://127.0.0.1:${mcpPort}/mcp`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 4242, method: "ping", params: {} }),
+  });
+  assert.equal(rejectedDuringDrain.status, 503, "new MCP POST must not enter after lifecycle admission closes");
+  assert.equal(rejectedDuringDrain.headers.get("retry-after"), "1");
+  const rejectedBody = await rejectedDuringDrain.json();
+  assert.equal(rejectedBody.id, 4242, "retryable drain rejection must preserve JSON-RPC request identity");
+  assert.equal(rejectedBody.error?.data?.retryable, true);
+  assert.equal(rejectedBody.error?.data?.lifecycle, "draining");
+
+  const resume = await fetch(`http://127.0.0.1:${adminPort}/api/process/resume`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(resume.status, 200, "aborted/finished lifecycle must be able to reopen MCP admission");
+  const resumeBody = await resume.json();
+  assert.equal(resumeBody.ok, true);
+  assert.equal(resumeBody.lifecycle?.admission, "accepting");
+
+  const resumedHealth = await (await fetch(`http://127.0.0.1:${mcpPort}/health`)).json();
+  assert.equal(resumedHealth.mcpTraffic?.admission, "accepting");
+  assert.equal(resumedHealth.mcpTraffic?.draining, false);
+
   const oversizedEnv = await fetch(`http://127.0.0.1:${adminPort}/api/config/env`, {
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -105,7 +149,7 @@ try {
   assert.match(uiJs, /headers\.Authorization = `Bearer \$\{token\}`/);
   assert.doesNotMatch(uiJs, /ADMIN_TOKEN.*localStorage|localStorage.*ADMIN_TOKEN/i);
 
-  console.log("admin-auth: ok (static UI loadable, API 401/200 boundary preserved, obsolete recovery config scrubbed, token session-scoped)");
+  console.log("admin-auth: ok (static UI loadable, API auth boundary + atomic MCP drain/resume preserved, obsolete recovery config scrubbed, token session-scoped)");
 } catch (err) {
   throw new Error(`${err.message}\nserver output:\n${output.slice(-3000)}`);
 } finally {

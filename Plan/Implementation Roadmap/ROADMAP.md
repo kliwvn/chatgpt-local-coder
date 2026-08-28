@@ -1,7 +1,7 @@
 # ROADMAP — chatgpt-local-coder
 
 ## Current production invariants
-- MCP transport sessions are isolated; never coalesce them by IP/User-Agent/client name.
+- MCP transport sessions and their mutable operation/error ledgers are isolated per `SessionManager`; never coalesce or serialize them across managers by session ID, IP/User-Agent or client name.
 - Idle retention defaults to **2 minutes**, cleanup **15 seconds**, hard cap **64**; connected SSE and in-flight operations are never evicted, and later stale POSTs are recoverable.
 - Stale session IDs are recoverable by invariant. The obsolete `MCP_SESSION_RECOVERY` switch is ignored by runtime and scrubbed from managed/Admin configuration to prevent hidden drift.
 - Initialize sends exactly one complete server-instruction document; do not double-wrap project memory/instructions.
@@ -16,14 +16,14 @@
 - Manager and admin APIs never ship plaintext secrets to the browser: env endpoints mask via `SECRET_KEY_RE` + sentinel; upstream config masks header/env secrets; write paths restore sentinels from stored config. Audit file stays raw (local disk).
 - Activity feed at the API boundary ships metadata-only `details` + sanitized `summary` for tool entries (never raw tool arguments).
 - `buildSession` failure/shutdown paths unregister the server from the upstream manager and close the server; `mcpServer.close()` itself closes the connected transport (Protocol.close → `_transport?.close()`), so the explicit `transport.close()` is only a fallback when `server.close()` rejects or when no server was created; no leaked registrations.
-- `npm test` and `run-all-tests.mjs` run the same 12 unit scripts (test-runner parity).
+- `npm test` and `npm run test:all` both delegate to the single canonical `scripts/run-all-tests.mjs` runner; it auto-discovers `scripts/test-*.mjs`, runs canonical `npm run build` first, and owns isolated integration setup/cleanup so new tests cannot silently fall out of one command.
 
 ## Next
 - Commit/push only when explicitly requested.
-- For quality-critical repo work, prefer a per-project instance or call `project_context(<repo>)`; the broad live default `E:\` is intentionally not treated as one repo context.
+- For quality-critical repo work under the current broad `C:\AI_Home` managed roots, prefer an exact per-project instance or call `project_context(<repo>)`; a collection root is intentionally not treated as one Git-repo context.
 - Continue observing client-side initialize frequency, but optimize with caching/retention rather than unsafe cross-session reuse.
-- **Security follow-up:** `OPENAI_TUNNEL_API_KEY` value exists in the gitignored instance `.env`; `git log --all -S <value fragment>` found no committed value (full history sweep pending). Rotation recommended as defense-in-depth; consider `git filter-repo`/history scrub if a sweep ever finds it.
-- Manager `:3300` restarts are required to pick up `manager/server.mjs` changes (module cached in memory) — document for future audits.
+- **Security status:** current gitignored managed-instance `OPENAI_TUNNEL_API_KEY` values were each checked against the full local Git history with `git log --all -S <exact value>` during the 2026-08-21 final audit: 2 unique current values scanned, 0 committed-history hits. Keep keys gitignored and masked at API/log boundaries; rotate on independent credential-policy grounds, not because this audit found repository exposure.
+- Manager `:3300` must load a new process generation to pick up `manager/server.mjs` changes; use the dedicated Restart Manager control/API and verify the replacement `boot_id`/PID rather than assuming edited bytes are live.
 
 ## Done
 - TX-02 session churn/performance hardening: TTL/cap cleanup, single instruction payload, proxy readiness, log/admin redaction, quiet health polling, dashboard live policy telemetry, harness fix, live performance verification.

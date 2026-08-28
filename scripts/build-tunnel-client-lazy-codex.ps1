@@ -10,7 +10,9 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$outDir = if ([string]::IsNullOrWhiteSpace($OutputDir)) { Join-Path $repoRoot "bin\lazy-codex-verified-v2" } else { [IO.Path]::GetFullPath($OutputDir) }
+$expectedBinarySha256 = "c900f09edba10115a17f937fb3b101e9e35e58b342d3c92f59f9f6f9b9166494"
+$defaultGenerationDir = Join-Path $repoRoot ("bin\lazy-codex-verified-v2\sha256-" + $expectedBinarySha256)
+$outDir = if ([string]::IsNullOrWhiteSpace($OutputDir)) { $defaultGenerationDir } else { [IO.Path]::GetFullPath($OutputDir) }
 $outExe = Join-Path $outDir "tunnel-client.exe"
 $markerFile = Join-Path $outDir "version.json"
 $lockFile = Join-Path $outDir ".build.lock"
@@ -40,9 +42,9 @@ function Get-ExactRuntimeValid {
     if ([string]$marker.patch_revision -ne $PatchRevision) { return $false }
     if ([string]$marker.source_commit -ne $SourceCommit) { return $false }
     $expected = ([string]$marker.sha256).ToLowerInvariant()
-    if ($expected -notmatch '^[0-9a-f]{64}$') { return $false }
+    if ($expected -ne $expectedBinarySha256) { return $false }
     $actual = (Get-FileHash -LiteralPath $outExe -Algorithm SHA256).Hash.ToLowerInvariant()
-    return $actual -eq $expected
+    return $actual -eq $expectedBinarySha256
   }
   catch {
     return $false
@@ -96,9 +98,13 @@ function Ensure-PinnedGoArchive {
 function Resolve-GoExecutable {
   if (-not [string]::IsNullOrWhiteSpace($GoExe)) {
     $explicit = Get-Command $GoExe -ErrorAction SilentlyContinue
-    if ($explicit) { return $explicit.Source }
-    if (Test-Path -LiteralPath $GoExe) { return [IO.Path]::GetFullPath($GoExe) }
-    throw "Explicit Go executable not found: $GoExe"
+    $resolvedExplicit = if ($explicit) { $explicit.Source } elseif (Test-Path -LiteralPath $GoExe) { [IO.Path]::GetFullPath($GoExe) } else { $null }
+    if (-not $resolvedExplicit) { throw "Explicit Go executable not found: $GoExe" }
+    $explicitVersionOutput = (& $resolvedExplicit version | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $explicitVersionOutput -notlike "*go$goVersion *") {
+      throw "Explicit Go executable must be exactly Go ${goVersion}: $explicitVersionOutput"
+    }
+    return $resolvedExplicit
   }
 
   Ensure-PinnedGoArchive
@@ -204,6 +210,9 @@ try {
     }
 
     $binarySha256 = (Get-FileHash -LiteralPath $stagedExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($binarySha256 -ne $expectedBinarySha256) {
+      throw "Patched tunnel-client SHA256 mismatch: expected $expectedBinarySha256, got $binarySha256"
+    }
     $marker = [ordered]@{
       schema = 1
       version = $Version

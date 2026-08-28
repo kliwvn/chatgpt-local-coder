@@ -26,6 +26,7 @@ import {
   MCP_PUBLIC_CONTRACT_DRIFT,
 } from "../dist/lib/chatgpt-public-contract.js";
 import { assertNoContractDrift, getContractFingerprint } from "../dist/lib/contract-fingerprint.js";
+import { CODEX_AGENT_PROMPT } from "../dist/lib/codex-agent-prompt.js";
 
 const fixturePath = path.join(import.meta.dirname, "fixtures", `chatgpt-public-contract-v${CHATGPT_PUBLIC_CONTRACT_VERSION}.json`);
 const fixtureRaw = JSON.parse(await fs.readFile(fixturePath, "utf8"));
@@ -159,6 +160,44 @@ try {
     "quickstart uses standardized host-gate protocol",
     /follow mcp_dispatch\.protocol v2.*\.clc-host-gate-canary-<UTC>-<nonce>\.tmp.*MCP_REACHED_UNSETTLED.*MCP_REJECTED.*MCP_EXECUTED.*HOST_NOT_INVOKED.*coverage\.canary\.complete_since.*INDETERMINATE_NO_COVERAGE/i.test(String(status.quickstart || "")),
     String(status.quickstart || "").slice(0, 2600)
+  );
+  check(
+    "quickstart forbids false tool/session/turn-limit terminal claims",
+    /Do not claim a "tool\/session\/turn limit" ended the task unless the host explicitly returned such a terminal signal/i.test(String(status.quickstart || "")) &&
+      /run_command timeout.*MCP session TTL\/cleanup.*single failed tool call.*not proof that the ChatGPT turn ended/i.test(String(status.quickstart || "")),
+    String(status.quickstart || "").slice(0, 3600)
+  );
+  check(
+    "injected agent workflow requires continuation after local sync timeout",
+    /timed_out=true.*does NOT mean the MCP session or ChatGPT turn ended.*Do not stop the task/i.test(CODEX_AGENT_PROMPT) &&
+      /Never claim "tool\/session\/turn limit".*unless the host itself returned an explicit terminal signal/i.test(CODEX_AGENT_PROMPT),
+    CODEX_AGENT_PROMPT.slice(0, 5200)
+  );
+  check(
+    "quickstart classifies transient connector failures as checkpoints",
+    /Technical interruption is a checkpoint, not completion/i.test(String(status.quickstart || "")) &&
+      /HTTP 502\/503\/504.*connection reset.*transient connector\/transport loss.*safe fresh retry/i.test(String(status.quickstart || "")) &&
+      /Do not blindly retry 401\/403\/host-disabled/i.test(String(status.quickstart || "")),
+    String(status.quickstart || "").slice(0, 5200)
+  );
+  check(
+    "quickstart requires polling non-terminal background work",
+    /start_process is non-terminal/i.test(String(status.quickstart || "")) &&
+      /continuation_required=true.*process_output\.running=true.*keep polling process_output until running=false/i.test(String(status.quickstart || "")),
+    String(status.quickstart || "").slice(0, 5600)
+  );
+  check(
+    "injected agent workflow treats transient connector failure as recoverable",
+    /Treat technical interruption as a checkpoint, never as task completion/i.test(CODEX_AGENT_PROMPT) &&
+      /HTTP 502\/503\/504.*connection reset.*transient transport loss.*retry safely with fresh calls/i.test(CODEX_AGENT_PROMPT) &&
+      /Do not blindly retry permission\/safety failures \(401\/403\/host-disabled\)/i.test(CODEX_AGENT_PROMPT),
+    CODEX_AGENT_PROMPT.slice(0, 7000)
+  );
+  check(
+    "injected agent workflow requires process continuation metadata",
+    /start_process is intentionally non-terminal/i.test(CODEX_AGENT_PROMPT) &&
+      /continuation_required=true.*process_output\.running=true.*keep polling with process_output until the process reaches running=false/i.test(CODEX_AGENT_PROMPT),
+    CODEX_AGENT_PROMPT.slice(0, 7600)
   );
   check("agent_status process sandbox required", status.process_security?.process_sandbox_mode === "required", `${status.process_security?.process_sandbox_mode}`);
   check("agent_status AppContainer backend", status.process_security?.sandbox_backend === "windows_appcontainer", `${status.process_security?.sandbox_backend}`);

@@ -13,6 +13,7 @@ assert.equal(isGitGrepCommand("pytest -q"), false);
 assert.equal(classifyCommandOutcome("git grep impossible-pattern -- src", 1, ""), "no_match");
 assert.equal(classifyCommandOutcome("git grep impossible-pattern -- src", 128, "fatal"), "failed");
 assert.equal(classifyCommandOutcome("pytest -q", 1, "1 failed"), "failed");
+assert.equal(classifyCommandOutcome("npm test", null, "", true), "timed_out");
 
 // console taxonomy: command/business failures are not MCP transport failures
 const warnLines = [];
@@ -38,6 +39,25 @@ assert.match(warnLines[0], /cwd=C:\\repo/);
 assert.doesNotMatch(warnLines[0], /\[MCP ERROR\]/);
 assert.match(warnLines[1], /\[TOOL FAILED\]/);
 assert.match(warnLines[2], /\[MCP ERROR\]/);
+
+const timeoutLines = [];
+const originalTimeoutWarn = console.warn;
+console.warn = (...args) => timeoutLines.push(args.join(" "));
+try {
+  appendActivity({
+    kind: "tool",
+    tool: "run_command",
+    target: "C:\\repo",
+    status: "error",
+    summary: "sync response budget exhausted",
+    details: { exit_code: null, command_outcome: "timed_out" },
+  });
+} finally {
+  console.warn = originalTimeoutWarn;
+}
+assert.equal(timeoutLines.length, 1);
+assert.match(timeoutLines[0], /\[COMMAND TIMED OUT\]/);
+assert.doesNotMatch(timeoutLines[0], /\[COMMAND FAILED\]|\[MCP ERROR\]/);
 
 const noMatchLines = [];
 const originalNoMatchLog = console.log;

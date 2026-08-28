@@ -25,7 +25,7 @@ const toast = (msg, kind = "ok") => {
 
 let busy = false;
 const ACTION_IDS = [
-  "btn-install", "btn-server", "btn-server-restart", "btn-tunnel", "btn-save", "btn-check",
+  "btn-install", "btn-server", "btn-server-restart", "btn-tunnel", "btn-tunnel-restart", "btn-save", "btn-check",
   "btn-profile-save", "btn-profile-del", "btn-tunnel-dl", "btn-del-inst", "add-create",
   "btn-mgr-restart",
 ];
@@ -46,12 +46,15 @@ function syncActionDisabledState() {
   const serverConflict = Boolean(bundle?.server?.portOccupied);
   const tunnelConflict = Boolean(bundle?.tunnel?.portOccupied);
   const serverRunning = Boolean(bundle?.server?.running);
+  const tunnelRunning = Boolean(bundle?.tunnel?.running);
   const serverButton = $("btn-server");
   const restartButton = $("btn-server-restart");
   const tunnelButton = $("btn-tunnel");
+  const tunnelRestartButton = $("btn-tunnel-restart");
   if (serverButton) serverButton.disabled = busy || serverConflict;
   if (restartButton) restartButton.disabled = busy || !serverRunning || serverConflict;
   if (tunnelButton) tunnelButton.disabled = busy || tunnelConflict;
+  if (tunnelRestartButton) tunnelRestartButton.disabled = busy || !tunnelRunning || tunnelConflict;
 }
 
 const instUrl = (name, sub) => `/api/instances/${encodeURIComponent(name)}${sub}`;
@@ -215,16 +218,17 @@ function renderServerTunnel(s) {
   setDot("inst-tunnel-dot", tunnelCurrent, tunnelInstanceLabel);
   $("btn-tunnel").textContent = tun.running ? "Tắt" : "Bật";
   $("btn-tunnel").disabled = busy || tunnelConflict;
+  $("btn-tunnel-restart").disabled = busy || !tun.running || tunnelConflict;
   const mode = tun.mode === "openai" ? "OpenAI Secure Tunnel" : "Cloudflare Tunnel";
   if (tun.running && tunnelConfigDrift) {
     $("tunnel-detail").textContent = tun.kind === "mixed"
       ? `Phát hiện đồng thời OpenAI tunnel-client và cloudflared — Tắt trạng thái mixed rồi Bật lại Tunnel.`
       : tun.ambiguous
         ? `${mode} có nhiều process cùng profile — Tắt rồi Bật lại Tunnel để khôi phục ownership duy nhất.`
-        : `${mode} đang chạy bằng cấu hình/launch cũ — Tắt rồi Bật lại Tunnel để áp dụng cấu hình hiện tại.`;
+        : `${mode} đang chạy bằng cấu hình/launch cũ — Manager sẽ tự khởi động lại khi chứng minh được ownership; có thể bấm “Khởi động lại Tunnel” để xử lý ngay.`;
     $("btn-copy-url").classList.add("hidden");
   } else if (tun.running && tunnelHealthDrift) {
-    $("tunnel-detail").textContent = `${mode} đúng launch identity nhưng health endpoint ${tun.healthPort} không phản hồi — kiểm tra/restart Tunnel.`;
+    $("tunnel-detail").textContent = `${mode} đúng launch identity nhưng health endpoint ${tun.healthPort} không phản hồi — bấm “Khởi động lại Tunnel” để recovery ngay.`;
     $("btn-copy-url").classList.add("hidden");
   } else if (tun.running && tun.url) {
     $("tunnel-detail").innerHTML = `${esc(mode)} • URL: <b class="mono">${esc(tun.url)}</b>`;
@@ -751,6 +755,26 @@ async function toggleTunnel() {
   loadInstances(false);
 }
 
+async function restartTunnelNow() {
+  if (!state.current) return;
+  const name = state.current;
+  const beforePid = state.lastBundle?.tunnel?.pid || null;
+  setBusy(true);
+  toast("Đang khởi động lại Tunnel…");
+  try {
+    const r = await api(instUrl(name, "/tunnel/restart"), "POST");
+    if (!r.ok || !r.restarted) throw new Error(r.error || "Tunnel restart failed");
+    const pidText = beforePid && r.pid ? ` (PID ${beforePid} → ${r.pid})` : r.pid ? ` (PID ${r.pid})` : "";
+    toast(`Tunnel đã khởi động lại${pidText}.`, "ok");
+    await loadInstances(false);
+    if (state.current === name) await selectInstance(name);
+  } catch (err) {
+    toast("Khởi động lại Tunnel lỗi: " + err.message, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function doTunnelDownload() {
   setBusy(true);
   try {
@@ -911,6 +935,7 @@ function init() {
   $("btn-save").addEventListener("click", doSave);
   $("btn-server").addEventListener("click", toggleServer);
   $("btn-tunnel").addEventListener("click", toggleTunnel);
+  $("btn-tunnel-restart").addEventListener("click", restartTunnelNow);
   $("btn-tunnel-dl").addEventListener("click", doTunnelDownload);
   $("btn-copy-url").addEventListener("click", copyUrl);
   $("btn-profile-save").addEventListener("click", doProfileSave);

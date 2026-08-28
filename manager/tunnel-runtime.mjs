@@ -12,13 +12,21 @@ export const OPENAI_TUNNEL_VERSION = "v0.0.11";
 export const OPENAI_TUNNEL_LAZY_CODEX_PATCH_REVISION = "lazy-codex-v2";
 export const OPENAI_TUNNEL_LAZY_CODEX_SOURCE_SHA = "8d55683eeef80bc5e360d95abf4692454fafc615";
 export const OPENAI_TUNNEL_LAZY_CODEX_MARKER_SCHEMA = 1;
+export const OPENAI_TUNNEL_LAZY_CODEX_BINARY_SHA256 = "c900f09edba10115a17f937fb3b101e9e35e58b342d3c92f59f9f6f9b9166494";
 
 const DEFAULT_BUILD_TIMEOUT_MS = 15 * 60 * 1000;
 const MAX_BUILD_OUTPUT_CHARS = 12000;
 const buildPromises = new Map();
 
-export function lazyCodexRuntimePaths(root = DEFAULT_ROOT) {
-  const dir = path.join(root, "bin", "lazy-codex-verified-v2");
+export function lazyCodexRuntimePaths(root = DEFAULT_ROOT, binarySha256 = OPENAI_TUNNEL_LAZY_CODEX_BINARY_SHA256) {
+  const generation = String(binarySha256 || "").toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(generation)) {
+    throw new Error(`Invalid lazy-Codex runtime SHA256 generation: ${binarySha256}`);
+  }
+  // Content-address the executable path. Windows keeps a running .exe locked;
+  // publishing a new generation beside the old one lets Manager verify/build the
+  // replacement before stopping the currently healthy/stale Tunnel process.
+  const dir = path.join(root, "bin", "lazy-codex-verified-v2", `sha256-${generation}`);
   return {
     dir,
     exe: path.join(dir, "tunnel-client.exe"),
@@ -43,8 +51,13 @@ export function lazyCodexRuntimeMarker(sha256) {
   };
 }
 
-function markerIdentityMatches(marker) {
+export function lazyCodexRuntimeLaunchIdentity() {
+  return `sha256:${OPENAI_TUNNEL_LAZY_CODEX_BINARY_SHA256}`;
+}
+
+function markerIdentityMatches(marker, expectedSha256 = OPENAI_TUNNEL_LAZY_CODEX_BINARY_SHA256) {
   const expected = lazyCodexRuntimeIdentity();
+  const expectedBinarySha256 = String(expectedSha256 || "").toLowerCase();
   return Boolean(
     marker &&
     marker.schema === expected.schema &&
@@ -52,7 +65,9 @@ function markerIdentityMatches(marker) {
     marker.patch_revision === expected.patch_revision &&
     marker.source_commit === expected.source_commit &&
     typeof marker.sha256 === "string" &&
-    /^[0-9a-f]{64}$/.test(marker.sha256)
+    /^[0-9a-f]{64}$/.test(marker.sha256) &&
+    /^[0-9a-f]{64}$/.test(expectedBinarySha256) &&
+    marker.sha256 === expectedBinarySha256
   );
 }
 
@@ -66,8 +81,11 @@ async function sha256File(file) {
   });
 }
 
-export async function inspectLazyCodexTunnelRuntime({ root = DEFAULT_ROOT } = {}) {
-  const paths = lazyCodexRuntimePaths(root);
+export async function inspectLazyCodexTunnelRuntime({
+  root = DEFAULT_ROOT,
+  expectedSha256 = OPENAI_TUNNEL_LAZY_CODEX_BINARY_SHA256,
+} = {}) {
+  const paths = lazyCodexRuntimePaths(root, expectedSha256);
   let marker;
   try {
     marker = JSON.parse(await fsp.readFile(paths.marker, "utf8"));
@@ -80,7 +98,7 @@ export async function inspectLazyCodexTunnelRuntime({ root = DEFAULT_ROOT } = {}
     };
   }
 
-  if (!markerIdentityMatches(marker)) {
+  if (!markerIdentityMatches(marker, expectedSha256)) {
     return { valid: false, reason: "identity-mismatch", marker, ...paths };
   }
 
@@ -191,6 +209,7 @@ export async function ensureLazyCodexTunnelRuntime({
   root = DEFAULT_ROOT,
   platform = process.platform,
   arch = process.arch,
+  expectedSha256 = OPENAI_TUNNEL_LAZY_CODEX_BINARY_SHA256,
   buildRuntime = buildLazyCodexTunnelRuntime,
 } = {}) {
   if (platform !== "win32") {
@@ -206,17 +225,24 @@ export async function ensureLazyCodexTunnelRuntime({
     };
   }
 
-  const before = await inspectLazyCodexTunnelRuntime({ root });
+  const before = await inspectLazyCodexTunnelRuntime({ root, expectedSha256 });
   if (before.valid) {
-    return { ok: true, required: true, path: before.exe, rebuilt: false, inspection: before };
+    return {
+      ok: true,
+      required: true,
+      path: before.exe,
+      runtimeIdentity: lazyCodexRuntimeLaunchIdentity(),
+      rebuilt: false,
+      inspection: before,
+    };
   }
 
-  const key = path.resolve(root).toLowerCase();
+  const key = `${path.resolve(root).toLowerCase()}::${String(expectedSha256 || "").toLowerCase()}`;
   let pending = buildPromises.get(key);
   if (!pending) {
     pending = (async () => {
-      await buildRuntime({ root });
-      const after = await inspectLazyCodexTunnelRuntime({ root });
+      await buildRuntime({ root, expectedSha256 });
+      const after = await inspectLazyCodexTunnelRuntime({ root, expectedSha256 });
       if (!after.valid) {
         throw new Error(`Builder completed but patched runtime verification failed (${after.reason}).`);
       }
@@ -234,6 +260,7 @@ export async function ensureLazyCodexTunnelRuntime({
       ok: true,
       required: true,
       path: inspection.exe,
+      runtimeIdentity: lazyCodexRuntimeLaunchIdentity(),
       rebuilt: true,
       repairedFrom: before.reason,
       inspection,

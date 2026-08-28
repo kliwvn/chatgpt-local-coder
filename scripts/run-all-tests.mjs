@@ -1,7 +1,7 @@
 /**
  * Full verification suite for ChatGPT MCP readiness.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "path";
@@ -13,31 +13,79 @@ const root = path.resolve(__dirname, "..");
 const mcpPort = 4200 + Math.floor(Math.random() * 200);
 const adminPort = mcpPort + 1;
 
-function runNode(script, env = {}) {
-  const scriptPath = path.join(root, script);
+function runProcess(command, args, { env = process.env, stdio = "inherit" } = {}, label = command) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [scriptPath], {
-      cwd: root,
-      env: { ...process.env, ...env },
-      stdio: "inherit",
+    let settled = false;
+    const child = spawn(command, args, { cwd: root, env, stdio });
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve();
+    };
+    child.once("error", (err) => finish(new Error(`${label} spawn failed: ${err.message}`, { cause: err })));
+    child.once("close", (code, signal) => {
+      if (code === 0) finish();
+      else finish(new Error(`${label} exit ${code ?? "null"}${signal ? ` signal=${signal}` : ""}`));
     });
-    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`${script} exit ${code}`))));
   });
 }
 
+function runNode(script, env = {}) {
+  const scriptPath = path.join(root, script);
+  return runProcess(
+    process.execPath,
+    [scriptPath],
+    { env: { ...process.env, ...env }, stdio: "inherit" },
+    script,
+  );
+}
+
 function runBuild() {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(root, "node_modules/typescript/bin/tsc")], {
-      cwd: root,
-      env: process.env,
-      stdio: "inherit",
-    });
-    child.on("error", () => {
-      const fallback = spawn("npm", ["run", "build"], { cwd: root, stdio: "inherit", shell: true });
-      fallback.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`build exit ${code}`))));
-    });
-    child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`tsc exit ${code}`))));
+  // package.json#build is the single build authority. Calling TypeScript directly
+  // used to skip the content-versioned Windows sandbox helper and created a second
+  // build pipeline whose success did not prove production artifacts were current.
+  if (process.platform === "win32") {
+    const comspec = process.env.ComSpec || path.join(process.env.SystemRoot || "C:\\Windows", "System32", "cmd.exe");
+    return runProcess(comspec, ["/d", "/s", "/c", "npm run build"], {}, "npm run build");
+  }
+  return runProcess("npm", ["run", "build"], {}, "npm run build");
+}
+
+function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode != null || child.signalCode != null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off("close", onClose);
+      resolve(value);
+    };
+    const onClose = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("close", onClose);
   });
+}
+
+async function terminateChildTree(child, label) {
+  if (!child || child.exitCode != null || child.signalCode != null) return true;
+  try { child.kill("SIGTERM"); } catch {}
+  if (await waitForChildExit(child, 2500)) return true;
+
+  if (process.platform === "win32" && Number.isInteger(child.pid) && child.pid > 0) {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      cwd: root,
+      windowsHide: true,
+      stdio: "ignore",
+      timeout: 10000,
+    });
+  } else {
+    try { child.kill("SIGKILL"); } catch {}
+  }
+  if (await waitForChildExit(child, 5000)) return true;
+  throw new Error(`${label} process tree did not exit after bounded graceful + forced termination; preserving test authority state for diagnosis`);
 }
 
 async function waitFor(url, ms = 25000) {
@@ -150,14 +198,12 @@ for (const script of unitScripts) {
 }
 
 console.log("\n--- scripts/test-read-text-streaming.mjs ---");
-await new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, ["--expose-gc", path.join(root, "scripts/test-read-text-streaming.mjs")], {
-    cwd: root,
-    env: process.env,
-    stdio: "inherit",
-  });
-  child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`test-read-text-streaming.mjs exit ${code}`))));
-});
+await runProcess(
+  process.execPath,
+  ["--expose-gc", path.join(root, "scripts/test-read-text-streaming.mjs")],
+  {},
+  "test-read-text-streaming.mjs",
+);
 
 console.log("\n=== Self-contained integration tests ===");
 for (const script of selfContainedIntegrationScripts) {
@@ -393,15 +439,10 @@ try {
   });
   console.log("OK  test-mcp-session");
 } finally {
-  server.kill();
-  await new Promise((resolve) => {
-    if (server.exitCode != null) return resolve();
-    const timer = setTimeout(resolve, 2000);
-    server.once("close", () => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
+  // Never recycle/delete the only integration authority directory while the
+  // process that owns it may still be alive. A bounded force-tree fallback makes
+  // test cleanup deterministic on Windows and fails closed if exit is unproven.
+  await terminateChildTree(server, "integration Local Coder");
   await fs.rm(integrationStateDir, { recursive: true, force: true });
 }
 

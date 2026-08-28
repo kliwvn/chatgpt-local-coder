@@ -13,7 +13,6 @@ import {
   setWorkspaceRoots,
 } from "./lib/path-security.js";
 import {
-  consumeSessionTransportError,
   createSessionManager,
   extractRequestId,
   isInitializeRequest,
@@ -186,10 +185,64 @@ app.use(
   }
 );
 const MCP_PATHS_SET = new Set(["/", "/mcp"]);
+let activeMcpRequests = 0;
+let lastMcpRequestStartedAtMs = 0;
+let lastMcpRequestSettledAtMs = 0;
+let mcpAdmissionDraining = false;
+let mcpAdmissionDrainStartedAtMs = 0;
+
+function mcpLifecycleState(): Record<string, unknown> {
+  const nowMs = Date.now();
+  const lastMcpActivityAtMs = Math.max(lastMcpRequestStartedAtMs, lastMcpRequestSettledAtMs);
+  return {
+    admission: mcpAdmissionDraining ? "draining" : "accepting",
+    draining: mcpAdmissionDraining,
+    drainStartedAt: mcpAdmissionDrainStartedAtMs > 0 ? new Date(mcpAdmissionDrainStartedAtMs).toISOString() : null,
+    activeRequests: activeMcpRequests,
+    lastRequestStartedAt: lastMcpRequestStartedAtMs > 0 ? new Date(lastMcpRequestStartedAtMs).toISOString() : null,
+    lastRequestSettledAt: lastMcpRequestSettledAtMs > 0 ? new Date(lastMcpRequestSettledAtMs).toISOString() : null,
+    quietForMs: activeMcpRequests > 0 || lastMcpActivityAtMs <= 0
+      ? (activeMcpRequests > 0 ? 0 : null)
+      : Math.max(0, nowMs - lastMcpActivityAtMs),
+    semantics: "POST/DELETE admission and request lifetime only; persistent GET/SSE does not block quiescence",
+  };
+}
+
+function beginMcpAdmissionDrain(): Record<string, unknown> {
+  if (!mcpAdmissionDraining) {
+    mcpAdmissionDraining = true;
+    mcpAdmissionDrainStartedAtMs = Date.now();
+  }
+  return mcpLifecycleState();
+}
+
+function resumeMcpAdmission(): Record<string, unknown> {
+  mcpAdmissionDraining = false;
+  mcpAdmissionDrainStartedAtMs = 0;
+  return mcpLifecycleState();
+}
 
 app.use((req, res, next) => {
   const started = Date.now();
   const isMcpRoute = MCP_PATHS_SET.has(req.path);
+  const tracksMcpTraffic = isMcpRoute && (req.method === "POST" || req.method === "DELETE");
+  const admissionRejected = tracksMcpTraffic && mcpAdmissionDraining;
+  if (tracksMcpTraffic && !admissionRejected) {
+    activeMcpRequests++;
+    lastMcpRequestStartedAtMs = started;
+    let trafficSettled = false;
+    const settleTraffic = () => {
+      if (trafficSettled) return;
+      trafficSettled = true;
+      activeMcpRequests = Math.max(0, activeMcpRequests - 1);
+      lastMcpRequestSettledAtMs = Date.now();
+    };
+    // finish = normal response completion; close = client disconnect/abort. Both
+    // can fire for one response, so settle exactly once. GET/SSE is deliberately
+    // excluded: a persistent connector stream must not make safe restart impossible.
+    res.once("finish", settleTraffic);
+    res.once("close", settleTraffic);
+  }
   res.on("finish", () => {
     const duration = Date.now() - started;
     const rawSessionId = req.headers["mcp-session-id"];
@@ -198,7 +251,7 @@ app.use((req, res, next) => {
 
     if (req.method === "POST" && isMcpRoute) {
       const transportError =
-        consumeSessionTransportError(sessionId) ||
+        sessionManager.consumeTransportError(sessionId) ||
         (typeof res.locals.mcpError === "string" ? res.locals.mcpError : undefined);
       logMcpRequest(req.body, sessionId, duration, res.statusCode, transportError);
       return;
@@ -230,6 +283,21 @@ app.use((req, res, next) => {
       console.log(`${formatLogTime()} [HTTP] ${req.method} ${req.path} ${res.statusCode} ${duration}ms${sessionInfo}`);
     }
   });
+
+  if (admissionRejected) {
+    res.locals.mcpError = "Managed lifecycle drain in progress; retry request";
+    res.setHeader("Retry-After", "1");
+    res.status(503).json({
+      jsonrpc: "2.0",
+      error: {
+        code: -32002,
+        message: "Local Coder is draining for a managed lifecycle transition; retry this request.",
+        data: { retryable: true, lifecycle: "draining" },
+      },
+      id: extractRequestId(req.body),
+    });
+    return;
+  }
   next();
 });
 
@@ -268,6 +336,11 @@ app.get("/health", async (_req, res) => {
     connectedSessions: counts.connected,
     buildingSessions: counts.building ?? 0,
     recoveringSessions: counts.recovering ?? 0,
+    // Authoritative disruptive-lifecycle guard for Manager. Unlike aggregate
+    // dispatch counters this tracks the actual non-SSE HTTP request lifetime and
+    // therefore can safely gate Server/Tunnel replacement without interpreting a
+    // lost response as permanently in-flight.
+    mcpTraffic: mcpLifecycleState(),
     sessionPolicy: {
       maxRetained: counts.maxRetained,
       idleTtlMs: counts.idleTtlMs,
@@ -527,6 +600,9 @@ const adminServer = startAdminServer({
   sessionCounts: () => sessionManager.counts(),
   instructionSummary: () => summarizeInstructionContext(instructionContext),
   instructionsPreview: () => instructionContext.instructionsText,
+  lifecycleState: () => mcpLifecycleState(),
+  beginMcpDrain: () => beginMcpAdmissionDrain(),
+  resumeMcpAdmission: () => resumeMcpAdmission(),
   requestShutdown: () => void gracefulShutdown("admin"),
 });
 
@@ -598,6 +674,7 @@ function closeHttpServerBounded(target: HttpServer, forceAfterMs = 2000, settleA
 async function gracefulShutdown(signal: string): Promise<void> {
   if (shutdownStarted) return;
   shutdownStarted = true;
+  beginMcpAdmissionDrain();
   console.log(`\n[DUNG] Server dang tat (${signal})...`);
 
   // Close MCP sessions first: this terminates long-lived SSE responses so

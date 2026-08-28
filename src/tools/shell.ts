@@ -180,20 +180,29 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         configured_timeout_ms: configuredTimeoutMs,
         effective_timeout_ms: effectiveTimeoutMs,
         sync_response_budget_ms: getSyncResponseBudgetMs(),
+        timeout_scope: result.timed_out ? "run_command_sync_response_budget" : null,
+        timeout_is_session_termination: false,
+        continuation_required: result.timed_out,
+        recommended_tool_flow: result.timed_out ? ["start_process", "process_output"] : null,
+        next_action: result.timed_out
+          ? "Continue the task. This command was terminated at the synchronous response budget; inspect any possible side effects, then use start_process + process_output for long-running work. Do not treat this as an MCP session or ChatGPT turn termination."
+          : null,
       };
       await audit({
         tool: "run_command",
         action: "command",
         target: result.cwd,
-        status: commandOutcome === "failed" ? "error" : "ok",
+        status: commandOutcome === "failed" || commandOutcome === "timed_out" ? "error" : "ok",
         details: { command, exit_code: result.exit_code, command_outcome: commandOutcome },
       });
       return toolResult("run_command", response, {
-        ok: commandOutcome !== "failed",
+        ok: commandOutcome !== "failed" && commandOutcome !== "timed_out",
         summary:
-          commandOutcome === "no_match"
-            ? `no matches (git grep exit ${result.exit_code}) in ${result.cwd}`
-            : `exit ${result.exit_code} in ${result.cwd}`,
+          result.timed_out
+            ? `sync run_command timeout after ${effectiveTimeoutMs}ms in ${result.cwd}; MCP session/ChatGPT turn did not end — continue with start_process + process_output for long jobs`
+            : commandOutcome === "no_match"
+              ? `no matches (git grep exit ${result.exit_code}) in ${result.cwd}`
+              : `exit ${result.exit_code} in ${result.cwd}`,
       });
     }
   );
@@ -276,13 +285,18 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       child.on("error", (err) => {
         item.spawnError = err.message;
         appendLog(item.stderr, `[spawn error] ${err.message}\n`);
-        if (item.finishedAt === null) markFinished(item, -1, null);
       });
       child.on("exit", (code, signal) => {
-        markFinished(item, code, signal);
+        // `exit` can fire before stdout/stderr streams have emitted their final
+        // buffered chunks. Preserve the process outcome here, but do not expose
+        // running=false until `close`, which is Node's terminal event after the
+        // child stdio handles have closed. This keeps process_output terminal
+        // snapshots complete instead of racing the last output bytes.
+        item.exitCode = code;
+        item.signal = signal;
       });
       child.on("close", (code, signal) => {
-        markFinished(item, code, signal);
+        markFinished(item, item.exitCode ?? code, item.signal ?? signal);
       });
       try {
         await new Promise<void>((resolve, reject) => {
@@ -314,10 +328,17 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         command,
         cwd,
         started_at: item.startedAt,
+        running: true,
+        process_terminal: false,
+        continuation_required: true,
+        continuation_reason: "background_process_running",
+        timeout_is_session_termination: false,
+        recommended_tool_flow: ["process_output"],
+        next_action: `Continue the task by polling process_output for ${id} until running=false. A background process is a checkpoint, not a task/session/turn stopping condition.`,
         sandboxed: processHandle.sandboxed,
         sandbox_backend: processHandle.backend,
       }, {
-        summary: `started ${id}`,
+        summary: `started ${id}; background process is running — continue with process_output until it reaches a terminal process state`,
       });
     }
   );
@@ -347,7 +368,17 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
           sandboxed: p.processHandle.sandboxed,
           sandbox_backend: p.processHandle.backend,
         }));
-      return toolResult("process_status", { processes: processes_list }, { summary: `${processes_list.length} process(es)` });
+      const running = processes_list.some((p) => p.running);
+      return toolResult("process_status", {
+        processes: processes_list,
+        continuation_required: running,
+        continuation_reason: running ? "background_process_running" : null,
+        timeout_is_session_termination: false,
+        recommended_tool_flow: running ? ["process_output"] : null,
+        next_action: running
+          ? "Continue the task by polling process_output for the running process(es); do not treat a running background job as a tool/session/turn stopping condition."
+          : null,
+      }, { summary: `${processes_list.length} process(es)${running ? "; background work still running" : ""}` });
     }
   );
 
@@ -366,16 +397,29 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async ({ id, tail_chars }) => {
       const item = processes.get(id);
       if (!item) throw new Error(`Unknown process id: ${id}`);
+      const running = isRunning(item);
       const data = {
         id,
-        running: isRunning(item),
+        running,
+        process_terminal: !running,
         exit_code: item.exitCode,
         signal: item.signal,
         error: item.spawnError,
         stdout: logTail(item.stdout, tail_chars),
         stderr: logTail(item.stderr, tail_chars),
+        continuation_required: running,
+        continuation_reason: running ? "background_process_running" : null,
+        timeout_is_session_termination: false,
+        recommended_tool_flow: running ? ["process_output"] : null,
+        next_action: running
+          ? `Continue the task by polling process_output for ${id} until running=false. This poll is not a task/session/turn boundary.`
+          : null,
       };
-      return toolResult("process_output", data, { summary: `output for ${id}` });
+      return toolResult("process_output", data, {
+        summary: running
+          ? `output for ${id}; process still running — continue polling process_output`
+          : `output for ${id}; process terminal with exit ${item.exitCode ?? "unknown"}`,
+      });
     }
   );
 

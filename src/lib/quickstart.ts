@@ -5,13 +5,16 @@ export const MCP_QUICKSTART = `
 3. project_context(path) may target only an exact configured workspace root; use an extra root only when the user's current request explicitly targets it.
 4. Explore with glob (file names) and grep (content), then read_text_file.
 5. Edit with apply_patch (preferred), multi_edit, or write_file for new files.
-6. Run builds/tests with run_command (short) or start_process + process_output (long).
+6. Run builds/tests with run_command (short) or start_process + process_output (long). timed_out=true from run_command is a per-call synchronous response-budget timeout, not an MCP session or ChatGPT turn termination; inspect possible side effects, continue the task, and use start_process + process_output for long work.
 7. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
 
 Use typed file/Git mutation tools whenever one exists; do not retry a host-blocked typed write through run_command/start_process. Generic shell is a broader action, not a permission workaround.
 mcp_servers(refresh=true) refreshes Local Coder upstream MCPs only; it does not refresh/rebind the ChatGPT → Local Coder connector, ChatGPT app permissions, or host session/cache state.
 tunnel_id/client_instance_id/boot_id/PID/MCP session ids are transport/runtime identities, not ChatGPT app/install permission identities; Local Coder cannot observe the host app/install id.
 agent_status.mcp_dispatch aggregate counters are process-global across MCP sessions. For host-gate diagnosis follow mcp_dispatch.protocol v2: use write_file on a fresh canonical .clc-host-gate-canary-<UTC>-<nonce>.tmp (8-64 char nonce) with the exact canonical canary content inside an already authorized scratch/project directory, then immediately call agent_status and match host_gate_canaries/recent_dispatches by exact basename + timestamp. A match with state=reached => MCP_REACHED_UNSETTLED; state=rejected => MCP_REJECTED; state=executed => MCP_EXECUTED. Absence + a host disabled/not-dispatched result is HOST_NOT_INVOKED only when mcp_dispatch.coverage.canary.complete_since proves that attempt is covered by the same live Local Coder process; otherwise classify INDETERMINATE_NO_COVERAGE and run a fresh canary. The agent_status call used to inspect diagnostics appears as its own temporary state=reached until the response completes. A counter delta alone is never per-chat attribution.
+Do not claim a "tool/session/turn limit" ended the task unless the host explicitly returned such a terminal signal. Local run_command timeout, MCP session TTL/cleanup, stale-session recovery, background-process capacity, or a single failed tool call are recoverable/local workflow states, not proof that the ChatGPT turn ended.
+Technical interruption is a checkpoint, not completion: HTTP 502/503/504, connection reset, transient connector/transport loss, or one failed invocation must trigger CURRENT-state/side-effect revalidation and a safe fresh retry while executable work remains. Do not blindly retry 401/403/host-disabled safety or permission failures; diagnose them separately. Only an explicit host terminal/unrecoverable signal is a transport stopping condition.
+start_process is non-terminal. Its result plus process_output/process_status expose continuation_required while background work is running. If continuation_required=true or process_output.running=true, keep polling process_output until running=false, then inspect exit/output and continue the task.
 
 ## Output format
 All tools return JSON: { ok, tool, summary, data }

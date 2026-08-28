@@ -64,19 +64,62 @@ try {
   assert.deepEqual(getManagedProcessStats(), beforeGuardStats, "blocked start_process allocated a managed process");
 
   const syncStarted = Date.now();
-  // Command runs ~15s, far beyond the 1s sync budget and the 10s assertion
-  // ceiling: an ignored budget would resolve after ~15s and fail this test.
+  // Command runs ~30s, far beyond the 1s sync budget and the 20s assertion
+  // ceiling: an ignored budget would resolve after ~30s and fail this test.
   // The response must come back at the deadline with timed_out: true while
   // taskkill cleanup continues in the background.
-  const syncTimed = data(await call("run_command", { command: nodeCommand("setTimeout(() => {}, 15000)") }));
+  const syncTimedResult = await call("run_command", { command: nodeCommand("setTimeout(() => {}, 30000)") });
+  const syncTimed = data(syncTimedResult);
   const syncElapsed = Date.now() - syncStarted;
   assert.equal(syncTimed.timed_out, true, "run_command ignored the synchronous MCP response budget");
   assert.equal(syncTimed.configured_timeout_ms, 30_000);
   assert.equal(syncTimed.effective_timeout_ms, 1_000);
   assert.equal(syncTimed.sync_response_budget_ms, 1_000);
+  assert.equal(syncTimed.command_outcome, "timed_out");
+  assert.equal(syncTimed.timeout_scope, "run_command_sync_response_budget");
+  assert.equal(syncTimed.timeout_is_session_termination, false);
+  assert.equal(syncTimed.continuation_required, true);
+  assert.deepEqual(syncTimed.recommended_tool_flow, ["start_process", "process_output"]);
+  assert.match(syncTimed.next_action || "", /Continue the task[\s\S]*inspect any possible side effects[\s\S]*start_process \+ process_output/i);
+  assert.equal(syncTimedResult.structuredContent.ok, false, "timed-out foreground command must remain an incomplete tool outcome");
+  assert.match(syncTimedResult.structuredContent.summary || "", /MCP session\/ChatGPT turn did not end/i);
   // Response bound includes slow Windows spawns (~2.5-3s under AV scanning);
-  // 10s keeps headroom while still proving the 15s command was cut off.
-  assert.ok(syncElapsed < 10_000, `run_command exceeded bounded synchronous response time: ${syncElapsed}ms`);
+  // 20s keeps headroom while still proving the 30s command was cut off.
+  assert.ok(syncElapsed < 20_000, `run_command exceeded bounded synchronous response time: ${syncElapsed}ms`);
+
+  // Background execution is an explicit continuation protocol, not an implicit
+  // conversation boundary. The tool result itself must tell the caller to keep
+  // polling until a terminal process state is observed.
+  const continuation = data(await call("start_process", {
+    command: nodeCommand("setTimeout(() => process.stdout.write('continued'), 2000)"),
+  }));
+  assert.equal(continuation.running, true);
+  assert.equal(continuation.process_terminal, false);
+  assert.equal(continuation.continuation_required, true);
+  assert.equal(continuation.continuation_reason, "background_process_running");
+  assert.equal(continuation.timeout_is_session_termination, false);
+  assert.deepEqual(continuation.recommended_tool_flow, ["process_output"]);
+  assert.match(continuation.next_action || "", /Continue the task[\s\S]*process_output[\s\S]*not a task\/session\/turn stopping condition/i);
+
+  const continuationPollResult = await call("process_output", { id: continuation.id, tail_chars: 40000 });
+  const continuationPoll = data(continuationPollResult);
+  assert.equal(continuationPoll.running, true, "first process_output poll must observe the deliberately sleeping process");
+  assert.equal(continuationPoll.process_terminal, false);
+  assert.equal(continuationPoll.continuation_required, true);
+  assert.deepEqual(continuationPoll.recommended_tool_flow, ["process_output"]);
+  assert.match(continuationPollResult.structuredContent.summary || "", /process still running.*continue polling/i);
+
+  const statusWhileRunning = data(await call("process_status", {}));
+  assert.equal(statusWhileRunning.continuation_required, true);
+  assert.deepEqual(statusWhileRunning.recommended_tool_flow, ["process_output"]);
+
+  await waitFinished(continuation.id);
+  const continuationTerminal = data(await call("process_output", { id: continuation.id, tail_chars: 40000 }));
+  assert.equal(continuationTerminal.running, false);
+  assert.equal(continuationTerminal.process_terminal, true);
+  assert.equal(continuationTerminal.continuation_required, false);
+  assert.equal(continuationTerminal.recommended_tool_flow, null);
+  assert.match(continuationTerminal.stdout, /continued/);
 
   const noisy = data(await call("start_process", { command: nodeCommand("process.stdout.write('x'.repeat(9000))") }));
   await waitFinished(noisy.id);

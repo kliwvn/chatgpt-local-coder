@@ -121,6 +121,69 @@ async function post(route, body = {}) {
   return request("POST", route, body);
 }
 
+function delayedBodyRequest(method, route, body = {}, delayMs = 750) {
+  const payload = JSON.stringify(body);
+  const firstChunk = payload.slice(0, 1) || "{";
+  const remainder = payload.slice(1) || "}";
+  let markFirstChunkSent;
+  const firstChunkSent = new Promise((resolve) => { markFirstChunkSent = resolve; });
+  const result = new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: "127.0.0.1",
+      port: managerPort,
+      path: route,
+      method,
+      // Pin Content-Length so every method (notably DELETE on Node/Windows) uses
+      // valid deterministic framing while we intentionally split the body across
+      // time. Relying on ClientRequest's implicit chunked-encoding decision made
+      // the fixture itself produce parser-level 400 responses before Manager code.
+      headers: {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(payload)),
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on("data", (chunk) => chunks.push(chunk));
+      res.on("end", () => {
+        const raw = Buffer.concat(chunks).toString("utf8");
+        try {
+          if (!raw.trim()) {
+            throw new Error(
+              `empty Manager response for delayed ${method} ${route}; status=${res.statusCode}; `
+              + `headers=${JSON.stringify(res.headers)}; managerOutput=${JSON.stringify(managerOutput.slice(-6000))}`
+            );
+          }
+          const parsed = JSON.parse(raw);
+          rememberManagedPid(parsed?.pid);
+          rememberManagedPid(parsed?.previousPid);
+          resolve(parsed);
+        } catch (err) {
+          if (raw.trim()) {
+            err.message = `${err.message}; delayed ${method} ${route}; status=${res.statusCode}; raw=${JSON.stringify(raw.slice(-4000))}; managerOutput=${JSON.stringify(managerOutput.slice(-6000))}`;
+          }
+          reject(err);
+        }
+      });
+    });
+    req.on("error", reject);
+    req.on("socket", (socket) => {
+      const sendPartialBody = () => {
+        req.flushHeaders();
+        req.write(firstChunk);
+        markFirstChunkSent();
+        setTimeout(() => req.end(remainder), delayMs);
+      };
+      if (socket.connecting) socket.once("connect", sendPartialBody);
+      else sendPartialBody();
+    });
+  });
+  return { firstChunkSent, result };
+}
+
+function delayedBodyPost(route, delayMs = 750, body = {}) {
+  return delayedBodyRequest("POST", route, body, delayMs);
+}
+
 let livePid = null;
 try {
   const ready = await waitFor(async () => {
@@ -131,8 +194,23 @@ try {
 
   // Reproduce the real bug: explicit Restart lands while a boot/manual Start for
   // the same stopped instance is already inside the shared deploy transaction.
-  const startPromise = post("/api/instances/race-demo/server/start");
-  await sleep(20);
+  let startSettled = false;
+  const startPromise = post("/api/instances/race-demo/server/start").finally(() => {
+    startSettled = true;
+  });
+  // Do not use an arbitrary client-side sleep as an HTTP ordering contract, and
+  // do not use the process-spawn marker either: cold dependency/build preflight
+  // can legitimately precede spawn for tens of seconds under Windows/AV load.
+  // The manager-command marker is emitted immediately after the Start intent and
+  // its shared command promise are registered, which is the exact ordering fact
+  // this overlap fixture needs before sending the later Restart.
+  const startRegistered = await waitFor(
+    () => managerOutput.includes("[manager-command] instance=race-demo intent=server:start") ? true : null,
+    30000,
+    5
+  );
+  assert.equal(startRegistered, true, `Start command was never registered by Manager: ${managerOutput}`);
+  assert.equal(startSettled, false, "Start settled before overlap could be exercised; fixture no longer proves in-flight coalescing");
   const restartPromise = post("/api/instances/race-demo/server/restart");
   const [started, restarted] = await Promise.all([startPromise, restartPromise]);
 
@@ -227,6 +305,40 @@ try {
   assert.equal(pidAlive(orderedStart2.pid), false, "final cleanup Stop must retire Start2 PID");
   livePid = null;
 
+  // Mixed legacy/direct aliases must share the SAME HTTP-admission order before
+  // body parsing. Hold the earlier Start body deliberately incomplete: without an
+  // admission reservation the later Stop would register first, then the delayed
+  // Start would run last and incorrectly leave Gateway running.
+  const delayedLegacyStart = delayedBodyPost("/api/server/start");
+  await delayedLegacyStart.firstChunkSent;
+  await sleep(100);
+  const directStopAfterLegacyStartPromise = post("/api/instances/race-demo/server/stop");
+  const [legacyStart, directStopAfterLegacyStart] = await Promise.all([
+    delayedLegacyStart.result,
+    directStopAfterLegacyStartPromise,
+  ]);
+  assert.equal(legacyStart.ok, true, `delayed legacy Start failed: ${JSON.stringify(legacyStart)}`);
+  assert.equal(directStopAfterLegacyStart.ok, true, `direct Stop after delayed legacy Start failed: ${JSON.stringify(directStopAfterLegacyStart)}`);
+  assert.ok(Number.isInteger(legacyStart.pid), "delayed legacy Start must create a concrete PID");
+  assert.equal(pidAlive(legacyStart.pid), false, "later direct Stop must retire the earlier legacy Start PID");
+  const mixedLegacyFirstFinal = (await (await fetch(`http://127.0.0.1:${managerPort}/api/instances`)).json()).instances.find((item) => item.name === "race-demo");
+  assert.equal(mixedLegacyFirstFinal?.server?.running, false, "legacy->direct mixed ordering must leave the last Stop intent authoritative");
+
+  const delayedDirectStart = delayedBodyPost("/api/instances/race-demo/server/start");
+  await delayedDirectStart.firstChunkSent;
+  await sleep(100);
+  const legacyStopAfterDirectStartPromise = post("/api/server/stop");
+  const [directStart, legacyStopAfterDirectStart] = await Promise.all([
+    delayedDirectStart.result,
+    legacyStopAfterDirectStartPromise,
+  ]);
+  assert.equal(directStart.ok, true, `delayed direct Start failed: ${JSON.stringify(directStart)}`);
+  assert.equal(legacyStopAfterDirectStart.ok, true, `legacy Stop after delayed direct Start failed: ${JSON.stringify(legacyStopAfterDirectStart)}`);
+  assert.ok(Number.isInteger(directStart.pid), "delayed direct Start must create a concrete PID");
+  assert.equal(pidAlive(directStart.pid), false, "later legacy Stop must retire the earlier direct Start PID");
+  const mixedDirectFirstFinal = (await (await fetch(`http://127.0.0.1:${managerPort}/api/instances`)).json()).instances.find((item) => item.name === "race-demo");
+  assert.equal(mixedDirectFirstFinal?.server?.running, false, "direct->legacy mixed ordering must leave the last Stop intent authoritative");
+
   // Config mutation is an intent-generation barrier too. A Restart arriving after
   // config must not coalesce onto the earlier Start even if that Start promise was
   // still in flight when the config request arrived.
@@ -271,13 +383,24 @@ try {
   assert.equal(pidAlive(livePid), false, "stop after failed Rename must retire the active PID");
   livePid = null;
 
-  // Conversely, once Rename owns and publishes the authority move, the old name
-  // must become non-startable. Arrival-order reservation itself is proven by the
-  // static dual-ticket invariant above; trying to infer HTTP handler arrival from
-  // two client promises is scheduler-dependent and produced a false flaky race.
-  const renameFirst = await post("/api/instances/race-demo/rename", { name: "race-renamed" });
+  // Conversely, once Rename has registered its catalog mutation, a later Start
+  // against the old name must fail retryably BEFORE the rename settles. Holding
+  // the Rename body open first proves request arrival order, while the tombstone
+  // prevents the later Start from being queued behind Rename and resurrecting the
+  // recycled old-name authority after publication.
+  const delayedRename = delayedBodyPost("/api/instances/race-demo/rename", 750, { name: "race-renamed" });
+  await delayedRename.firstChunkSent;
+  await sleep(100);
+  const staleNameStartDuringRenamePromise = post("/api/instances/race-demo/server/start");
+  const [renameFirst, staleNameStartDuringRename] = await Promise.all([
+    delayedRename.result,
+    staleNameStartDuringRenamePromise,
+  ]);
   assert.equal(renameFirst.ok, true, `Rename transaction failed: ${JSON.stringify(renameFirst)}`);
   assert.equal(renameFirst.renamed, true, "Rename transaction must publish the destination name");
+  assert.equal(staleNameStartDuringRename.ok, false, `Start admitted after Rename registration must fail closed: ${JSON.stringify(staleNameStartDuringRename)}`);
+  assert.equal(staleNameStartDuringRename.retryable, true, "stale Start during Rename must be explicitly retryable against the current catalog");
+  assert.equal(staleNameStartDuringRename.staleInstanceAuthority, true, "stale Start during Rename must identify catalog authority invalidation");
   const staleNameStart = await post("/api/instances/race-demo/server/start");
   assert.notEqual(staleNameStart.ok, true, `Start on old name must fail after Rename authority moved: ${JSON.stringify(staleNameStart)}`);
   assert.equal(await fs.stat(instanceDir).then(() => true, () => false), false, "successful Rename must remove the old catalog path");
@@ -290,6 +413,27 @@ try {
   assert.equal(renamedStop.ok, true, `renamed instance cleanup stop failed: ${JSON.stringify(renamedStop)}`);
   assert.equal(pidAlive(livePid), false, "renamed instance cleanup must retire the final PID");
   livePid = null;
+
+  // Delete is the stronger terminal catalog barrier: a later Start that already
+  // passed HTTP admission must never land on the same name after Recycle Bin
+  // removal and recreate its directory/default config. Hold Delete's body open to
+  // make the arrival order deterministic, then issue the stale Start behind it.
+  const renamedDir = path.join(instances, "race-renamed");
+  const delayedDelete = delayedBodyRequest("DELETE", "/api/instances/race-renamed", {}, 750);
+  await delayedDelete.firstChunkSent;
+  await sleep(100);
+  const staleStartDuringDeletePromise = post("/api/instances/race-renamed/server/start");
+  const [deleted, staleStartDuringDelete] = await Promise.all([
+    delayedDelete.result,
+    staleStartDuringDeletePromise,
+  ]);
+  assert.equal(deleted.ok, true, `Delete transaction failed: ${JSON.stringify(deleted)}`);
+  assert.equal(staleStartDuringDelete.ok, false, `Start admitted after Delete registration must fail closed: ${JSON.stringify(staleStartDuringDelete)}`);
+  assert.equal(staleStartDuringDelete.retryable, true, "stale Start during Delete must be explicitly retryable against the current catalog");
+  assert.equal(staleStartDuringDelete.staleInstanceAuthority, true, "stale Start during Delete must identify catalog authority invalidation");
+  assert.equal(await fs.stat(renamedDir).then(() => true, () => false), false, "Delete followed by stale Start must not recreate the deleted instance directory");
+  const catalogAfterDelete = await (await fetch(`http://127.0.0.1:${managerPort}/api/instances`)).json();
+  assert.equal(catalogAfterDelete.instances.some((item) => item.name === "race-renamed"), false, "deleted instance name must remain absent after stale lifecycle rejection");
 
   console.log("manager command ordering/coalescing races: ok");
 } finally {

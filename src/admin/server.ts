@@ -20,6 +20,9 @@ export interface AdminServerOptions {
   sessionCounts?: () => SessionCounts;
   instructionSummary?: () => Record<string, unknown>;
   instructionsPreview?: () => string;
+  lifecycleState?: () => Record<string, unknown>;
+  beginMcpDrain?: () => Record<string, unknown>;
+  resumeMcpAdmission?: () => Record<string, unknown>;
   requestShutdown?: () => void;
 }
 
@@ -48,6 +51,9 @@ export function startAdminServer(options: AdminServerOptions): Server {
     sessionCounts: options.sessionCounts,
     instructionSummary: options.instructionSummary,
     instructionsPreview: options.instructionsPreview,
+    lifecycleState: options.lifecycleState,
+    beginMcpDrain: options.beginMcpDrain,
+    resumeMcpAdmission: options.resumeMcpAdmission,
     requestShutdown: options.requestShutdown,
   }));
 

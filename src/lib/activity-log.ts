@@ -117,6 +117,13 @@ function writeConsole(entry: ActivityEntry): void {
     return;
   }
 
+  if (entry.kind === "tool" && entry.tool === "run_command" && commandOutcome === "timed_out") {
+    const detail = entry.summary || "synchronous response budget exhausted";
+    const cwd = entry.target ? ` cwd=${entry.target}` : "";
+    console.warn(`${ts} [COMMAND TIMED OUT] run_command${cwd} — ${detail}${dur}${sid}`);
+    return;
+  }
+
   if (isError) {
     const label =
       entry.tool ? `tools/call ${entry.tool}` : entry.action || entry.kind || "mcp";

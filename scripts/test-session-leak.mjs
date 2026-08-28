@@ -14,6 +14,7 @@
 // the server's close() was attempted.
 
 import http from "node:http";
+import { readFile } from "node:fs/promises";
 import {
   createSessionManager,
   isValidMcpSessionId,
@@ -63,6 +64,21 @@ function fakeReqRes() {
 }
 
 async function main() {
+  const sessionManagerSource = await readFile(new URL("../src/lib/mcp-session-manager.ts", import.meta.url), "utf8");
+  const runtimeEntrySource = await readFile(new URL("../src/index.ts", import.meta.url), "utf8");
+  const factoryPos = sessionManagerSource.indexOf("export function createSessionManager(config: SessionManagerConfig)");
+  const errorLedgerPos = sessionManagerSource.indexOf("const lastTransportErrors: Record<string, string>");
+  const opChainPos = sessionManagerSource.indexOf("const sessionOpChains = new Map<string, Promise<void>>()");
+  if (factoryPos < 0 || errorLedgerPos <= factoryPos || opChainPos <= factoryPos) {
+    fail("session mutable ledgers are manager-local", `factory=${factoryPos} errors=${errorLedgerPos} ops=${opChainPos}`);
+  } else if (/export function consumeSessionTransportError/.test(sessionManagerSource)) {
+    fail("session mutable ledgers are manager-local", "module-global transport-error consumer still exported");
+  } else if (!/sessionManager\.consumeTransportError\(sessionId\)/.test(runtimeEntrySource)) {
+    fail("session mutable ledgers are manager-local", "runtime logging does not consume errors through its SessionManager instance");
+  } else {
+    ok("session mutable ledgers are manager-local");
+  }
+
   const samplingCases = [
     ["openai-mcp", 1, false],
     ["openai-mcp", 2, false],

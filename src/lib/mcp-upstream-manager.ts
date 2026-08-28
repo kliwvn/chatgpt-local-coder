@@ -417,8 +417,44 @@ export class McpUpstreamManager {
     }
 
     try {
-      const conn = await this.connect(serverId, true);
-      return this.buildStatus(config, "connected", true, conn.tools, undefined, conn);
+      const existing = this.connections.get(serverId);
+      if (!existing?.connected) {
+        // Cold connect already performs a bounded initial listTools discovery, so
+        // it is itself an active reachability proof and does not need a second RPC.
+        const conn = await this.connect(serverId);
+        return this.buildStatus(config, "connected", true, conn.tools, undefined, conn);
+      }
+
+      // A health/test request is observability, not lifecycle authority. Never
+      // replace a transport while an accepted tool/list operation is using it.
+      // The exact current connection is already positive liveness evidence in
+      // that window; the active operation will own any failure/reconnect decision.
+      if (existing.activeOperations > 0) {
+        return this.buildStatus(config, "connected", true, existing.tools, existing.lastError, existing);
+      }
+
+      // Idle connection: perform a real bounded protocol probe without replacing
+      // the generation. This preserves the user-facing meaning of "Test" while
+      // avoiding the old force-disconnect/reconnect behavior.
+      this.beginOperation(existing);
+      try {
+        const list = await existing.client.listTools(undefined, { timeout: UPSTREAM_DISCOVERY_TIMEOUT_MS });
+        const tools = list.tools ?? [];
+        existing.tools = tools;
+        existing.lastError = undefined;
+        this.toolsCache.set(serverId, { tools, expiresAt: Date.now() + this.toolsCacheTtlMs });
+        return this.buildStatus(config, "connected", true, tools, undefined, existing);
+      } catch (err) {
+        const message = redactSensitiveText(err instanceof Error ? err.message : String(err));
+        existing.lastError = message;
+        // Close only when this probe is still the sole operation. If another call
+        // joined while the probe was awaiting its response, do not let observability
+        // tear down that accepted operation; its own result owns recovery.
+        if (existing.activeOperations === 1) await this.disconnect(serverId);
+        return this.buildStatus(config, "unreachable", false, [], message);
+      } finally {
+        this.endOperation(existing);
+      }
     } catch (err) {
       const message = redactSensitiveText(err instanceof Error ? err.message : String(err));
       return this.buildStatus(config, "unreachable", false, [], message);

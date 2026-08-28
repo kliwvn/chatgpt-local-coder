@@ -156,7 +156,7 @@
           <div class="field">
             <label for="f-sync-budget">MCP_SYNC_RESPONSE_BUDGET_MS</label>
             <input id="f-sync-budget" class="input mono" inputmode="numeric" placeholder="100000" />
-            <p class="hint">Hard budget cho MCP synchronous call; mặc định 100 giây để trả trước deadline tunnel. Job dài dùng start_process.</p>
+            <p class="hint">Hard budget cho từng run_command synchronous; mặc định 100 giây để trả trước deadline tunnel. Hết budget chỉ terminate command đó, KHÔNG phải hết MCP session/ChatGPT turn. Job dài dùng start_process + process_output.</p>
           </div>
           <div class="field">
             <label for="f-session-ttl">MCP_SESSION_TTL_MS</label>
@@ -208,6 +208,7 @@
           <span class="spacer"></span>
           <span id="tunnel-status" class="status-label">Đang kiểm tra…</span>
           <span id="tunnel-dot" class="status-dot"></span>
+          <button id="btn-tunnel-restart" class="btn btn-green" disabled title="Restart Tunnel; tự hội tụ Local Coder Server trước nếu Server đang dùng cấu hình cũ">↻ Khởi động lại Tunnel</button>
           <button id="btn-tunnel" class="btn btn-primary" disabled>Bật</button>
         </div>
         <p class="hint" id="tunnel-detail"></p>

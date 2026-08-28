@@ -262,6 +262,7 @@ PORT=3000
 MANAGER_PORT=3300
 WORKSPACE_PATH=C:\Users\You\projects\my-app
 SHELL_TIMEOUT=120
+MCP_SYNC_RESPONSE_BUDGET_MS=100000
 MCP_SESSION_TTL_MS=120000
 MCP_SESSION_CLEANUP_MS=15000
 MCP_SESSION_DELETE_GRACE_MS=45000
@@ -307,7 +308,8 @@ OPENAI_TUNNEL_API_KEY=
 | `MCP_SESSION_CLEANUP_MS` | `15000` | Chu kỳ cleanup session idle (15 giây) |
 | `MCP_SESSION_DELETE_GRACE_MS` | `45000` | **Fallback grace** cho transport close ngoài explicit DELETE. Explicit DELETE đã serialize sau các POST/tool call trước đó nên được dispose ngay khi op chain drain xong, tránh giữ session churn thêm 45s không cần thiết |
 | `MCP_MAX_SESSIONS` | `64` | Hard cap session giữ trong RAM; evict session idle cũ nhất trước, không đụng session connected/in-flight |
-| `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
+| `SHELL_TIMEOUT` | `120` | Configured max seconds for `run_command`; effective synchronous wait is additionally capped by `MCP_SYNC_RESPONSE_BUDGET_MS` |
+| `MCP_SYNC_RESPONSE_BUDGET_MS` | `100000` | Per-`run_command` synchronous response budget (max 115000 ms). Hitting it terminates that foreground command and returns `command_outcome=timed_out`, `timeout_is_session_termination=false`; it is **not** an MCP-session/ChatGPT-turn limit. Long jobs use `start_process` + `process_output` |
 | `SHELL_OUTPUT_MAX_CHARS` | `250000` | Giới hạn tail stdout/stderr của `run_command` trong RAM; response báo `*_truncated` khi bị cắt |
 | `GIT_OUTPUT_MAX_CHARS` | `500000` | Giới hạn output Git trong RAM; output bị cắt có marker rõ để agent không hiểu nhầm diff/log là đầy đủ |
 | `READ_TEXT_MAX_BYTES` | `2097152` | Whole-file `read_text_file` tối đa 2 MiB. File lớn phải dùng `offset+limit`, `head` hoặc `tail`; partial reads cũng fail-fast nếu một slice/single line vượt budget |
@@ -349,9 +351,9 @@ OPENAI_TUNNEL_API_KEY=
 
 > **Cross-agent shell isolation:** invocation có `working_directory` không còn đi vào default-shell history/cwd dù command chứa `cd`; `shell_status` chỉ phản ánh default shell, recent commands được secret-redact, và `shell_reset` clear cả cwd state lẫn history. Điều này ngăn nhiều agent/workspace dùng chung Gateway làm nhiễm shell context của nhau.
 
-> **Foreground shell timeout:** stdout/stderr của `run_command` giữ bounded tail. Khi timeout, process tree bị terminate; caller ưu tiên chờ child `close` nhưng có bounded fallback, nên một OS/process edge không phát `close` cũng không thể giữ Promise của `run_command` vô hạn.
+> **Foreground shell timeout:** stdout/stderr của `run_command` giữ bounded tail. Khi synchronous response budget hết, process tree của foreground call bị terminate; result trả `command_outcome=timed_out`, `timeout_scope=run_command_sync_response_budget`, `timeout_is_session_termination=false`, `continuation_required=true` và hướng dẫn chuyển job dài sang `start_process` + `process_output`. Đây là timeout của **một tool call**, không phải bằng chứng MCP session hay ChatGPT turn đã kết thúc. Caller ưu tiên chờ child `close` nhưng có bounded fallback, nên một OS/process edge không phát `close` cũng không thể giữ Promise vô hạn.
 
-> **Command/error taxonomy:** `run_command` non-zero exit là **command-level outcome**, không phải MCP transport failure. Server log dùng `[COMMAND FAILED] ... exit=<code> cwd=<path>` cho test/build/script fail, `[COMMAND NO MATCH]` cho `git grep` exit `1` (Git định nghĩa là không có match), `[TOOL FAILED]` cho failure cấp tool/upstream, và chỉ dùng `[MCP ERROR]` cho protocol/transport/server request failure. Raw `exit_code` vẫn luôn được giữ trong tool result/audit record; no-match chỉ được normalize semantic thành `command_outcome=no_match` để agent không debug một kết quả tìm kiếm hợp lệ như lỗi hệ thống.
+> **Command/error taxonomy:** `run_command` non-zero exit là **command-level outcome**, không phải MCP transport failure. Server log dùng `[COMMAND FAILED] ... exit=<code> cwd=<path>` cho test/build/script fail, `[COMMAND TIMED OUT]` cho per-call synchronous budget exhaustion, `[COMMAND NO MATCH]` cho `git grep` exit `1` (Git định nghĩa là không có match), `[TOOL FAILED]` cho failure cấp tool/upstream, và chỉ dùng `[MCP ERROR]` cho protocol/transport/server request failure. Raw `exit_code` vẫn được giữ khi có; `command_outcome=timed_out` và `command_outcome=no_match` tách riêng để agent không suy diễn timeout/no-match thành lỗi session/transport.
 
 > **Background process lifecycle:** `start_process` dùng registry dùng chung giữa các MCP transport session. Registry giới hạn số process đang chạy, số process-history và log tail trong RAM. Khi Gateway graceful shutdown/restart, Local Coder dừng toàn bộ process tree do `start_process` tạo trước khi thoát để tránh orphan process sau restart.
 

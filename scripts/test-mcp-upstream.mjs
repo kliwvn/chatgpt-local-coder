@@ -559,6 +559,34 @@ try {
     await manager.shutdown();
   });
 
+  await run("health probe never replaces a connection with an active tool call", async () => {
+    const manager = new McpUpstreamManager(configPath);
+    await manager.init();
+    await manager.updateConfig({
+      version: 1,
+      servers: [{
+        id: "probe-busy",
+        enabled: true,
+        transport: "http",
+        url: `http://127.0.0.1:${httpPort}/mcp`,
+        expose: "meta_only",
+        idle_timeout_sec: 10,
+      }],
+    });
+    await manager.connect("probe-busy");
+    const slowCall = manager.callTool("probe-busy", "sleep", { ms: 180 });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const health = await manager.checkHealth("probe-busy");
+    if (!health.connected || health.health !== "connected") {
+      throw new Error(`health probe unexpectedly lost live connection: ${JSON.stringify(health)}`);
+    }
+    const raw = await slowCall;
+    if (!JSON.stringify(raw).includes("180")) {
+      throw new Error(`health probe interrupted active tool call: ${JSON.stringify(raw)}`);
+    }
+    await manager.shutdown();
+  });
+
   await run("upstream synchronous tool calls honor the MCP response budget", async () => {
     const previousBudget = process.env.MCP_SYNC_RESPONSE_BUDGET_MS;
     process.env.MCP_SYNC_RESPONSE_BUDGET_MS = "1000";

@@ -1,4 +1,4 @@
-export type CommandOutcome = "ok" | "no_match" | "failed";
+export type CommandOutcome = "ok" | "no_match" | "timed_out" | "failed";
 
 const GIT_OPTIONS_WITH_VALUE = new Set([
   "-C",
@@ -78,7 +78,10 @@ export function classifyCommandOutcome(
   stderr = "",
   timedOut = false
 ): CommandOutcome {
-  if (timedOut) return "failed";
+  // A synchronous response-budget timeout is a command-level incomplete
+  // outcome, not an MCP-session/ChatGPT-turn failure. Keep it distinct from
+  // ordinary command failure so logs/results cannot collapse the two states.
+  if (timedOut) return "timed_out";
   if (exitCode === 0) return "ok";
   if (exitCode === 1 && stderr.trim() === "" && isGitGrepCommand(command)) return "no_match";
   return "failed";

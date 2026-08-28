@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-const OPENAI_TUNNEL_LAUNCH_FINGERPRINT_VERSION = 1;
+const OPENAI_TUNNEL_LAUNCH_FINGERPRINT_VERSION = 2;
 
 function normalizedPort(value) {
   const port = Number(value);
@@ -11,9 +11,26 @@ function normalizedPort(value) {
  * Persistable, secret-safe evidence for the exact OpenAI tunnel launch config.
  * The API key participates in the digest but is never stored in plaintext.
  */
-export function openAiTunnelLaunchFingerprint({ tunnelId, apiKey, healthPort, serverPort }) {
+export function openAiTunnelLaunchFingerprint({ tunnelId, apiKey, healthPort, serverPort, runtimeIdentity }) {
   const payload = JSON.stringify({
     version: OPENAI_TUNNEL_LAUNCH_FINGERPRINT_VERSION,
+    tunnelId: String(tunnelId || ""),
+    apiKey: String(apiKey || ""),
+    healthPort: normalizedPort(healthPort),
+    serverPort: normalizedPort(serverPort),
+    runtimeIdentity: String(runtimeIdentity || ""),
+  });
+  return createHash("sha256").update(payload, "utf8").digest("hex");
+}
+
+/**
+ * Previous launch-fingerprint contract. Keep this only for the bounded
+ * PID-file-mtime ownership bridge so an immediately-previous tunnel can still
+ * be stopped safely after upgrading. It must never authorize desired/green.
+ */
+export function legacyOpenAiTunnelLaunchFingerprintV1({ tunnelId, apiKey, healthPort, serverPort }) {
+  const payload = JSON.stringify({
+    version: 1,
     tunnelId: String(tunnelId || ""),
     apiKey: String(apiKey || ""),
     healthPort: normalizedPort(healthPort),
@@ -37,6 +54,7 @@ export function evaluateOpenAiTunnelLaunchState({
   savedProcessStartedAt,
   savedFingerprint,
   desiredFingerprint,
+  runtimePathMatches = true,
 }) {
   const pids = [...new Set((Array.isArray(processPids) ? processPids : [])
     .map((value) => Number(value))
@@ -57,7 +75,8 @@ export function evaluateOpenAiTunnelLaunchState({
     && !duplicateProcesses
     && pidMatch
     && processStartedAtMatch
-    && fingerprintMatch;
+    && fingerprintMatch
+    && runtimePathMatches === true;
   const desired = launchIdentityMatches && healthy === true;
 
   return {
@@ -71,6 +90,7 @@ export function evaluateOpenAiTunnelLaunchState({
     pidMatch,
     processStartedAtMatch,
     fingerprintMatch,
+    runtimePathMatches: runtimePathMatches === true,
   };
 }
 

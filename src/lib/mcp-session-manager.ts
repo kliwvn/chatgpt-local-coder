@@ -44,9 +44,6 @@ const SESSION_RESOURCE_CLOSE_TIMEOUT_MS = 2000;
 const RECOVERY_LOOPBACK_TIMEOUT_MS = 5000;
 const RECOVERY_LOOPBACK_RESPONSE_MAX_BYTES = 64 * 1024;
 
-const lastTransportErrors: Record<string, string> = Object.create(null);
-const sessionOpChains = new Map<string, Promise<void>>();
-
 export interface McpSession {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
@@ -122,6 +119,8 @@ export interface SessionManager {
   ): Promise<boolean>;
   sendSessionNotFound(res: Response, requestId?: string | number | null): void;
   sendBadRequest(res: Response, message: string, requestId?: string | number | null): void;
+  /** Consume the latest transport error for this manager's session only. */
+  consumeTransportError(sessionId?: string): string | undefined;
   startCleanup(): void;
   stopCleanup(): void;
   shutdown(): Promise<void>;
@@ -198,26 +197,6 @@ export async function loopbackMcpPost(
   }
 }
 
-export function consumeSessionTransportError(sessionId?: string): string | undefined {
-  if (!sessionId || !lastTransportErrors[sessionId]) return undefined;
-  const message = lastTransportErrors[sessionId];
-  delete lastTransportErrors[sessionId];
-  return message;
-}
-
-async function enqueueSessionOp(sessionId: string, op: () => Promise<void>): Promise<void> {
-  const prev = sessionOpChains.get(sessionId) ?? Promise.resolve();
-  const run = prev.catch(() => undefined).then(op);
-  sessionOpChains.set(sessionId, run);
-  try {
-    await run;
-  } finally {
-    if (sessionOpChains.get(sessionId) === run) {
-      sessionOpChains.delete(sessionId);
-    }
-  }
-}
-
 export function createSessionManager(config: SessionManagerConfig): SessionManager {
   // Session IDs originate on the wire. Null-prototype dictionaries prevent
   // special property names such as "__proto__"/"constructor" from changing
@@ -225,6 +204,12 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   const sessions: Record<string, McpSession> = Object.create(null);
   const pendingRecoveries: Record<string, McpSession> = Object.create(null);
   const deleteGraceTimers: Record<string, ReturnType<typeof setTimeout>> = Object.create(null);
+  // Mutable request/error state is per manager. Keeping these module-global makes
+  // two SessionManager instances with the same wire session ID serialize each
+  // other, leak transport errors across instances, and lets one shutdown clear
+  // another manager's in-flight operation ledger.
+  const lastTransportErrors: Record<string, string> = Object.create(null);
+  const sessionOpChains = new Map<string, Promise<void>>();
   let cleanupTimer: ReturnType<typeof setInterval> | null = null;
   const recoveryInFlight = new Map<string, Promise<McpSession | null>>();
   // Explicit DELETE closes the transport as part of the serialized request.
@@ -250,6 +235,20 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   let initializedTotal = 0;
   let openAiMcpInitializedTotal = 0;
   let shuttingDown = false;
+
+  async function enqueueSessionOp(sessionId: string, op: () => Promise<void>): Promise<void> {
+    const prev = sessionOpChains.get(sessionId) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(op);
+    sessionOpChains.set(sessionId, run);
+    try {
+      await run;
+    } finally {
+      if (sessionOpChains.get(sessionId) === run) {
+        sessionOpChains.delete(sessionId);
+      }
+    }
+  }
+
   function touch(sessionId: string): void {
     const session = sessions[sessionId];
     if (session) {
@@ -658,6 +657,13 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         error: { code: -32000, message },
         id: requestId,
       });
+    },
+
+    consumeTransportError(sessionId?: string) {
+      if (!sessionId || !lastTransportErrors[sessionId]) return undefined;
+      const message = lastTransportErrors[sessionId];
+      delete lastTransportErrors[sessionId];
+      return message;
     },
 
     async createNew(req: Request, res: Response, body: unknown): Promise<void> {

@@ -133,6 +133,9 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
   sessionCounts?: () => SessionCounts;
   instructionSummary?: () => Record<string, unknown>;
   instructionsPreview?: () => string;
+  lifecycleState?: () => Record<string, unknown>;
+  beginMcpDrain?: () => Record<string, unknown>;
+  resumeMcpAdmission?: () => Record<string, unknown>;
   requestShutdown?: () => void;
 }): Router {
   const router = Router();
@@ -266,6 +269,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
       upstream,
       checkpoint: getCheckpointConfig(),
       instructions: options.instructionSummary?.() ?? null,
+      lifecycle: options.lifecycleState?.() ?? null,
     });
   });
 
@@ -285,6 +289,27 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     });
   });
 
+
+  router.post("/api/process/drain", (_req: Request, res: Response) => {
+    if (!options.beginMcpDrain) {
+      res.status(501).json({ ok: false, error: "MCP admission drain is not configured" });
+      return;
+    }
+    const lifecycle = options.beginMcpDrain();
+    // Admission closes synchronously before this response is emitted. Existing
+    // requests keep running; Manager can now wait until activeRequests reaches 0
+    // without a TOCTOU window where a new POST sneaks in before process stop.
+    res.status(202).json({ ok: true, draining: true, lifecycle });
+  });
+
+  router.post("/api/process/resume", (_req: Request, res: Response) => {
+    if (!options.resumeMcpAdmission) {
+      res.status(501).json({ ok: false, error: "MCP admission resume is not configured" });
+      return;
+    }
+    const lifecycle = options.resumeMcpAdmission();
+    res.status(200).json({ ok: true, draining: false, lifecycle });
+  });
 
   router.post("/api/process/shutdown", (_req: Request, res: Response) => {
     if (!options.requestShutdown) {
