@@ -10,6 +10,8 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const launcher = path.join(root, "chatgpt-local-coder.bat");
 const source = await fs.readFile(launcher, "utf8");
 const executorSource = await fs.readFile(path.join(root, "src", "lib", "process-executor.ts"), "utf8");
+const startupCoreSource = await fs.readFile(path.join(root, "scripts", "ensure-startup-core.mjs"), "utf8");
+const managerStartSource = await fs.readFile(path.join(root, "scripts", "ensure-manager-start.mjs"), "utf8");
 
 function runChild(file, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -56,8 +58,85 @@ for (const command of ["status", "install", "help"]) {
 assert.match(source, /Host lifecycle bi chan trong Windows AppContainer agent sandbox/i);
 assert.match(
   source,
-  /:cmd_startup[\s\S]{0,500}?call :cmd_install[\s\S]{0,220}?call :cmd_start/,
-  "Windows-login startup must reconcile install/build/tunnel runtime before starting Manager",
+  /^:cmd_startup\s*$[\s\S]{0,900}?call :manager_current[\s\S]{0,900}?call :ensure_runtime_core[\s\S]{0,900}?call :cmd_start/im,
+  "Windows-login startup must fast-path a current Manager and reconcile only core runtime before starting Manager",
+);
+assert.doesNotMatch(
+  source.match(/^:cmd_startup\s*$[\s\S]*?(?=^:cmd_stop\s*$)/im)?.[0] || "",
+  /ensure-tunnel-client-lazy-codex|:cmd_install/,
+  "Windows-login critical path must not eagerly verify/build tunnel runtime; Manager tunnel lifecycle owns lazy tunnel preflight",
+);
+assert.match(
+  source,
+  /:ensure_runtime_core[\s\S]{0,500}?ensure-startup-core\.mjs/,
+  "launcher core preflight must use the dedicated dependency/build freshness helper",
+);
+assert.match(
+  source,
+  /^:cmd_start\s*$[\s\S]{0,800}?ensure-manager-start\.mjs[\s\S]{0,300}?if errorlevel 1/im,
+  "Manager startup must delegate single-flight/readiness ownership to the dedicated helper",
+);
+assert.match(
+  source,
+  /^:manager_current\s*$[\s\S]{0,700}?TcpClient[\s\S]{0,500}?Wait\(300\)/im,
+  "cold login Manager detection must use a bounded TCP precheck before HTTP identity validation",
+);
+assert.doesNotMatch(
+  source.match(/^:cmd_startup\s*$[\s\S]*?(?=^:cmd_stop\s*$)/im)?.[0] || "",
+  /call :cmd_start\s*>>/i,
+  "startup must not hold startup.log as redirected stdout across Manager spawn; that can lock later milestone appends",
+);
+assert.doesNotMatch(
+  source.match(/^:cmd_startup\s*$[\s\S]*?(?=^:cmd_stop\s*$)/im)?.[0] || "",
+  /call :ensure_runtime_core\s*>>/i,
+  "concurrent startup must not hold one shared startup.log handle across core preflight",
+);
+assert.doesNotMatch(
+  source.match(/^:cmd_start\s*$[\s\S]*?(?=^:cmd_startup\s*$)/im)?.[0] || "",
+  /manager-start\.lock|wait_manager_ready|Start-Process|ping\s+-n\s+5/i,
+  "batch launcher must not reimplement Manager single-flight/spawn/readiness logic",
+);
+assert.match(
+  source,
+  /startup\.log/,
+  "hidden Windows-login startup must persist pre-Manager failure diagnostics",
+);
+assert.match(
+  source,
+  /startup\.log[\s\S]{0,500}?524288[\s\S]{0,350}?startup\.prev\.log/,
+  "startup diagnostics must stay bounded instead of growing forever across logins",
+);
+assert.match(
+  startupCoreSource,
+  /startup-core\.lock[\s\S]{0,1800}?fsp\.mkdir\(coreLockDir\)[\s\S]{0,2600}?processIsAlive[\s\S]{0,2600}?releaseCoreLock/,
+  "dependency/build preflight must be single-flight with dead-owner recovery and owned release",
+);
+assert.match(
+  managerStartSource,
+  /manager-start\.lock/,
+  "Manager start helper must use an owned single-flight lock with dead-owner recovery",
+);
+assert.match(managerStartSource, /fsp\.mkdir\(lockDir\)/, "Manager start helper must acquire the lock atomically");
+assert.match(managerStartSource, /processIsAlive\(owner\.pid\)/, "Manager start helper must recover dead lock owners");
+assert.match(managerStartSource, /await release\(claim\.owner\)/, "Manager start helper must release only its owned lock");
+assert.match(
+  managerStartSource,
+  /detached:\s*true/,
+  "Manager start helper must detach the Manager and verify readiness rather than fixed-sleep",
+);
+assert.match(managerStartSource, /child\.unref\(\)/, "Manager start helper must unref the detached Manager");
+assert.match(managerStartSource, /await waitHealthy\(pid\)/, "Manager start helper must verify Manager readiness after spawn");
+assert.match(
+  managerStartSource,
+  /Get-CimInstance Win32_Process/,
+  "Manager helper must prove exact Windows process ownership and self-restart an artifact-drifted Manager",
+);
+assert.match(managerStartSource, /artifactDrift/, "Manager helper must inspect Manager artifact drift");
+assert.match(managerStartSource, /\/api\/manager\/restart/, "Manager helper must use the Manager self-restart handoff for drift");
+assert.match(
+  startupCoreSource,
+  /startup-core\.log[\s\S]{0,5000}?atomicWriteFile\(coreStatusLog/,
+  "core preflight must keep a bounded latest-status diagnostic instead of sharing the login append handle",
 );
 assert.match(
   source,

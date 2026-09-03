@@ -12,7 +12,7 @@ REM  Cach dung:
 REM    %~nx0               -> cai dat (node deps + build), bat autostart,
 REM                           start Manager (an) va mo dashboard
 REM    %~nx0 start         -> chi start Manager (an) neu chua chay
-REM    %~nx0 startup       -> cold-login reconcile: install/build/runtime + start Manager
+REM    %~nx0 startup       -> optimized cold-login: core freshness + start Manager
 REM    %~nx0 stop          -> dung Manager (giu nguyen Server + Tunnel)
 REM    %~nx0 status        -> trang thai Manager + cac instance
 REM    %~nx0 autostart     -> bat tu dong chay khi dang nhap Windows (tao LNK)
@@ -76,16 +76,7 @@ exit /b 0
 REM =====================================================================
 :cmd_install
 REM =====================================================================
-call :check_node
-if errorlevel 1 exit /b 1
-if not exist "%~dp0node_modules" (
-  echo [..] Dang cai thu vien ^(npm install^)...
-  call npm install
-  if errorlevel 1 ( echo [LOI] npm install that bai. & exit /b 1 )
-) else (
-  echo [OK] Thu vien da co san.
-)
-call :ensure_build
+call :ensure_runtime_core
 if errorlevel 1 exit /b 1
 echo [..] Dang kiem tra patched OpenAI Tunnel runtime...
 node "%~dp0scripts\ensure-tunnel-client-lazy-codex.mjs"
@@ -120,36 +111,50 @@ exit /b 0
 REM =====================================================================
 :cmd_start
 REM =====================================================================
-call :ensure_build
-if errorlevel 1 exit /b 1
-call :manager_running
-if not errorlevel 1 (
-  echo [OK] Manager da chay: http://127.0.0.1:%MGR_PORT%
-  exit /b 0
+if /i not "%CLC_RUNTIME_PREPARED%"=="1" (
+  call :ensure_runtime_core
+  if errorlevel 1 exit /b 1
 )
-if not exist "%~dp0manager\state\logs" mkdir "%~dp0manager\state\logs"
-set "NODE_EXE=%ProgramFiles%\nodejs\node.exe"
-if not exist "%NODE_EXE%" set "NODE_EXE=node"
-echo [..] Dang khoi dong Manager (an) tai http://127.0.0.1:%MGR_PORT% ...
-"%PS%" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -FilePath '%NODE_EXE%' -ArgumentList 'manager/server.mjs','--no-open' -WorkingDirectory '%~dp0' -WindowStyle Hidden -RedirectStandardOutput '%~dp0manager\state\logs\manager-console.log' -RedirectStandardError '%~dp0manager\state\logs\manager-console.err.log'"
-ping -n 5 127.0.0.1 >nul
-call :manager_running
+node "%~dp0scripts\ensure-manager-start.mjs" "%MGR_PORT%"
 if errorlevel 1 (
-  echo [LOI] Manager chua san sau khi khoi dong. Xem manager\state\logs\manager-console.err.log
+  echo [LOI] Manager startup that bai. Xem manager\state\logs\manager-start.log va manager-console.err.log
   exit /b 1
 )
-echo [OK] Manager dang chay: http://127.0.0.1:%MGR_PORT%
 exit /b 0
 
 REM =====================================================================
 :cmd_startup
 REM =====================================================================
-REM Windows login entrypoint: reconcile dependencies/build/tunnel runtime first,
-REM then start Manager so autoStart instances always use the current generation.
-call :cmd_install
-if errorlevel 1 exit /b 1
+REM Windows login entrypoint: keep the critical path minimal. Tunnel runtime is
+REM ensured lazily by Manager exactly when an OpenAI Tunnel start needs it.
+if not exist "%~dp0manager\state\logs" mkdir "%~dp0manager\state\logs"
+set "CLC_STARTUP_LOG=%~dp0manager\state\logs\startup.log"
+if exist "%CLC_STARTUP_LOG%" for %%F in ("%CLC_STARTUP_LOG%") do if %%~zF GTR 524288 (
+  move /y "%CLC_STARTUP_LOG%" "%~dp0manager\state\logs\startup.prev.log" >nul 2>nul
+)
+echo.>>"%CLC_STARTUP_LOG%"
+echo [%date% %time%] startup begin>>"%CLC_STARTUP_LOG%"
+call :manager_current
+if not errorlevel 1 (
+  echo [%date% %time%] startup fast-path: current Manager already healthy>>"%CLC_STARTUP_LOG%"
+  echo [OK] Manager da current: http://127.0.0.1:%MGR_PORT%
+  exit /b 0
+)
+call :ensure_runtime_core
+if errorlevel 1 (
+  echo [%date% %time%] startup failed: core preflight>>"%CLC_STARTUP_LOG%"
+  echo [LOI] Startup core preflight that bai. Xem "%CLC_STARTUP_LOG%" va manager\state\logs\startup-core.log
+  exit /b 1
+)
+set "CLC_RUNTIME_PREPARED=1"
 call :cmd_start
-if errorlevel 1 exit /b 1
+if errorlevel 1 (
+  echo [%date% %time%] startup failed: Manager start>>"%CLC_STARTUP_LOG%"
+  echo [LOI] Manager startup that bai. Xem "%CLC_STARTUP_LOG%"
+  exit /b 1
+)
+echo [%date% %time%] startup complete>>"%CLC_STARTUP_LOG%"
+echo [OK] Startup hoan tat: http://127.0.0.1:%MGR_PORT%
 exit /b 0
 
 REM =====================================================================
@@ -249,29 +254,12 @@ echo [OK] Autostart da cai: "%LNK%"
 exit /b 0
 
 REM =====================================================================
-:ensure_build
+:ensure_runtime_core
 REM =====================================================================
-set "NEED_BUILD=0"
-if not exist "%~dp0dist\index.js" (
-  set "NEED_BUILD=1"
-) else (
-  REM Khong duoc dat "%PS%" trong dau ngoac kep o dau lenh backquote:
-  REM cmd.exe parse sai va chay khong ra ket qua (false-green). %PS% khong
-  REM chua khoang trang tren Windows chuan. NEED_BUILD rong = check loi
-  REM -> xem nhu can build (huong an toan).
-  for /f "usebackq delims=" %%s in (`%PS% -NoProfile -ExecutionPolicy Bypass -Command "$s=Get-ChildItem -Path '%~dp0src' -Recurse -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1; $d=Get-Item -LiteralPath '%~dp0dist\index.js'; if (-not $s -or $s.LastWriteTime -le $d.LastWriteTime) { '0' } else { '1' }"`) do set "NEED_BUILD=%%s"
-  if "%NEED_BUILD%"=="" set "NEED_BUILD=1"
-)
-if "%NEED_BUILD%"=="1" (
-  echo [..] Dang build ^(npm run build^)...
-  call npm run build
-  if errorlevel 1 (
-    echo [LOI] Build that bai.
-    exit /b 1
-  )
-) else (
-  echo [OK] Build da co san.
-)
+call :check_node
+if errorlevel 1 exit /b 1
+node "%~dp0scripts\ensure-startup-core.mjs"
+if errorlevel 1 exit /b 1
 exit /b 0
 
 REM =====================================================================
@@ -306,5 +294,11 @@ exit /b 0
 REM =====================================================================
 :manager_running
 REM =====================================================================
-"%PS%" -NoProfile -Command "try { $r=Invoke-RestMethod -Uri 'http://127.0.0.1:%MGR_PORT%/api/health' -TimeoutSec 3; if ($r.ok -eq $true -and $r.name -eq 'chatgpt-local-coder-manager') { exit 0 } } catch {} exit 1"
+"%PS%" -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient; try { if (-not $c.ConnectAsync('127.0.0.1',%MGR_PORT%).Wait(300)) { exit 1 } } catch { exit 1 } finally { $c.Dispose() }; try { $r=Invoke-RestMethod -Uri 'http://127.0.0.1:%MGR_PORT%/api/health' -TimeoutSec 2; if ($r.ok -eq $true -and $r.name -eq 'chatgpt-local-coder-manager') { exit 0 } } catch {} exit 1"
+exit /b %errorlevel%
+
+REM =====================================================================
+:manager_current
+REM =====================================================================
+"%PS%" -NoProfile -Command "$c=New-Object Net.Sockets.TcpClient; try { if (-not $c.ConnectAsync('127.0.0.1',%MGR_PORT%).Wait(300)) { exit 1 } } catch { exit 1 } finally { $c.Dispose() }; try { $r=Invoke-RestMethod -Uri 'http://127.0.0.1:%MGR_PORT%/api/health' -TimeoutSec 1; if ($r.ok -ne $true -or $r.name -ne 'chatgpt-local-coder-manager' -or $r.artifactDrift -eq $true) { exit 1 }; $p=Get-CimInstance Win32_Process -Filter ('ProcessId='+$r.pid) -ErrorAction SilentlyContinue; if (-not $p -or $p.Name -notmatch '^node' -or $p.CommandLine -notmatch 'manager[\\/]server\.mjs') { exit 1 }; exit 0 } catch { exit 1 }"
 exit /b %errorlevel%
