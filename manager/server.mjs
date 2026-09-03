@@ -112,7 +112,7 @@ function psSingleQuoted(value) {
 
 function autostartExpectedArguments() {
   const launcherLiteral = `'${LAUNCHER_BAT.replaceAll("'", "''")}'`;
-  return `-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "& ${launcherLiteral} start"`;
+  return `-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "& ${launcherLiteral} startup"`;
 }
 
 function runBoundedHelperProcess(command, args, {
@@ -207,6 +207,34 @@ async function inspectAutostartLink() {
     valid: result.status === 0,
     reason: result.status === 0 ? "exact-current-repo" : "stale-or-invalid",
   };
+}
+async function reconcileAutostartWithLauncher(enable) {
+  if (!IS_WIN) {
+    if (enable) await atomicWriteFile(STARTUP_LNK, "enabled\n", "utf8");
+    else await fsp.rm(STARTUP_LNK, { force: true });
+    return inspectAutostartLink();
+  }
+  const args = ["/d", "/c", LAUNCHER_BAT, "autostart"];
+  if (!enable) args.push("off");
+  const result = await runBoundedHelperProcess("cmd.exe", args, {
+    timeoutMs: 30000,
+    maxOutputChars: HELPER_OUTPUT_MAX_CHARS,
+    cwd: REPO_ROOT,
+  });
+  if (result.status !== 0) {
+    const detail = String(result.error || result.stderr || result.stdout || "launcher autostart reconciliation failed")
+      .trim()
+      .slice(-500);
+    throw new Error(detail || "launcher autostart reconciliation failed");
+  }
+  const state = await inspectAutostartLink();
+  if (enable && !state.valid) {
+    throw new Error("launcher reported success but Startup LNK is not exact CURRENT repo authority");
+  }
+  if (!enable && state.exists) {
+    throw new Error("launcher reported autostart disabled but Startup LNK still exists");
+  }
+  return state;
 }
 const NPM_CMD = IS_WIN ? "npm.cmd" : "npm";
 const CLOUDFLARED = IS_WIN ? path.join(ROOT, "cloudflared.exe") : "cloudflared";
@@ -6590,59 +6618,24 @@ async function handleApi(req, res, url, body, instanceAdmission = null) {
     }
     if (req.method === "POST") {
       const enable = Boolean(body && body.enabled);
-      if (enable) {
-        // Luôn ghi lại shortcut (ghi đè LNK cũ kể cả khi đã tồn tại): LNK từ bản
-        // cũ có thể trỏ manager-hidden.vbs hoặc launcher ps1 đời cũ — bật lại autostart
-        // phải tự sửa chữa. Launcher duy nhất giờ là chatgpt-local-coder.bat.
-        {
-          // Tạo shortcut .lnk trỏ powershell.exe ẩn chạy:
-          //   & '<repo>\chatgpt-local-coder.bat' start
-          // KHÔNG dùng VBS/wscript (VBScript engine không đăng ký sẵn trên nhiều
-          // Windows hiện đại: "There is no script engine for file extension
-          // '.vbs'") và không tạo thêm file launcher phụ trong manager/state/.
-          const psExe = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-          const expectedArguments = autostartExpectedArguments();
-          const psCode =
-            "$ws = New-Object -ComObject WScript.Shell\n" +
-            `$s = $ws.CreateShortcut(${psSingleQuoted(STARTUP_LNK)})\n` +
-            `$s.TargetPath = ${psSingleQuoted(psExe)}\n` +
-            `$s.Arguments = ${psSingleQuoted(expectedArguments)}\n` +
-            `$s.WorkingDirectory = ${psSingleQuoted(REPO_ROOT)}\n` +
-            "$s.WindowStyle = 7\n" +
-            "$s.Description = 'ChatGPT Local Coder Manager (hidden)'\n" +
-            "$s.Save()\n";
-          const r = await runBoundedHelperProcess(
-            psExe,
-            ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psCode],
-            { timeoutMs: 30000, maxOutputChars: HELPER_OUTPUT_MAX_CHARS }
-          );
-          if (r.status !== 0) {
-            return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: " + (r.stderr || r.stdout || "").trim().slice(-200) });
-          }
-          // Đọc ngược LNK và chứng minh đủ 3 identity: PowerShell target,
-          // launcher absolute path của CURRENT repo, và CURRENT repo working dir.
-          // Chỉ kiểm basename là false-green khi repo từng bị move/copy.
-          const verification = await inspectAutostartLink();
-          if (!verification.valid) {
-            return json(res, 500, { ok: false, error: "Tạo shortcut autostart lỗi: LNK không khớp exact CURRENT repo launcher/working directory" });
-          }
-          // Dọn VBS cũ nếu còn (phiên bản cũ từng tạo) để không còn shortcut chết.
-          try {
-            if (fs.existsSync(MANAGER_HIDDEN_VBS)) await fsp.unlink(MANAGER_HIDDEN_VBS);
-          } catch { /* bỏ qua - không chặn bật autostart */ }
-        }
-        return json(res, 200, { ok: true, enabled: true });
-      }
-      // Tắt: xóa shortcut
       try {
-        if (fs.existsSync(STARTUP_LNK)) await fsp.unlink(STARTUP_LNK);
-        return json(res, 200, { ok: true, enabled: false });
+        const state = await reconcileAutostartWithLauncher(enable);
+        return json(res, 200, {
+          ok: true,
+          enabled: state.valid,
+          exists: state.exists,
+          drift: state.exists && !state.valid,
+          reason: state.reason,
+          synchronized: true,
+        });
       } catch (err) {
-        return json(res, 500, { ok: false, error: "Xóa shortcut lỗi: " + String((err && err.message) || err).slice(-200) });
+        return json(res, 500, {
+          ok: false,
+          error: "Autostart synchronization failed: " + String((err && err.message) || err).slice(-500),
+        });
       }
     }
   }
-
   if (req.method === "GET" && p === "/api/health") {
     return json(res, 200, {
       ok: true,

@@ -13,6 +13,7 @@ const ROOT_MEMORY_FILES = [
 ] as const;
 
 const USER_MEMORY_CANDIDATES = [
+  path.join(os.homedir(), ".agents", "AGENTS.md"),
   path.join(os.homedir(), ".codex", "AGENTS.md"),
   path.join(os.homedir(), ".codex", "CLAUDE.md"),
   path.join(os.homedir(), ".claude", "CLAUDE.md"),
@@ -81,7 +82,7 @@ async function validateUserMemoryEntrypoint(filePath: string): Promise<string> {
 }
 
 export function getCanonicalGlobalHarnessBootstrapPath(): string {
-  return path.join(os.homedir(), ".codex", "AGENTS.md");
+  return path.join(os.homedir(), ".agents", "AGENTS.md");
 }
 
 /**

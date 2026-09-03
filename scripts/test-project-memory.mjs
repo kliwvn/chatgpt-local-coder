@@ -124,7 +124,7 @@ try {
       adminPort: 3001,
     });
     const hasHarnessBootstrap = ctx.projectMemory.sections.some(
-      (section) => section.kind === "user" && /[\\/]\.codex[\\/]AGENTS\.md$/i.test(section.path)
+      (section) => section.kind === "user" && /[\\/]\.agents[\\/]AGENTS\.md$/i.test(section.path)
     );
     if (hasHarnessBootstrap) {
       if (ctx.instructionsText.includes(sentinel) || ctx.instructionsText.includes("## Auto memory (learned across sessions)")) {
@@ -165,9 +165,26 @@ try {
     if (!normalPathRejected) throw new Error("Global Harness context exception widened ordinary path authority");
 
     const continuityFile = path.join(os.homedir(), ".codex", "GLOBAL_IMPLEMENTATION_NOTES.md");
-    const continuityPath = await validateContextReadPath(continuityFile);
-    if (path.normalize(continuityPath).toLowerCase() !== path.normalize(continuityFile).toLowerCase()) {
-      throw new Error(`Global Harness continuity path mismatch: ${continuityPath}`);
+    try {
+      const continuityInfo = await fs.lstat(continuityFile);
+      if (!continuityInfo.isFile() || continuityInfo.isSymbolicLink()) {
+        throw new Error("Global Harness continuity file exists but is not a canonical regular file");
+      }
+      const continuityPath = await validateContextReadPath(continuityFile);
+      if (path.normalize(continuityPath).toLowerCase() !== path.normalize(continuityFile).toLowerCase()) {
+        throw new Error(`Global Harness continuity path mismatch: ${continuityPath}`);
+      }
+    } catch (err) {
+      if (err?.code !== "ENOENT") throw err;
+      let missingContinuityRejected = false;
+      try {
+        await validateContextReadPath(continuityFile);
+      } catch {
+        missingContinuityRejected = true;
+      }
+      if (!missingContinuityRejected) {
+        throw new Error("missing Global Harness continuity file was trusted before a canonical file existed");
+      }
     }
 
     let unrelatedOutsideReadRejected = false;

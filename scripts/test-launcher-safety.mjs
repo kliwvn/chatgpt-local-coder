@@ -39,7 +39,7 @@ assert.match(
   /CLC_OS_SANDBOX:\s*"windows_appcontainer"/,
   "strict ProcessExecutor must mark child environments so launcher lifecycle calls fail closed",
 );
-for (const command of ["setup", "start", "stop", "autostart", "tunnel"]) {
+for (const command of ["setup", "start", "startup", "stop", "autostart", "tunnel"]) {
   assert.match(
     source,
     new RegExp(`if /i "%CMD%"=="${command}"\\s+goto :sandbox_host_lifecycle_blocked`, "i"),
@@ -54,6 +54,16 @@ for (const command of ["status", "install", "help"]) {
   );
 }
 assert.match(source, /Host lifecycle bi chan trong Windows AppContainer agent sandbox/i);
+assert.match(
+  source,
+  /:cmd_startup[\s\S]{0,500}?call :cmd_install[\s\S]{0,220}?call :cmd_start/,
+  "Windows-login startup must reconcile install/build/tunnel runtime before starting Manager",
+);
+assert.match(
+  source,
+  /:ensure_autostart[\s\S]{0,1800}?launcherLiteral[\s\S]{0,500}?startup/,
+  "autostart shortcut must target the reconciled startup command rather than raw Manager start",
+);
 assert.match(
   source,
   /:manager_running[\s\S]{0,520}?Invoke-RestMethod[\s\S]{0,320}?\$r\.ok -eq \$true[\s\S]{0,180}?\$r\.name -eq 'chatgpt-local-coder-manager'/,
@@ -77,6 +87,11 @@ assert.match(
   source,
   /^:autostart_off[\s\S]{0,520}?del \/q[\s\S]{0,220}?if errorlevel 1[\s\S]{0,260}?if exist "%LNK%"/im,
   "autostart off must verify shortcut deletion instead of reporting success after a failed delete",
+);
+assert.match(
+  source,
+  /echo \[OK\] Da tat autostart \^\(xoa LNK\^\)\./,
+  "autostart off status text must escape parentheses inside the cmd IF block",
 );
 
 if (process.platform === "win32") {

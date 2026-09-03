@@ -1065,17 +1065,21 @@ function init() {
       const res = await fetch("/api/autostart");
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || "lỗi");
-      btnAuto.textContent = data.enabled
-        ? "⚡ Tự chạy khi đăng nhập: BẬT"
-        : "⚡ Tự chạy khi đăng nhập: TẮT";
+      btnAuto.textContent = data.drift
+        ? "⚠ Tự chạy khi đăng nhập: CẦN ĐỒNG BỘ"
+        : data.enabled
+          ? "⚡ Tự chạy khi đăng nhập: BẬT"
+          : "⚡ Tự chạy khi đăng nhập: TẮT";
       btnAuto.dataset.on = data.enabled ? "1" : "0";
+      btnAuto.dataset.drift = data.drift ? "1" : "0";
       btnAuto.classList.toggle("btn-green", data.enabled);
     } catch (err) {
       btnAuto.textContent = "⚡ Tự chạy khi đăng nhập: lỗi kiểm tra";
     }
   }
   btnAuto.addEventListener("click", async () => {
-    const enable = btnAuto.dataset.on !== "1";
+    const repairing = btnAuto.dataset.drift === "1";
+    const enable = repairing || btnAuto.dataset.on !== "1";
     btnAuto.disabled = true;
     try {
       const res = await fetch("/api/autostart", {
@@ -1085,7 +1089,14 @@ function init() {
       });
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || "lỗi");
-      toast(enable ? "Đã bật autostart — manager sẽ tự chạy khi bạn đăng nhập" : "Đã tắt autostart", "ok");
+      toast(
+        repairing
+          ? "Đã đồng bộ lại autostart với CURRENT chatgpt-local-coder"
+          : enable
+            ? "Đã bật autostart — startup sẽ tự reconcile runtime rồi mở manager"
+            : "Đã tắt autostart",
+        "ok",
+      );
       await refreshAutostart();
     } catch (err) {
       toast("Lỗi đổi autostart: " + err.message, "err");

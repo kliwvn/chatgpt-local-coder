@@ -148,7 +148,7 @@ export async function validatePath(inputPath: string): Promise<string> {
 
 /**
  * Read-only context exception for canonical user-global Harness surfaces.
- * This exists so an injected ~/.codex/AGENTS.md bootstrap can selectively load
+ * This exists so the canonical ~/.agents/AGENTS.md bootstrap can selectively load
  * exact ~/.agents modules plus allowlisted Harness-owned ~/.codex text when
  * needed, even while FULL_DISK_ACCESS=false. It intentionally does not widen
  * write, shell, Git, hook, upstream, or project authority: those paths continue

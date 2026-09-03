@@ -12,6 +12,7 @@ REM  Cach dung:
 REM    %~nx0               -> cai dat (node deps + build), bat autostart,
 REM                           start Manager (an) va mo dashboard
 REM    %~nx0 start         -> chi start Manager (an) neu chua chay
+REM    %~nx0 startup       -> cold-login reconcile: install/build/runtime + start Manager
 REM    %~nx0 stop          -> dung Manager (giu nguyen Server + Tunnel)
 REM    %~nx0 status        -> trang thai Manager + cac instance
 REM    %~nx0 autostart     -> bat tu dong chay khi dang nhap Windows (tao LNK)
@@ -37,6 +38,7 @@ REM internal marker, so ordinary launcher behavior is unchanged.
 if /i "%CLC_OS_SANDBOX%"=="windows_appcontainer" (
   if /i "%CMD%"=="setup"     goto :sandbox_host_lifecycle_blocked
   if /i "%CMD%"=="start"     goto :sandbox_host_lifecycle_blocked
+  if /i "%CMD%"=="startup"   goto :sandbox_host_lifecycle_blocked
   if /i "%CMD%"=="stop"      goto :sandbox_host_lifecycle_blocked
   if /i "%CMD%"=="autostart" goto :sandbox_host_lifecycle_blocked
   if /i "%CMD%"=="tunnel"    goto :sandbox_host_lifecycle_blocked
@@ -49,6 +51,7 @@ for /f "delims=" %%p in ("%MGR_PORT%") do set "MGR_PORT=%%p"
 
 if /i "%CMD%"=="setup"     goto :cmd_setup
 if /i "%CMD%"=="start"     goto :cmd_start
+if /i "%CMD%"=="startup"   goto :cmd_startup
 if /i "%CMD%"=="stop"      goto :cmd_stop
 if /i "%CMD%"=="status"    goto :cmd_status
 if /i "%CMD%"=="autostart" goto :cmd_autostart
@@ -66,7 +69,7 @@ exit /b 1
 REM =====================================================================
 :cmd_help
 REM =====================================================================
-echo Cach dung: %~nx0 [setup^|start^|stop^|status^|autostart [off]^|tunnel start^|tunnel stop^|install^|help]
+echo Cach dung: %~nx0 [setup^|start^|startup^|stop^|status^|autostart [off]^|tunnel start^|tunnel stop^|install^|help]
 echo   (khong tham so = setup: cai dat + autostart + start + mo dashboard)
 exit /b 0
 
@@ -139,6 +142,17 @@ echo [OK] Manager dang chay: http://127.0.0.1:%MGR_PORT%
 exit /b 0
 
 REM =====================================================================
+:cmd_startup
+REM =====================================================================
+REM Windows login entrypoint: reconcile dependencies/build/tunnel runtime first,
+REM then start Manager so autoStart instances always use the current generation.
+call :cmd_install
+if errorlevel 1 exit /b 1
+call :cmd_start
+if errorlevel 1 exit /b 1
+exit /b 0
+
+REM =====================================================================
 :cmd_stop
 REM =====================================================================
 call :manager_running
@@ -176,7 +190,7 @@ if exist "%LNK%" (
     echo [LOI] Autostart LNK van con sau khi xoa: "%LNK%"
     exit /b 1
   )
-  echo [OK] Da tat autostart (xoa LNK).
+  echo [OK] Da tat autostart ^(xoa LNK^).
 ) else (
   echo [OK] Autostart da tat san.
 )
@@ -215,9 +229,9 @@ set "CLC_AUTOSTART_TARGET=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershel
 set "CLC_AUTOSTART_LAUNCHER=%~dp0chatgpt-local-coder.bat"
 set "CLC_AUTOSTART_WORKDIR=%~dp0"
 if not exist "%~dp0manager\state" mkdir "%~dp0manager\state"
-REM LNK tro powershell an -> chay chinh file nay voi lenh "start".
+REM LNK tro powershell an -> chay chinh file nay voi lenh "startup".
 REM Khong dung VBS/wscript (VBScript engine khong dang ky san tren nhieu Windows).
-"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($env:CLC_AUTOSTART_LNK); $singleQuote=[string][char]39; $launcherLiteral=$singleQuote + $env:CLC_AUTOSTART_LAUNCHER.Replace($singleQuote,($singleQuote+$singleQuote)) + $singleQuote; $s.TargetPath=$env:CLC_AUTOSTART_TARGET; $s.Arguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ' + [char]34 + '& ' + $launcherLiteral + ' start' + [char]34; $s.WorkingDirectory=$env:CLC_AUTOSTART_WORKDIR; $s.WindowStyle=7; $s.Description='ChatGPT Local Coder Manager (hidden)'; $s.Save()"
+"%PS%" -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $ws=New-Object -ComObject WScript.Shell; $s=$ws.CreateShortcut($env:CLC_AUTOSTART_LNK); $singleQuote=[string][char]39; $launcherLiteral=$singleQuote + $env:CLC_AUTOSTART_LAUNCHER.Replace($singleQuote,($singleQuote+$singleQuote)) + $singleQuote; $s.TargetPath=$env:CLC_AUTOSTART_TARGET; $s.Arguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ' + [char]34 + '& ' + $launcherLiteral + ' startup' + [char]34; $s.WorkingDirectory=$env:CLC_AUTOSTART_WORKDIR; $s.WindowStyle=7; $s.Description='ChatGPT Local Coder Manager (hidden, reconciled startup)'; $s.Save()"
 if errorlevel 1 (
   echo [LOI] Tao LNK autostart that bai.
   exit /b 1
@@ -226,7 +240,7 @@ if not exist "%LNK%" (
   echo [LOI] Khong tao duoc autostart LNK.
   exit /b 1
 )
-"%PS%" -NoProfile -Command "$ErrorActionPreference='Stop'; $w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut($env:CLC_AUTOSTART_LNK); $expectedTarget=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_TARGET); $expectedLauncher=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_LAUNCHER); $expectedWork=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_WORKDIR).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar); $singleQuote=[string][char]39; $launcherLiteral=$singleQuote + $expectedLauncher.Replace($singleQuote,($singleQuote+$singleQuote)) + $singleQuote; $expectedArguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ' + [char]34 + '& ' + $launcherLiteral + ' start' + [char]34; $actualTarget=[IO.Path]::GetFullPath($s.TargetPath); $actualWork=[IO.Path]::GetFullPath($s.WorkingDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar); if (-not [string]::Equals($actualTarget,$expectedTarget,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($actualWork,$expectedWork,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($s.Arguments,$expectedArguments,[StringComparison]::OrdinalIgnoreCase)) { exit 1 }"
+"%PS%" -NoProfile -Command "$ErrorActionPreference='Stop'; $w=New-Object -ComObject WScript.Shell; $s=$w.CreateShortcut($env:CLC_AUTOSTART_LNK); $expectedTarget=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_TARGET); $expectedLauncher=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_LAUNCHER); $expectedWork=[IO.Path]::GetFullPath($env:CLC_AUTOSTART_WORKDIR).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar); $singleQuote=[string][char]39; $launcherLiteral=$singleQuote + $expectedLauncher.Replace($singleQuote,($singleQuote+$singleQuote)) + $singleQuote; $expectedArguments='-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ' + [char]34 + '& ' + $launcherLiteral + ' startup' + [char]34; $actualTarget=[IO.Path]::GetFullPath($s.TargetPath); $actualWork=[IO.Path]::GetFullPath($s.WorkingDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar,[IO.Path]::AltDirectorySeparatorChar); if (-not [string]::Equals($actualTarget,$expectedTarget,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($actualWork,$expectedWork,[StringComparison]::OrdinalIgnoreCase) -or -not [string]::Equals($s.Arguments,$expectedArguments,[StringComparison]::OrdinalIgnoreCase)) { exit 1 }"
 if errorlevel 1 (
   echo [LOI] LNK autostart khong khop exact CURRENT repo launcher/working directory.
   exit /b 1
