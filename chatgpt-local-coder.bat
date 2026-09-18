@@ -184,7 +184,8 @@ call :ensure_autostart
 if errorlevel 1 exit /b 1
 exit /b 0
 :autostart_off
-set "LNK=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\ChatGPT Local Coder Manager.lnk"
+if defined CLC_STARTUP_DIR (set "STARTUP=%CLC_STARTUP_DIR%") else (set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup")
+set "LNK=%STARTUP%\ChatGPT Local Coder Manager.lnk"
 if exist "%LNK%" (
   del /q "%LNK%" >nul 2>nul
   if errorlevel 1 (
@@ -227,7 +228,9 @@ exit /b 0
 REM =====================================================================
 :ensure_autostart
 REM =====================================================================
-set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+if defined CLC_STARTUP_DIR (set "STARTUP=%CLC_STARTUP_DIR%") else (set "STARTUP=%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup")
+if not exist "%STARTUP%" mkdir "%STARTUP%"
+if errorlevel 1 exit /b 1
 set "LNK=%STARTUP%\ChatGPT Local Coder Manager.lnk"
 set "CLC_AUTOSTART_LNK=%LNK%"
 set "CLC_AUTOSTART_TARGET=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"

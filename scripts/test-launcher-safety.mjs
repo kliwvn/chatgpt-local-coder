@@ -145,6 +145,11 @@ assert.match(
 );
 assert.match(
   source,
+  /if defined CLC_STARTUP_DIR \(set "STARTUP=%CLC_STARTUP_DIR%"\) else \(set "STARTUP=%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"\)/i,
+  "launcher must isolate only the legacy Startup-link directory without overriding APPDATA for child processes",
+);
+assert.match(
+  source,
   /:manager_running[\s\S]{0,520}?Invoke-RestMethod[\s\S]{0,320}?\$r\.ok -eq \$true[\s\S]{0,180}?\$r\.name -eq 'chatgpt-local-coder-manager'/,
   "launcher Manager detection must require the Local Coder Manager health identity, not any HTTP 200 occupant",
 );

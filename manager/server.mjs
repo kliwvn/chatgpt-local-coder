@@ -100,8 +100,10 @@ const LAUNCHER_BAT = path.join(ROOT, "chatgpt-local-coder.bat");
 const MANAGER_HIDDEN_VBS = path.join(STATE_DIR, "manager-hidden.vbs"); // chỉ dọn legacy
 const STARTUP_LNK = IS_WIN
   ? path.join(
-      process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"),
-      "Microsoft", "Windows", "Start Menu", "Programs", "Startup",
+      process.env.CLC_STARTUP_DIR || path.join(
+        process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming"),
+        "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
+      ),
       "ChatGPT Local Coder Manager.lnk"
     )
   : path.join(ROOT, ".autostart");
