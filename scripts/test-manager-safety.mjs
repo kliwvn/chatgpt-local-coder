@@ -211,6 +211,10 @@ try {
   if (!listing) throw new Error(`manager did not start: ${managerOutput}`);
   const managerHealth = (await api("/api/health")).body;
   assert.equal(managerHealth.ok, true);
+  const instanceCatalog = (await api("/api/instance-catalog")).body;
+  assert.equal(instanceCatalog.ok, true);
+  assert.deepEqual(instanceCatalog.instances.map((entry) => entry.name).sort(), listing.instances.map((entry) => entry.name).sort(), "lightweight instance catalog must preserve managed instance names");
+  assert.ok(instanceCatalog.instances.every((entry) => Object.keys(entry).length === 1 && typeof entry.name === "string"), "instance catalog must not include runtime diagnostics or config payloads");
   assert.equal(managerHealth.artifactDrift, false, "fresh Manager process must not report its own runtime as stale");
   assert.ok(Number.isInteger(managerHealth.pid) && managerHealth.pid > 0);
   assert.ok(item);

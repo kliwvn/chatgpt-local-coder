@@ -6315,6 +6315,10 @@ async function handleApi(req, res, url, body, instanceAdmission = null) {
     const conflict = catalogMutationConflict(instanceAdmission.name);
     if (conflict) return json(res, 200, conflict);
   }
+  if (req.method === "GET" && p === "/api/instance-catalog") {
+    const names = await listInstances();
+    return json(res, 200, { ok: true, instances: names.map((name) => ({ name })) });
+  }
   if (req.method === "GET" && p === "/api/instances") {
     const names = await listInstances();
     const [instances, manager] = await Promise.all([
