@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
-import { getWorkspaceRoots, setWorkspaceRoots, validateContextReadPath, validatePath } from "./path-security.js";
+import { validateContextReadPath, validatePathWithinRoots } from "./path-security.js";
 import { readUtf8FilePrefix } from "./bounded-file.js";
 
 const ROOT_MEMORY_FILES = [
@@ -114,7 +114,8 @@ async function readTextLimited(
   filePath: string,
   maxBytes: number,
   maxLines: number,
-  kind: ProjectMemorySection["kind"]
+  kind: ProjectMemorySection["kind"],
+  workspaceRoots: string[]
 ): Promise<ProjectMemorySection | null> {
   try {
     // User-level memory is an explicit trusted source outside the project, but its
@@ -123,7 +124,7 @@ async function readTextLimited(
     // the normal workspace sandbox.
     const resolvedPath = kind === "user"
       ? await validateUserMemoryEntrypoint(filePath)
-      : await validatePath(filePath);
+      : await validatePathWithinRoots(filePath, workspaceRoots);
     let sourceText: string;
     let sourceTruncated = false;
     if (Number.isFinite(maxBytes)) {
@@ -140,7 +141,8 @@ async function readTextLimited(
       full,
       path.dirname(resolvedPath),
       kind === "user" ? "context" : "workspace",
-      maxBytes
+      maxBytes,
+      workspaceRoots
     );
     full = expanded.content;
 
@@ -175,10 +177,11 @@ async function expandImportsInContent(
   content: string,
   baseDir: string,
   importScope: ImportScope,
-  maxBytes: number
+  maxBytes: number,
+  workspaceRoots: string[]
 ): Promise<{ content: string; truncated: boolean }> {
   const visited = new Set<string>();
-  return expandMemoryImportsAsync(content, baseDir, visited, 0, importScope, maxBytes);
+  return expandMemoryImportsAsync(content, baseDir, visited, 0, importScope, maxBytes, workspaceRoots);
 }
 
 async function expandMemoryImportsAsync(
@@ -187,7 +190,8 @@ async function expandMemoryImportsAsync(
   visited: Set<string>,
   depth: number,
   importScope: ImportScope,
-  maxBytes: number
+  maxBytes: number,
+  workspaceRoots: string[]
 ): Promise<{ content: string; truncated: boolean }> {
   if (depth >= IMPORT_MAX_DEPTH) {
     const clipped = truncateUtf8Text(content, maxBytes);
@@ -250,7 +254,7 @@ async function expandMemoryImportsAsync(
     try {
       resolved = importScope === "context"
         ? await validateContextReadPath(resolved)
-        : await validatePath(resolved);
+        : await validatePathWithinRoots(resolved, workspaceRoots);
     } catch {
       const blocked = importScope === "context"
         ? "<!-- import blocked: outside canonical Global Harness context -->"
@@ -281,7 +285,8 @@ async function expandMemoryImportsAsync(
         visited,
         depth + 1,
         importScope,
-        remaining
+        remaining,
+        workspaceRoots
       );
       if (!append(`<!-- @import ${resolved} -->`)) break;
       if (!append(expanded.content)) break;
@@ -350,14 +355,16 @@ async function appendSection(
   maxBytes: number,
   maxLines: number,
   filePath: string,
-  kind: ProjectMemorySection["kind"]
+  kind: ProjectMemorySection["kind"],
+  workspaceRoots: string[]
 ): Promise<void> {
   if (totalBytes.value >= maxBytes) return;
   const section = await readTextLimited(
     filePath,
     maxBytes - totalBytes.value,
     maxLines,
-    kind
+    kind,
+    workspaceRoots
   );
   if (!section?.content) return;
   sections.push(section);
@@ -376,40 +383,34 @@ export async function loadProjectMemory(
   const sections: ProjectMemorySection[] = [];
   const totalBytes = { value: 0 };
 
-  // The workspaceRoots option is the sandbox boundary for this load: swap it into
-  // path-security for the duration so project/rules files and @imports are validated
-  // against exactly these roots, then restore the process-wide roots.
-  const previousRoots = getWorkspaceRoots();
-  setWorkspaceRoots(workspace_roots);
-  try {
-    if (opts?.includeUserMemory !== false) {
-      for (const userPath of USER_MEMORY_CANDIDATES) {
-        if (!(await fileExists(userPath))) continue;
-        await appendSection(sections, totalBytes, maxBytes, maxLines, userPath, "user");
-        break;
-      }
+  // workspaceRoots is a request-local context boundary. Never mutate the
+  // process-global path-security roots while an async load is in flight: this
+  // server serves multiple MCP sessions concurrently.
+  if (opts?.includeUserMemory !== false) {
+    for (const userPath of USER_MEMORY_CANDIDATES) {
+      if (!(await fileExists(userPath))) continue;
+      await appendSection(sections, totalBytes, maxBytes, maxLines, userPath, "user", workspace_roots);
+      break;
     }
+  }
 
-    for (const rel of ROOT_MEMORY_FILES) {
-      const filePath = path.join(root, rel);
-      if (!(await fileExists(filePath))) continue;
-      await appendSection(sections, totalBytes, maxBytes, maxLines, filePath, "project");
-    }
+  for (const rel of ROOT_MEMORY_FILES) {
+    const filePath = path.join(root, rel);
+    if (!(await fileExists(filePath))) continue;
+    await appendSection(sections, totalBytes, maxBytes, maxLines, filePath, "project", workspace_roots);
+  }
 
-    const rulesDir = path.join(root, ".claude", "rules");
-    if (totalBytes.value < maxBytes && (await fileExists(rulesDir))) {
-      try {
-        const safeRulesDir = await validatePath(rulesDir);
-        for (const ruleFile of await listUnconditionalRuleFiles(safeRulesDir)) {
-          await appendSection(sections, totalBytes, maxBytes, maxLines, ruleFile, "rule");
-        }
-      } catch {
-        // A project-controlled rules symlink/junction outside the configured roots
-        // is intentionally ignored when the path sandbox is enabled.
+  const rulesDir = path.join(root, ".claude", "rules");
+  if (totalBytes.value < maxBytes && (await fileExists(rulesDir))) {
+    try {
+      const safeRulesDir = await validatePathWithinRoots(rulesDir, workspace_roots);
+      for (const ruleFile of await listUnconditionalRuleFiles(safeRulesDir)) {
+        await appendSection(sections, totalBytes, maxBytes, maxLines, ruleFile, "rule", workspace_roots);
       }
+    } catch {
+      // A project-controlled rules symlink/junction outside the request-local
+      // project roots is intentionally ignored in every permission profile.
     }
-  } finally {
-    setWorkspaceRoots(previousRoots);
   }
 
   return {

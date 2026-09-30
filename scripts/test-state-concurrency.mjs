@@ -2,6 +2,20 @@
 import os from "node:os";
 import path from "node:path";
 
+async function removeTempBounded(dir) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const transient = ["EBUSY", "ENOTEMPTY", "EPERM", "EACCES"].includes(error?.code);
+      if (!transient || Date.now() >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+}
+
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-state-concurrency-"));
 try {
   const { enqueueKeyedMutation } = await import("../dist/lib/keyed-mutation.js");
@@ -23,6 +37,38 @@ try {
     throw new Error(`keyed mutation order broken: ${mutationOrder.join(",")}`);
   }
   if (mutationChains.size !== 0) throw new Error(`keyed mutation retained settled keys: ${mutationChains.size}`);
+
+  // Project-memory loads are per-request reads. They must never narrow the
+  // process-global workspace authority while an async load is in flight, or a
+  // concurrent MCP session can observe another session's temporary roots.
+  const pathSecurity = await import("../dist/lib/path-security.js");
+  const projectMemory = await import("../dist/lib/project-memory.js");
+  const memoryRootA = path.join(root, "memory-root-a");
+  const memoryRootB = path.join(root, "memory-root-b");
+  await fs.mkdir(memoryRootA, { recursive: true });
+  await fs.mkdir(memoryRootB, { recursive: true });
+  await fs.writeFile(path.join(memoryRootA, "AGENTS.md"), "root-a\n");
+  await fs.writeFile(path.join(memoryRootB, "sentinel.txt"), "root-b\n");
+  process.env.FULL_DISK_ACCESS = "false";
+  pathSecurity.setDefaultCwd(memoryRootA);
+  pathSecurity.setWorkspaceRoots([memoryRootA, memoryRootB]);
+  const rootsBeforeMemoryLoad = pathSecurity.getWorkspaceRoots().map((value) => path.normalize(value));
+  const inFlightMemoryLoad = projectMemory.loadProjectMemory(memoryRootA, {
+    workspaceRoots: [memoryRootA],
+    includeUserMemory: false,
+  });
+  const rootsDuringMemoryLoad = pathSecurity.getWorkspaceRoots().map((value) => path.normalize(value));
+  if (rootsDuringMemoryLoad.join("|") !== rootsBeforeMemoryLoad.join("|")) {
+    throw new Error(
+      `project-memory load leaked request-local workspace roots into process-global state: ${rootsDuringMemoryLoad.join("|")}`
+    );
+  }
+  await pathSecurity.validatePath(path.join(memoryRootB, "sentinel.txt"));
+  await inFlightMemoryLoad;
+  const rootsAfterMemoryLoad = pathSecurity.getWorkspaceRoots().map((value) => path.normalize(value));
+  if (rootsAfterMemoryLoad.join("|") !== rootsBeforeMemoryLoad.join("|")) {
+    throw new Error(`project-memory load failed to preserve process-global workspace roots: ${rootsAfterMemoryLoad.join("|")}`);
+  }
 
   process.env.CHECKPOINT_PATH = path.join(root, "checkpoints");
   process.env.CHECKPOINT_ENABLED = "true";
@@ -124,5 +170,8 @@ try {
 
   console.log("state-concurrency: ok (keyed queues release, checkpoint 30/30, rewind/edit no-deadlock, memory concurrent+bounded-recent, shell recent 20/20)");
 } finally {
-  await fs.rm(root, { recursive: true, force: true });
+  // Windows AV/indexers can briefly retain directory entries after the state
+  // writers have closed their files. Retry only the known transient cleanup
+  // errors; all concurrency assertions above remain unchanged.
+  await removeTempBounded(root);
 }

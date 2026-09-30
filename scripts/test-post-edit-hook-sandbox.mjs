@@ -4,9 +4,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// Temp base derives from the repo itself, never WORKSPACE_PATH: that env value
-// can be a placeholder or point outside the test's control.
-const testBase = path.resolve(repoRoot, "..");
+// Prefer the configured workspace for AppContainer fixtures so ServiceHub's
+// nested runtime checkout does not add unrelated ancestor-traversal denials.
+// Standalone runs without an absolute configured workspace retain the repo
+// parent fallback.
+const configuredWorkspace = process.env.WORKSPACE_PATH?.trim();
+const testBase = configuredWorkspace && path.isAbsolute(configuredWorkspace)
+  ? path.resolve(configuredWorkspace)
+  : path.resolve(repoRoot, "..");
 const root = await fs.mkdtemp(path.join(testBase, "clc-hook-sandbox-"));
 const outside = await fs.mkdtemp(path.join(testBase, "clc-hook-outside-"));
 const target = path.join(root, "edited.txt");

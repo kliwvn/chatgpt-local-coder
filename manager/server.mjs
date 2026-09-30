@@ -30,7 +30,7 @@ import { randomUUID } from "node:crypto";
 import { copyTruncateLogFile, isSecretKeyName, redactSensitiveLogText, rotateLogFile, scrubLogFile, tailFile } from "./log-utils.mjs";
 import { recycleManagedDirectory } from "./safe-delete.mjs";
 import { preserveLegacySandboxPolicyManifest, reconcileLegacyRuntimeDirectory, reconcileLegacyShellStateDirectory } from "./runtime-state.mjs";
-import { evaluateOpenAiTunnelLaunchState, legacyOpenAiTunnelLaunchFingerprintV1, legacyPidFileMatchesProcessStart, openAiTunnelLaunchFingerprint, waitForTunnelPortRelease } from "./tunnel-state.mjs";
+import { evaluateOpenAiTunnelControlPlaneFreshness, evaluateOpenAiTunnelLaunchState, evaluateOpenAiTunnelRecoveryCandidate, legacyOpenAiTunnelLaunchFingerprintV1, legacyPidFileMatchesProcessStart, openAiTunnelLaunchFingerprint, waitForTunnelPortRelease } from "./tunnel-state.mjs";
 import { configuredPrimaryWorkspaceRootsFromEnv, configuredWorkspaceRootsFromEnv } from "./workspace-scope.mjs";
 import { autoStartInstances, DEFAULT_AUTO_START_CONCURRENCY } from "./autostart-policy.mjs";
 import {
@@ -41,8 +41,10 @@ import {
 } from "./tunnel-runtime.mjs";
 import {
   atomicWriteFile,
+  atomicWriteSecretFile,
   enqueueKeyedMutation,
   pruneExpiredCache,
+  readResponseLineByPrefixBounded,
   readUtf8FileBounded,
   readResponseTextBounded,
   retryTransientFsMutation,
@@ -307,18 +309,47 @@ const ENV_LINE_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
 /* Secret keys masked on the wire. ADMIN_TOKEN also gates the instance admin
  * API, so it must never reach the browser either. */
 const MASK_SENTINEL = "********";
+const MANAGER_HEALTH_METADATA_CACHE_MS = 1500;
+let managerRuntimeStatusCache = { at: 0, value: null, pending: null };
 
 function isSecretKey(key) { return isSecretKeyName(key); }
 
-async function managerRuntimeStatus() {
-  const stats = await Promise.all(MANAGER_RUNTIME_FILES.map((file) => fsp.stat(file).catch(() => null)));
-  const newestMtimeMs = stats.reduce((max, stat) => Math.max(max, Number(stat?.mtimeMs) || 0), 0);
-  const loadedAt = new Date(MANAGER_LOADED_AT_MS).toISOString();
-  return {
-    pid: process.pid,
-    loadedAt,
-    artifactDrift: isRuntimeArtifactStale(loadedAt, newestMtimeMs || Number.NaN),
-  };
+async function managerRuntimeStatus(force = false) {
+  const now = Date.now();
+  if (!force && managerRuntimeStatusCache.value && now - managerRuntimeStatusCache.at < MANAGER_HEALTH_METADATA_CACHE_MS) {
+    return managerRuntimeStatusCache.value;
+  }
+  if (!force && managerRuntimeStatusCache.pending) return managerRuntimeStatusCache.pending;
+
+  const pending = (async () => {
+    const stats = await Promise.all(MANAGER_RUNTIME_FILES.map((file) => fsp.stat(file).catch(() => null)));
+    const newestMtimeMs = stats.reduce((max, stat) => Math.max(max, Number(stat?.mtimeMs) || 0), 0);
+    const loadedAt = new Date(MANAGER_LOADED_AT_MS).toISOString();
+    return {
+      pid: process.pid,
+      loadedAt,
+      artifactDrift: isRuntimeArtifactStale(loadedAt, newestMtimeMs || Number.NaN),
+      runtime_authority: {
+        source_root: ROOT,
+        state_dir: STATE_DIR,
+        instances_dir: INSTANCES_DIR,
+      },
+      runtime_identity: {
+        exec_path: process.execPath,
+        argv: process.argv.slice(1),
+        cwd: process.cwd(),
+      },
+    };
+  })();
+  managerRuntimeStatusCache.pending = pending;
+  try {
+    const value = await pending;
+    managerRuntimeStatusCache.value = value;
+    managerRuntimeStatusCache.at = Date.now();
+    return value;
+  } finally {
+    if (managerRuntimeStatusCache.pending === pending) managerRuntimeStatusCache.pending = null;
+  }
 }
 
 /* ---------------- manager self-restart ---------------- */
@@ -353,6 +384,37 @@ let sandboxCompatibilityChain = Promise.resolve();
 const cancelledBootAutoStart = new Set();
 const serverStartInFlight = new Map();
 const serverRestartInFlight = new Map();
+// Boot autoStart is intentionally bounded, but an autoStart Server that dies
+// later must not remain unavailable until the next Manager restart. Keep this
+// post-boot availability supervisor separate from drift reconciliation:
+// - it may start only a truly absent Server;
+// - it never restarts/kills a live Server;
+// - explicit Stop suppresses recovery until an explicit Start/Restart.
+const serverRecoverySuppressed = new Set();
+const serverRecoveryInFlight = new Map();
+const serverRecoveryRetryAfter = new Map();
+const serverRecoveryIntervalRaw = Number(process.env.MANAGER_SERVER_RECOVERY_INTERVAL_MS || 3000);
+const SERVER_RECOVERY_INTERVAL_MS = Number.isFinite(serverRecoveryIntervalRaw)
+  ? Math.min(60000, Math.max(250, Math.trunc(serverRecoveryIntervalRaw)))
+  : 3000;
+const SERVER_RECOVERY_RETRY_COOLDOWN_MS = 15000;
+let serverRecoveryTimer = null;
+const tunnelRecoverySuppressed = new Set();
+const tunnelRecoveryInFlight = new Map();
+const tunnelRecoveryRetryAfter = new Map();
+const tunnelRecoveryIntervalRaw = Number(process.env.MANAGER_TUNNEL_RECOVERY_INTERVAL_MS || 5000);
+const TUNNEL_RECOVERY_INTERVAL_MS = Number.isFinite(tunnelRecoveryIntervalRaw)
+  ? Math.min(60000, Math.max(1000, Math.trunc(tunnelRecoveryIntervalRaw)))
+  : 5000;
+const TUNNEL_RECOVERY_RETRY_COOLDOWN_MS = 60000;
+const TUNNEL_RECOVERY_CONFIRMATIONS = 3;
+const TUNNEL_RECOVERY_CONFIRM_INTERVAL_MS = 1000;
+let tunnelRecoveryTimer = null;
+const OPENAI_TUNNEL_POLL_TIMEOUT = "10s";
+const OPENAI_TUNNEL_POLL_DEADLINE_GUARDRAIL = "2s";
+const OPENAI_TUNNEL_CONTROL_PLANE_STALE_MS = 36000;
+const OPENAI_TUNNEL_METRICS_TIMEOUT_MS = 2500;
+const OPENAI_TUNNEL_METRICS_SCAN_MAX_BYTES = 1024 * 1024;
 // Keep the legacy env key for backward compatibility, but this timer is now an
 // observation-only maintenance detector. It must never auto-restart healthy service.
 const staleConfigObserveIntervalRaw = Number(process.env.MANAGER_STALE_CONFIG_RECONCILE_INTERVAL_MS || 5000);
@@ -443,6 +505,7 @@ async function requestManagerRestart() {
   await rotateLogFile(MANAGER_LOG).catch(() => {});
   console.log(`[Manager] Restart theo yêu cầu (token ${token.slice(0, 8)}…) — spawn bản mới, giữ nguyên instance.`);
   let replacementPid = null;
+  let replacementIdentity = null;
   try {
     replacementPid = spawnDetached(
       process.execPath,
@@ -452,6 +515,18 @@ async function requestManagerRestart() {
     if (!Number.isSafeInteger(replacementPid) || replacementPid <= 0 || !isPidAlive(replacementPid)) {
       throw new Error(`replacement PID is not live/valid: ${replacementPid}`);
     }
+    if (IS_WIN) {
+      const candidate = await tryExactProcessIdentityAsync(replacementPid, { force: true });
+      if (
+        candidate
+        && candidate.pid === replacementPid
+        && sameExecutablePath(candidate.executablePath, process.execPath)
+        && String(candidate.commandLine || "").includes("manager/server.mjs")
+        && String(candidate.commandLine || "").includes(`--restart ${token}`)
+      ) {
+        replacementIdentity = candidate;
+      }
+    }
   } catch (err) {
     managerRestartInFlight = false;
     return {
@@ -459,6 +534,27 @@ async function requestManagerRestart() {
       error: `Không spawn được replacement Manager; Manager hiện tại được giữ nguyên: ${String((err && err.message) || err).slice(0, 300)}`,
     };
   }
+  const stopReplacementIfSameGeneration = async () => {
+    if (!isPidAlive(replacementPid)) return true;
+    if (!IS_WIN) {
+      await killPidTree(replacementPid);
+      return await waitFor(() => !isPidAlive(replacementPid), 3000, 100);
+    }
+    if (!replacementIdentity) return false;
+    const currentIdentity = await exactProcessIdentityForAuthorityAsync(replacementPid);
+    const sameGeneration = Boolean(
+      currentIdentity
+      && currentIdentity.pid === replacementPid
+      && currentIdentity.startedAt === replacementIdentity.startedAt
+      && sameExecutablePath(currentIdentity.executablePath, replacementIdentity.executablePath)
+      && sameExecutablePath(currentIdentity.executablePath, process.execPath)
+      && String(currentIdentity.commandLine || "").includes("manager/server.mjs")
+      && String(currentIdentity.commandLine || "").includes(`--restart ${token}`)
+    );
+    if (!sameGeneration) return false;
+    await killPidTree(replacementPid);
+    return await waitFor(() => !isPidAlive(replacementPid), 3000, 100);
+  };
   const prepared = await waitFor(async () => {
     if (!isPidAlive(replacementPid)) return false;
     try {
@@ -474,10 +570,7 @@ async function requestManagerRestart() {
     }
   }, MANAGER_RESTART_PREPARE_TIMEOUT_MS, 100);
   if (!prepared || !isPidAlive(replacementPid)) {
-    if (isPidAlive(replacementPid)) {
-      await killPidTree(replacementPid);
-      await waitFor(() => !isPidAlive(replacementPid), 3000, 100);
-    }
+    if (isPidAlive(replacementPid)) await stopReplacementIfSameGeneration();
     managerRestartInFlight = false;
     return {
       ok: false,
@@ -541,10 +634,7 @@ async function requestManagerRestart() {
           process.exit(0);
         }
 
-        if (isPidAlive(replacementPid)) {
-          await killPidTree(replacementPid);
-          await waitFor(() => !isPidAlive(replacementPid), 3000, 100);
-        }
+        if (isPidAlive(replacementPid)) await stopReplacementIfSameGeneration();
         managerRestartInFlight = false;
         await reopenOldListener();
         console.error("[Manager] Replacement never proved canonical-port ownership; old Manager stayed alive and attempted listener rollback.");
@@ -564,22 +654,40 @@ async function requestManagerRestart() {
  * runtime state (profile, live hash, dynamic flags) comes from agent_status. */
 const CONTRACT_FIXTURE_PATH = path.join(ROOT, "scripts", "fixtures", "chatgpt-public-contract-v1.json");
 let managerBootId = null;
+let publicContractFingerprintCache = { at: 0, value: undefined, pending: null };
 function getManagerBootId() {
   if (!managerBootId) managerBootId = randomUUID();
   return managerBootId;
 }
-async function publicContractFingerprint() {
+async function publicContractFingerprint(force = false) {
+  const now = Date.now();
+  if (!force && publicContractFingerprintCache.value !== undefined && now - publicContractFingerprintCache.at < MANAGER_HEALTH_METADATA_CACHE_MS) {
+    return publicContractFingerprintCache.value;
+  }
+  if (!force && publicContractFingerprintCache.pending) return publicContractFingerprintCache.pending;
+
+  const pending = (async () => {
+    try {
+      const raw = JSON.parse(await fsp.readFile(CONTRACT_FIXTURE_PATH, "utf8"));
+      return {
+        version: raw.version,
+        hash: raw.hash,
+        tool_count: Array.isArray(raw.tools) ? raw.tools.length : null,
+      };
+    } catch {
+      // Fixture thiếu/hỏng không được làm chết health endpoint; instance-level
+      // self-check (MCP_PUBLIC_CONTRACT_DRIFT) vẫn fail-closed riêng.
+      return null;
+    }
+  })();
+  publicContractFingerprintCache.pending = pending;
   try {
-    const raw = JSON.parse(await fsp.readFile(CONTRACT_FIXTURE_PATH, "utf8"));
-    return {
-      version: raw.version,
-      hash: raw.hash,
-      tool_count: Array.isArray(raw.tools) ? raw.tools.length : null,
-    };
-  } catch {
-    // Fixture thiếu/hỏng không được làm chết health endpoint; instance-level
-    // self-check (MCP_PUBLIC_CONTRACT_DRIFT) vẫn fail-closed riêng.
-    return null;
+    const value = await pending;
+    publicContractFingerprintCache.value = value;
+    publicContractFingerprintCache.at = Date.now();
+    return value;
+  } finally {
+    if (publicContractFingerprintCache.pending === pending) publicContractFingerprintCache.pending = null;
   }
 }
 
@@ -636,13 +744,47 @@ function serializeDotEnv(values, original) {
   return result.join("\n");
 }
 
+function structuredEnvSemantics(values, config = {}) {
+  const normalized = { ...values };
+  const healthPort = Number(values.OPENAI_TUNNEL_HEALTH_PORT || config.healthPort || 8080);
+  normalized.OPENAI_TUNNEL_HEALTH_PORT = String(healthPort);
+  return normalized;
+}
+
+function sameEnvSemantics(a, b) {
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  for (let i = 0; i < aKeys.length; i += 1) {
+    const key = aKeys[i];
+    if (key !== bKeys[i] || String(a[key]) !== String(b[key])) return false;
+  }
+  return true;
+}
+
 const PORT_PID_CACHE_TTL_MS = 2000;
+const PORT_PID_SCAN_TIMEOUT_MS = 30000;
+const PORT_PID_TARGETED_TIMEOUT_MS = 10000;
+const PORT_PID_NETSTAT_FALLBACK_TIMEOUT_MS = 5000;
+const PORT_PID_TARGETED_CACHE_TTL_MS = 60000;
 let portPidCache = { at: 0, pids: new Map() };
 let portPidScanGeneration = 0;
 let portPidScanInFlight = null;
+const targetedPortPidCache = new Map();
+const targetedPortPidInFlight = new Map();
+const targetedPortPidGeneration = new Map();
 function invalidatePortPidCache() {
   portPidCache = { at: 0, pids: new Map() };
+  targetedPortPidCache.clear();
+  targetedPortPidInFlight.clear();
+  targetedPortPidGeneration.clear();
   portPidScanGeneration += 1;
+}
+function invalidateTargetedPortPidCache(port) {
+  const numericPort = Number(port);
+  if (!Number.isInteger(numericPort) || numericPort <= 0 || numericPort > 65535) return;
+  targetedPortPidCache.delete(numericPort);
+  targetedPortPidGeneration.set(numericPort, (targetedPortPidGeneration.get(numericPort) || 0) + 1);
 }
 
 function runNetstatListenerScan(timeoutMs) {
@@ -696,30 +838,20 @@ function runNetstatListenerScan(timeoutMs) {
 async function listeningPortPids() {
   if (Date.now() - portPidCache.at < PORT_PID_CACHE_TTL_MS) return portPidCache.pids;
   // netstat can transiently exceed a few seconds during Windows cold boot or
-  // heavy process churn. Ownership must still fail closed, but a single helper
-  // timeout must not freeze the Manager event loop or turn an unrelated request
-  // into an availability outage. Retry asynchronously with bounded increasing
-  // budgets, coalesce callers observing the same lifecycle generation, and cache
-  // only a successful scan from the still-current generation.
-  const scanTimeouts = [3000, 6000, 10000];
+  // heavy process churn. Repeatedly cold-starting and killing netstat with short
+  // retry budgets multiplies that startup penalty and still fails before one
+  // realistic scan could finish. Use one bounded non-blocking scan, coalesce
+  // callers for the same lifecycle generation, and cache only a successful scan.
   const generation = portPidScanGeneration;
   if (portPidScanInFlight?.generation === generation) return portPidScanInFlight.promise;
 
   const pending = (async () => {
-    const scanFailures = [];
-    let out = null;
-    for (let attempt = 0; attempt < scanTimeouts.length; attempt++) {
-      const timeout = scanTimeouts[attempt];
-      try {
-        out = await runNetstatListenerScan(timeout);
-        break;
-      } catch (err) {
-        const detail = String(err?.message || err || "unknown netstat failure");
-        scanFailures.push(`attempt ${attempt + 1}/${scanTimeouts.length} (${timeout}ms): ${detail.slice(0, 180)}`);
-      }
-    }
-    if (out === null) {
-      throw new Error(`PROCESS_PORT_SCAN_FAILED: netstat listener ownership scan failed after bounded retries: ${scanFailures.join("; ").slice(0, 700)}`);
+    let out;
+    try {
+      out = await runNetstatListenerScan(PORT_PID_SCAN_TIMEOUT_MS);
+    } catch (err) {
+      const detail = String(err?.message || err || "unknown netstat failure").slice(0, 500);
+      throw new Error(`PROCESS_PORT_SCAN_FAILED: netstat listener ownership scan failed: ${detail}`);
     }
 
     const pids = new Map();
@@ -743,8 +875,96 @@ async function listeningPortPids() {
     }
   }
 }
+
+async function netstatPidOnPort(port) {
+  const numericPort = Number(port);
+  if (!Number.isInteger(numericPort) || numericPort <= 0 || numericPort > 65535) return null;
+  const out = await runNetstatListenerScan(PORT_PID_NETSTAT_FALLBACK_TIMEOUT_MS);
+  const owners = new Set();
+  for (const line of out.split(/\r?\n/)) {
+    const m = /^\s*TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/i.exec(line);
+    if (!m || Number(m[1]) !== numericPort) continue;
+    const pid = Number(m[2]);
+    if (Number.isSafeInteger(pid) && pid > 0) owners.add(pid);
+  }
+  if (owners.size > 1) {
+    throw new Error(`ambiguous listener ownership for PORT ${numericPort}: ${[...owners].join(",")}`);
+  }
+  return owners.size === 1 ? [...owners][0] : null;
+}
+
+async function targetedPidOnPort(port) {
+  const numericPort = Number(port);
+  if (!Number.isInteger(numericPort) || numericPort <= 0 || numericPort > 65535) return null;
+  const now = Date.now();
+  pruneExpiredCache(targetedPortPidCache, PORT_PID_TARGETED_CACHE_TTL_MS, now);
+  const hit = targetedPortPidCache.get(numericPort);
+  if (hit) return hit.pid;
+  const generation = portPidScanGeneration;
+  const portGeneration = targetedPortPidGeneration.get(numericPort) || 0;
+  const inFlightKey = `${generation}\u0000${portGeneration}\u0000${numericPort}`;
+  const existing = targetedPortPidInFlight.get(inFlightKey);
+  if (existing) return existing;
+
+  const pending = (async () => {
+    let pid = null;
+    let nativeDetail = "";
+    try {
+      // Native netstat is the steady-state Windows ownership source. In
+      // production Get-NetTCPConnection repeatedly consumed its full 10s budget
+      // while netstat immediately proved the same exact listener PID. Keeping
+      // PowerShell off the hot path avoids WMI/PowerShell helper pressure.
+      pid = await netstatPidOnPort(numericPort);
+    } catch (nativeErr) {
+      nativeDetail = String(nativeErr?.message || nativeErr || "unknown netstat failure").slice(0, 500);
+      const script = [
+        "$ErrorActionPreference='Stop'",
+        `$owners=@(Get-NetTCPConnection -State Listen -LocalPort ${numericPort} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)`,
+        "if ($owners.Count -gt 1) { throw 'ambiguous listener ownership' }",
+        "if ($owners.Count -eq 1) { [string]$owners[0] }",
+      ].join("; ");
+      const result = await runBoundedHelperProcess("powershell.exe", ["-NoProfile", "-Command", script], {
+        timeoutMs: PORT_PID_TARGETED_TIMEOUT_MS,
+        maxOutputChars: 4096,
+      });
+      const fallbackDetail = result.status === 0
+        ? ""
+        : String(result.error || result.stderr || result.stdout || `exit ${result.status ?? "null"}`).trim().slice(-500);
+      const text = result.status === 0 ? String(result.stdout || "").trim() : "";
+      pid = text ? Number(text.split(/\r?\n/).filter(Boolean).at(-1)) : null;
+      if (pid !== null && (!Number.isSafeInteger(pid) || pid <= 0)) {
+        throw new Error(`PROCESS_PORT_PROBE_FAILED: invalid listener PID '${text}' for PORT ${numericPort}`);
+      }
+      if (result.status !== 0) {
+        console.warn(
+          `[manager] PROCESS_PORT_PROBE_FAILED PORT ${numericPort}: native=${nativeDetail}; powershell=${fallbackDetail || "no-owner"}`
+        );
+        pid = null;
+      } else if (pid !== null) {
+        console.warn(
+          `[manager] PROCESS_PORT_PROBE_FALLBACK PORT ${numericPort}: native netstat failed (${nativeDetail}); PowerShell proved PID ${pid}.`
+        );
+      }
+    }
+    if (
+      generation === portPidScanGeneration
+      && portGeneration === (targetedPortPidGeneration.get(numericPort) || 0)
+    ) targetedPortPidCache.set(numericPort, { at: Date.now(), pid });
+    return pid;
+  })();
+
+  targetedPortPidInFlight.set(inFlightKey, pending);
+  try {
+    return await pending;
+  } finally {
+    if (targetedPortPidInFlight.get(inFlightKey) === pending) targetedPortPidInFlight.delete(inFlightKey);
+  }
+}
+
 async function pidOnPort(port) {
-  return (await listeningPortPids()).get(Number(port)) || null;
+  const numericPort = Number(port);
+  if (IS_WIN) return targetedPidOnPort(numericPort);
+  return (await listeningPortPids()).get(numericPort) || null;
 }
 
 async function portsForPid(pid) {
@@ -964,7 +1184,7 @@ async function waitFor(predicate, timeoutMs, intervalMs = 300) {
 }
 
 /** Spawn a detached process; its output goes to logFile so it survives manager exit. */
-function spawnDetached(cmd, args, logFile, extraEnv = null) {
+function spawnDetached(cmd, args, logFile, extraEnv = null, observer = null) {
   const out = fs.openSync(logFile, "a");
   const child = spawn(cmd, args, {
     cwd: ROOT,
@@ -973,7 +1193,35 @@ function spawnDetached(cmd, args, logFile, extraEnv = null) {
     windowsHide: true,
     env: extraEnv ? { ...process.env, ...extraEnv } : undefined,
   });
-  child.on("error", (err) => console.error("[spawnDetached] lỗi:", err.message));
+  child.on("error", (err) => {
+    console.error("[spawnDetached] lỗi:", err.message);
+    if (typeof observer?.onError === "function") {
+      try {
+        observer.onError({ pid: child.pid || null, error: err });
+      } catch (observerErr) {
+        console.warn("[spawnDetached] observer onError failed:", String(observerErr?.message || observerErr).slice(0, 300));
+      }
+    }
+  });
+  if (typeof observer?.onExit === "function") {
+    child.once("exit", (code, signal) => {
+      try {
+        const pending = observer.onExit({
+          pid: child.pid || null,
+          code: Number.isInteger(code) ? code : null,
+          signal: signal || null,
+          at: new Date().toISOString(),
+        });
+        if (pending && typeof pending.catch === "function") {
+          void pending.catch((err) => {
+            console.warn("[spawnDetached] observer onExit failed:", String(err?.message || err).slice(0, 300));
+          });
+        }
+      } catch (observerErr) {
+        console.warn("[spawnDetached] observer onExit failed:", String(observerErr?.message || observerErr).slice(0, 300));
+      }
+    });
+  }
   fs.closeSync(out);
   return child.pid;
 }
@@ -995,6 +1243,7 @@ function instPaths(name) {
     tunnelPid: path.join(dir, "tunnel.pid"),
     profile: path.join(dir, "profile.yaml"),
     serverLog: path.join(dir, "server.log"),
+    serverLifecycleLog: path.join(dir, "server-lifecycle.jsonl"),
     tunnelLog: path.join(dir, "tunnel.log"),
   };
 }
@@ -1109,7 +1358,7 @@ async function migrateLegacyRuntimeState(name, env, inst) {
         const rawEnv = await readInstanceEnvRaw(name);
         const current = parseDotEnv(rawEnv);
         if (!isLegacyRuntimeStateValue(current[item.envKey], item.legacy)) return;
-        await atomicWriteFile(inst.env, serializeDotEnv({ [item.envKey]: null }, rawEnv), "utf8");
+        await atomicWriteSecretFile(inst.env, serializeDotEnv({ [item.envKey]: null }, rawEnv), "utf8");
       });
       delete env[item.envKey];
     }
@@ -1206,6 +1455,7 @@ async function readServerLaunchEvidence(name) {
     return {
       serverLaunchPid: Number(config?.serverLaunchPid) || null,
       serverLaunchPort: Number(config?.serverLaunchPort) || null,
+      serverLaunchBootId: String(config?.serverLaunchBootId || "").trim() || null,
       available: true,
       error: null,
     };
@@ -1219,6 +1469,7 @@ async function readServerLaunchEvidence(name) {
     return {
       serverLaunchPid: null,
       serverLaunchPort: null,
+      serverLaunchBootId: null,
       available: false,
       error: err instanceof Error ? err.message : String(err),
     };
@@ -1251,6 +1502,7 @@ function publicInstanceConfig(config) {
 function clearServerLaunchEvidence(config) {
   delete config.serverLaunchPid;
   delete config.serverLaunchPort;
+  delete config.serverLaunchBootId;
 }
 
 function clearTunnelLaunchEvidence(config) {
@@ -1528,7 +1780,7 @@ async function ensureInstances() {
     marker: path.join(stageDir, ".legacy-instance-migration-v1.json"),
   };
   await fsp.mkdir(stageDir, { recursive: false });
-  await atomicWriteFile(staged.env, legacyEnv, "utf8");
+  await atomicWriteSecretFile(staged.env, legacyEnv, "utf8");
   const inst = instPaths("default");
   const legacyConfig = await readConfig();
   const legacyParsed = parseDotEnv(legacyEnv);
@@ -1587,27 +1839,34 @@ async function ensureInstances() {
 }
 
 
-/** Cache kết quả quét PID ngắn (2s) — tránh spawn powershell.exe liên tục
- *  khi UI gọi /api/instances (mỗi instance 1-2 lần quét mỗi request). */
+/** Cache process-identity snapshot theo image trong 10s — nhiều instance/profile
+ *  cùng dùng một OS scan, rồi filter CommandLine trong Node. Lifecycle mutation
+ *  luôn invalidate generation nên cache không được cấp authority qua mutation. */
 const pidScanCache = new Map();
 const pidScanInFlight = new Map();
+const exactPidIdentityCache = new Map();
+const exactPidIdentityInFlight = new Map();
 let pidScanGeneration = 0;
-const PID_SCAN_TTL_MS = 2000;
+const PID_SCAN_TTL_MS = 10000;
+const PROCESS_IDENTITY_SCAN_TIMEOUT_MS = 8000;
+const EXACT_PID_IDENTITY_TTL_MS = 2000;
+const EXACT_PID_IDENTITY_TIMEOUT_MS = 3000;
 function invalidateProcessScanCache() {
   pidScanCache.clear();
+  exactPidIdentityCache.clear();
   pidScanGeneration += 1;
 }
 
-function processIdentityScanKey(imageName, substring) {
-  return `${imageName}\u0000${substring}`;
+function processIdentityScanKey(imageName) {
+  return String(imageName || "").toLowerCase();
 }
 
-function processIdentityPowerShellArgs(imageName, substring) {
-  const needle = String(substring).replace(/'/g, "''");
+function processIdentityPowerShellArgs(imageName) {
+  const processName = String(imageName || "").replace(/\.exe$/i, "").replace(/'/g, "''");
   return [
     "-NoProfile",
     "-Command",
-    `$ErrorActionPreference='Stop'; Get-CimInstance Win32_Process -Filter "Name='${imageName}'" | Where-Object { $_.CommandLine -like '*${needle}*' } | ForEach-Object { [string]$_.ProcessId + '|' + $_.CreationDate.ToUniversalTime().ToString('o') + '|' + [string]$_.ExecutablePath }`,
+    `$ErrorActionPreference='Stop'; $candidates=@(Get-Process -Name '${processName}' -ErrorAction SilentlyContinue); if ($candidates.Count -eq 0) { exit 0 }; $candidates | ForEach-Object { $processId=[int]$_.Id; $p=Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction Stop; if ($null -ne $p) { $exe=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.ExecutablePath)); $cmd=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine)); [string]$p.ProcessId + '|' + $p.CreationDate.ToUniversalTime().ToString('o') + '|' + $exe + '|' + $cmd } }`,
   ];
 }
 
@@ -1617,36 +1876,166 @@ function parseProcessIdentityScanOutput(output) {
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
-      const [pidRaw, startedAtRaw, executablePathRaw] = line.split("|", 3);
+      const [pidRaw, startedAtRaw, executablePathBase64, commandLineBase64] = line.split("|", 4);
       const pid = Number(pidRaw);
       const startedAt = String(startedAtRaw || "");
-      const executablePath = String(executablePathRaw || "").trim();
+      const executablePath = executablePathBase64 ? Buffer.from(executablePathBase64, "base64").toString("utf8").trim() : "";
+      const commandLine = commandLineBase64 ? Buffer.from(commandLineBase64, "base64").toString("utf8") : "";
       if (!Number.isInteger(pid) || pid <= 0 || !Number.isFinite(Date.parse(startedAt)) || !executablePath) {
         throw new Error("malformed PID/CreationDate/ExecutablePath record");
       }
-      return { pid, startedAt, executablePath };
+      return { pid, startedAt, executablePath, commandLine };
     });
+}
+
+function exactProcessIdentityPowerShellArgs(pid) {
+  const processId = Number(pid);
+  if (!Number.isSafeInteger(processId) || processId <= 0) {
+    throw new Error(`invalid exact process PID: ${pid}`);
+  }
+  return [
+    "-NoProfile",
+    "-Command",
+    `$ErrorActionPreference='Stop'; $p=Get-CimInstance Win32_Process -Filter "ProcessId=${processId}" -ErrorAction Stop; if ($null -eq $p) { exit 0 }; $exe=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.ExecutablePath)); $cmd=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine)); [string]$p.ProcessId + '|' + $p.CreationDate.ToUniversalTime().ToString('o') + '|' + $exe + '|' + $cmd`,
+  ];
+}
+
+async function exactProcessIdentityAsync(pid, { force = false } = {}) {
+  const processId = Number(pid);
+  if (!IS_WIN || !Number.isSafeInteger(processId) || processId <= 0 || !isPidAlive(processId)) return null;
+  const now = Date.now();
+  pruneExpiredCache(exactPidIdentityCache, EXACT_PID_IDENTITY_TTL_MS, now);
+  if (!force) {
+    const hit = exactPidIdentityCache.get(processId);
+    if (hit) return hit.identity;
+  }
+
+  const generation = pidScanGeneration;
+  // A destructive authority check must never join a query that may have begun
+  // before the caller observed the target PID. PID reuse is rare but real on
+  // Windows; a cached/in-flight CreationDate for the previous owner of the same
+  // numeric PID must not authorize killing the replacement process.
+  const key = `${generation}\u0000${processId}`;
+  if (!force) {
+    const existing = exactPidIdentityInFlight.get(key);
+    if (existing) return await existing;
+  }
+
+  const pending = new Promise((resolve, reject) => {
+    const child = spawn("powershell.exe", exactProcessIdentityPowerShellArgs(processId), {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const maxBytes = 64 * 1024;
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let timer = null;
+    const finish = (err, identity = null) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (err) reject(err);
+      else resolve(identity);
+    };
+    const appendBounded = (current, chunk, label) => {
+      const next = current + String(chunk || "");
+      if (Buffer.byteLength(next, "utf8") > maxBytes) {
+        try { child.kill("SIGKILL"); } catch {}
+        finish(new Error(`PROCESS_IDENTITY_SCAN_FAILED: exact PID ${processId} ${label} exceeded ${maxBytes} bytes`));
+        return current;
+      }
+      return next;
+    };
+    child.stdout.on("data", (chunk) => { stdout = appendBounded(stdout, chunk, "stdout"); });
+    child.stderr.on("data", (chunk) => { stderr = appendBounded(stderr, chunk, "stderr"); });
+    child.once("error", (err) => finish(new Error(`PROCESS_IDENTITY_SCAN_FAILED: exact PID ${processId}: ${String(err?.message || err)}`)));
+    child.once("close", (code, signal) => {
+      if (settled) return;
+      if (code !== 0) {
+        const detail = String(stderr || stdout || `exit ${code ?? "null"}${signal ? ` signal=${signal}` : ""}`).trim().slice(-300);
+        finish(new Error(`PROCESS_IDENTITY_SCAN_FAILED: exact PID ${processId}: ${detail}`));
+        return;
+      }
+      try {
+        const identities = parseProcessIdentityScanOutput(stdout);
+        if (identities.length > 1) throw new Error(`exact PID ${processId} returned multiple records`);
+        const identity = identities[0] || null;
+        if (identity && identity.pid !== processId) throw new Error(`exact PID ${processId} returned PID ${identity.pid}`);
+        if (generation === pidScanGeneration) {
+          exactPidIdentityCache.set(processId, { at: Date.now(), identity });
+        }
+        finish(null, identity);
+      } catch (err) {
+        finish(new Error(`PROCESS_IDENTITY_SCAN_FAILED: exact PID ${processId}: ${String(err?.message || err)}`));
+      }
+    });
+    timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish(new Error(`PROCESS_IDENTITY_SCAN_FAILED: exact PID ${processId} timed out after ${EXACT_PID_IDENTITY_TIMEOUT_MS}ms`));
+    }, EXACT_PID_IDENTITY_TIMEOUT_MS);
+    timer.unref?.();
+  });
+
+  if (!force) exactPidIdentityInFlight.set(key, pending);
+  try {
+    return await pending;
+  } finally {
+    if (!force && exactPidIdentityInFlight.get(key) === pending) exactPidIdentityInFlight.delete(key);
+  }
+}
+
+async function tryExactProcessIdentityAsync(pid, options = {}) {
+  try {
+    return await exactProcessIdentityAsync(pid, options);
+  } catch {
+    return null;
+  }
+}
+
+async function exactProcessIdentityForAuthorityAsync(pid, { attempts = 3 } = {}) {
+  const processId = Number(pid);
+  if (!IS_WIN || !Number.isSafeInteger(processId) || processId <= 0 || !isPidAlive(processId)) return null;
+  const maxAttempts = Math.max(1, Math.min(3, Number(attempts) || 1));
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    // Each attempt is an independent uncached exact-PID query. Never replace
+    // this with the shared image snapshot/cache: destructive authority must be
+    // bound to the process generation observed at this boundary.
+    const identity = await tryExactProcessIdentityAsync(processId, { force: true });
+    if (identity || !isPidAlive(processId)) return identity;
+    if (attempt + 1 < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+  }
+  return null;
+}
+
+function filterProcessIdentitySnapshot(processes, substring) {
+  const needle = String(substring || "").toLowerCase();
+  return processes
+    .filter((process) => !needle || String(process.commandLine || "").toLowerCase().includes(needle))
+    .map(({ pid, startedAt, executablePath }) => ({ pid, startedAt, executablePath }));
 }
 
 /**
  * Async variant for HTTP/lifecycle hot paths. Windows CIM can take seconds under
  * process churn; using spawnSync here used to freeze the entire Manager event loop
  * and make unrelated health/control requests time out. Share one in-flight query
- * per exact identity filter and keep the same fail-closed/cache semantics.
+ * per image snapshot, then filter CommandLine in Node while keeping fail-closed/cache semantics.
  */
 async function processesWithCmdLineAsync(imageName, substring) {
   const now = Date.now();
   pruneExpiredCache(pidScanCache, PID_SCAN_TTL_MS, now);
-  const key = processIdentityScanKey(imageName, substring);
+  const key = processIdentityScanKey(imageName);
   const hit = pidScanCache.get(key);
-  if (hit) return hit.processes;
+  if (hit) return filterProcessIdentitySnapshot(hit.processes, substring);
   const generation = pidScanGeneration;
   const inFlightKey = `${generation}\u0000${key}`;
   const existing = pidScanInFlight.get(inFlightKey);
-  if (existing) return existing;
+  if (existing) return filterProcessIdentitySnapshot(await existing, substring);
 
   const pending = new Promise((resolve, reject) => {
-    const child = spawn("powershell.exe", processIdentityPowerShellArgs(imageName, substring), {
+    const child = spawn("powershell.exe", processIdentityPowerShellArgs(imageName), {
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -1701,14 +2090,14 @@ async function processesWithCmdLineAsync(imageName, substring) {
 
     timer = setTimeout(() => {
       try { child.kill("SIGKILL"); } catch {}
-      finish(new Error("PROCESS_IDENTITY_SCAN_FAILED: process identity scan timed out after 15000ms"));
-    }, 15000);
+      finish(new Error(`PROCESS_IDENTITY_SCAN_FAILED: process identity scan timed out after ${PROCESS_IDENTITY_SCAN_TIMEOUT_MS}ms`));
+    }, PROCESS_IDENTITY_SCAN_TIMEOUT_MS);
     timer.unref?.();
   });
 
   pidScanInFlight.set(inFlightKey, pending);
   try {
-    return await pending;
+    return filterProcessIdentitySnapshot(await pending, substring);
   } finally {
     if (pidScanInFlight.get(inFlightKey) === pending) pidScanInFlight.delete(inFlightKey);
   }
@@ -2119,12 +2508,34 @@ function isExactManagedRuntimeHealth(health, name, savedPid) {
   return Number.isSafeInteger(healthPid) && healthPid === savedPid;
 }
 
+function isExactManagedLaunchGeneration(health, name, savedPid, launchEvidence, expectedPort) {
+  if (!isExactManagedRuntimeHealth(health, name, savedPid)) return false;
+  const launchPid = Number(launchEvidence?.serverLaunchPid);
+  const launchPort = Number(launchEvidence?.serverLaunchPort);
+  const launchBootId = String(launchEvidence?.serverLaunchBootId || "").trim();
+  const healthBootId = String(health?.boot_id || "").trim();
+  return Boolean(
+    launchEvidence?.available === true
+    && launchPid === savedPid
+    && Number.isInteger(launchPort)
+    && launchPort === Number(expectedPort)
+    && launchBootId
+    && healthBootId
+    && launchBootId === healthBootId
+  );
+}
+
 async function isExactCurrentServerProcess(pid) {
   if (!IS_WIN || !Number.isSafeInteger(pid) || pid <= 0 || !isPidAlive(pid)) return false;
   // Recovery is intentionally stronger than normal health classification. A
   // missing server.pid is writable authority, so only adopt a current repo child
   // whose Windows command line names this exact compiled entry point.
-  return (await processesWithCmdLineAsync("node.exe", SERVER_ENTRY)).some((process) => process.pid === pid);
+  const identity = await exactProcessIdentityAsync(pid);
+  return Boolean(
+    identity
+    && sameExecutablePath(identity.executablePath, process.execPath)
+    && String(identity.commandLine || "").toLowerCase().includes(String(SERVER_ENTRY).toLowerCase())
+  );
 }
 
 function isLocalCoderHealth(health, env, name = null, { allowLegacy = false } = {}) {
@@ -2165,6 +2576,55 @@ async function tunnelClientHealth(port) {
     if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
   }
   return false;
+}
+
+async function tunnelClientControlPlaneFreshness(port) {
+  const numericPort = Number(port);
+  if (!Number.isInteger(numericPort) || numericPort <= 0 || numericPort > 65535) {
+    return {
+      supported: false,
+      fresh: null,
+      lastSuccessfulAt: null,
+      ageMs: null,
+      staleAfterMs: OPENAI_TUNNEL_CONTROL_PLANE_STALE_MS,
+      reason: "invalid-health-port",
+    };
+  }
+  try {
+    const response = await fetch(`http://127.0.0.1:${numericPort}/metrics`, {
+      signal: AbortSignal.timeout(OPENAI_TUNNEL_METRICS_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      return {
+        supported: false,
+        fresh: null,
+        lastSuccessfulAt: null,
+        ageMs: null,
+        staleAfterMs: OPENAI_TUNNEL_CONTROL_PLANE_STALE_MS,
+        reason: `metrics-http-${response.status}`,
+      };
+    }
+    const freshnessLine = await readResponseLineByPrefixBounded(
+      response,
+      "commands_poll_last_successful_timestamp_seconds",
+      OPENAI_TUNNEL_METRICS_SCAN_MAX_BYTES,
+      "tunnel metrics response"
+    );
+    return evaluateOpenAiTunnelControlPlaneFreshness(freshnessLine || "", {
+      nowMs: Date.now(),
+      staleAfterMs: OPENAI_TUNNEL_CONTROL_PLANE_STALE_MS,
+    });
+  } catch {
+    return {
+      supported: false,
+      fresh: null,
+      lastSuccessfulAt: null,
+      ageMs: null,
+      staleAfterMs: OPENAI_TUNNEL_CONTROL_PLANE_STALE_MS,
+      reason: "metrics-unavailable",
+    };
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -2598,27 +3058,36 @@ async function serverStatus(name, desiredEnv = null) {
   let health = null;
   let portPid = null;
   if (configuredPortValid) {
-    portOpen = await isPortOpen(configuredPort);
-    portPid = portOpen ? await pidOnPort(configuredPort) : null;
     // Do not gate the authoritative HTTP identity probe behind a separate TCP
     // connect snapshot. On Windows the socket/netstat view can briefly report
     // closed/stale immediately after restart even though /health is already
     // serving. A successful health response itself proves the configured port is
     // open and lets current builds prove exact instance + PID ownership.
     health = await serverHealth(configuredPort);
-    if (health) portOpen = true;
-    if (portOpen && !portPid) portPid = await pidOnPort(configuredPort);
-    if (!health && portOpen) {
+    if (health) {
+      portOpen = true;
+    } else {
+      // TCP reachability is only a fallback observation when identity-bearing
+      // health is unavailable. Never make a healthy current runtime wait on a
+      // Windows listener enumeration just to prove that its HTTP port is open.
+      portOpen = await isPortOpen(configuredPort);
+    }
+    if (!health) {
       // A freshly restarted Local Coder Server can accept TCP a fraction before
-      // /health is consistently ready under Windows load. This retry must also
-      // work in the exact crash window where server.pid is missing/dead; gating
-      // it on savedPid makes the recovery path self-defeating. Retry only the
-      // identity probe — never infer ownership from an open socket alone.
+      // /health is consistently ready under Windows load. The initial TCP
+      // snapshot can also be transiently false, so retry the identity probe
+      // independently of portOpen. Never infer ownership from an open socket
+      // alone.
       for (let attempt = 0; attempt < 3 && !health; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 120));
         health = await serverHealth(configuredPort);
       }
+      if (health) portOpen = true;
     }
+    // Listener PID is a stronger, destructive-ownership proof. Resolve it only
+    // after liveness/identity has been observed so a slow OS helper cannot
+    // suppress running status or delay health recovery ordering.
+    if (portOpen) portPid = await pidOnPort(configuredPort);
     // netstat is cached for UI efficiency and Windows can briefly publish the
     // listener before the PID snapshot catches up. Current health carries its own
     // PID, so refresh toward health.pid rather than toward server.pid. The latter
@@ -2635,7 +3104,7 @@ async function serverStatus(name, desiredEnv = null) {
       portPid !== currentHealthPid
     ) {
       for (let attempt = 0; attempt < 3 && portPid !== currentHealthPid; attempt++) {
-        invalidatePortPidCache();
+        invalidateTargetedPortPidCache(configuredPort);
         portPid = await pidOnPort(configuredPort);
         if (portPid === currentHealthPid) break;
         await new Promise((resolve) => setTimeout(resolve, 100));
@@ -2653,7 +3122,7 @@ async function serverStatus(name, desiredEnv = null) {
       const healthPid = currentHealthPid;
       if (Number.isSafeInteger(healthPid) && healthPid > 0 && isPidAlive(healthPid)) {
         for (let attempt = 0; attempt < 3 && portPid !== healthPid; attempt += 1) {
-          invalidatePortPidCache();
+          invalidateTargetedPortPidCache(configuredPort);
           portPid = await pidOnPort(configuredPort);
           if (portPid === healthPid) break;
           await new Promise((resolve) => setTimeout(resolve, 100));
@@ -2790,7 +3259,7 @@ async function serverStatus(name, desiredEnv = null) {
       let actualPortPid = listenerPorts.includes(actualPort) ? savedPid : null;
       if (exactCurrentIdentity && actualPortPid !== savedPid) {
         for (let attempt = 0; attempt < 3 && actualPortPid !== savedPid; attempt += 1) {
-          invalidatePortPidCache();
+          invalidateTargetedPortPidCache(actualPort);
           actualPortPid = await pidOnPort(actualPort);
           if (actualPortPid === savedPid) break;
           await new Promise((resolve) => setTimeout(resolve, 100));
@@ -3084,7 +3553,7 @@ async function serverStartPortCheck(port, label, currentServer = null) {
     : null;
   let ownerPid = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    invalidatePortPidCache();
+    invalidateTargetedPortPidCache(port);
     ownerPid = await pidOnPort(port);
     if (ownerPid || !allowedPid) break;
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -3256,6 +3725,17 @@ async function startServerUnlocked(name) {
     // manifest away while the next runtime silently recreates a fresh .mcp-state
     // and loses the previous ACL roots that must be revoked during reconciliation.
     CLC_SANDBOX_STATE_DIR: managedRuntimeStatePath(env.CLC_SANDBOX_STATE_DIR, path.join(ROOT, ".mcp-state"), path.join(inst.dir, "shell-state")),
+  }, {
+    onExit: (exit) => onManagedServerChildExit(name, exit),
+    onError: ({ pid: failedPid, error }) => {
+      void appendServerLifecycleEvent(name, {
+        event: "server_spawn_error",
+        pid: Number.isSafeInteger(Number(failedPid)) ? Number(failedPid) : null,
+        error: String(error?.message || error).slice(0, 500),
+      }).catch((journalErr) => {
+        console.warn("[manager] failed to journal Server spawn error: " + String(journalErr?.message || journalErr).slice(0, 300));
+      });
+    },
   });
   invalidatePortPidCache();
   await writePidFile(inst.serverPid, pid);
@@ -3267,6 +3747,22 @@ async function startServerUnlocked(name) {
     config.serverLaunchPid = pid;
     config.serverLaunchPort = port;
   });
+  let spawnedServerIdentity = null;
+  if (IS_WIN) {
+    for (let attempt = 0; attempt < 4 && isPidAlive(pid); attempt += 1) {
+      const candidate = await tryExactProcessIdentityAsync(pid, { force: true });
+      if (
+        candidate
+        && candidate.pid === pid
+        && sameExecutablePath(candidate.executablePath, process.execPath)
+        && String(candidate.commandLine || "").toLowerCase().includes(String(SERVER_ENTRY).toLowerCase())
+      ) {
+        spawnedServerIdentity = candidate;
+        break;
+      }
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
   let startupState = "pending";
   await waitFor(async () => {
     if (!isPidAlive(pid)) {
@@ -3292,7 +3788,19 @@ async function startServerUnlocked(name) {
     const startupElapsedMs = Date.now() - startupStartedAt;
     const pidAliveAtDeadline = isPidAlive(pid);
     const portOpenAtDeadline = await isPortOpen(port);
-    await killPidTree(pid);
+    let cleanupKillAllowed = !IS_WIN;
+    if (IS_WIN && pidAliveAtDeadline && spawnedServerIdentity) {
+      const currentIdentity = await exactProcessIdentityForAuthorityAsync(pid);
+      cleanupKillAllowed = Boolean(
+        currentIdentity
+        && currentIdentity.pid === pid
+        && currentIdentity.startedAt === spawnedServerIdentity.startedAt
+        && sameExecutablePath(currentIdentity.executablePath, spawnedServerIdentity.executablePath)
+        && sameExecutablePath(currentIdentity.executablePath, process.execPath)
+        && String(currentIdentity.commandLine || "").toLowerCase().includes(String(SERVER_ENTRY).toLowerCase())
+      );
+    }
+    if (pidAliveAtDeadline && cleanupKillAllowed) await killPidTree(pid);
     invalidatePortPidCache();
     const stopped = await waitFor(() => !isPidAlive(pid), 5000, 150);
     if (stopped) {
@@ -3333,6 +3841,33 @@ async function stopServerUnlocked(name, { allowLegacyPreDrainMaintenance = false
       port: st.port,
       pid: st.pid || null,
       stopped: false,
+    };
+  }
+
+  // serverStatus proves live listener/health/PID ownership, but a destructive
+  // stop can spend several seconds draining traffic before reaching taskkill.
+  // Capture the exact Windows process generation now so a dead Gateway whose
+  // numeric PID is reused during that drain can never transfer kill authority to
+  // the replacement process.
+  const stopProcessIdentity = IS_WIN
+    ? await exactProcessIdentityForAuthorityAsync(st.pid)
+    : null;
+  if (
+    IS_WIN
+    && (
+      !stopProcessIdentity
+      || stopProcessIdentity.pid !== st.pid
+      || !sameExecutablePath(stopProcessIdentity.executablePath, process.execPath)
+      || !String(stopProcessIdentity.commandLine || "").toLowerCase().includes(String(SERVER_ENTRY).toLowerCase())
+    )
+  ) {
+    return {
+      ok: false,
+      stopped: false,
+      staleProcessAuthority: true,
+      port: st.port,
+      pid: st.pid || null,
+      error: `Refusing to stop managed Gateway PID ${st.pid}: exact Windows process-generation identity could not be established before the destructive boundary.`,
     };
   }
 
@@ -3390,7 +3925,44 @@ async function stopServerUnlocked(name, { allowLegacyPreDrainMaintenance = false
   }
 
   let killed = false;
-  if (pidFile === st.pid) killed = await killPidTree(pidFile);
+  if (pidFile === st.pid && isPidAlive(st.pid)) {
+    const latestPidFile = await readPidFile(inst.serverPid);
+    const currentProcessIdentity = IS_WIN
+      ? await exactProcessIdentityForAuthorityAsync(st.pid)
+      : null;
+    const exactGenerationStillOwned = Boolean(
+      latestPidFile === st.pid
+      && (
+        !IS_WIN
+        || (
+          currentProcessIdentity
+          && stopProcessIdentity
+          && currentProcessIdentity.pid === st.pid
+          && currentProcessIdentity.startedAt === stopProcessIdentity.startedAt
+          && sameExecutablePath(currentProcessIdentity.executablePath, stopProcessIdentity.executablePath)
+          && sameExecutablePath(currentProcessIdentity.executablePath, process.execPath)
+          && String(currentProcessIdentity.commandLine || "").toLowerCase().includes(String(SERVER_ENTRY).toLowerCase())
+        )
+      )
+    );
+    if (!exactGenerationStillOwned) {
+      invalidateProcessScanCache();
+      const admissionResume = trafficDrain.admissionClosed
+        ? await resumeServerTrafficAdmission(name, st)
+        : { ok: true, skipped: true, reason: "legacy-quiet-bridge" };
+      return {
+        ok: false,
+        stopped: false,
+        staleProcessAuthority: true,
+        port: st.port,
+        pid: st.pid || null,
+        trafficDrain,
+        admissionResume,
+        error: `Refusing to hard-stop managed Gateway PID ${st.pid}: PID ledger or Windows CreationDate changed after traffic drain.`,
+      };
+    }
+    killed = await killPidTree(pidFile);
+  }
   invalidatePortPidCache();
   const stopped = await waitFor(
     async () => !isPidAlive(st.pid) && !(await isPortOpen(st.port)),
@@ -3780,7 +4352,16 @@ async function startServer(name) {
   }
 }
 
+async function startServerExplicit(name) {
+  // An explicit Start supersedes an earlier explicit Stop for this Manager
+  // generation. Boot/recovery callers intentionally use startServer() directly
+  // so they cannot erase a Stop that races with background supervision.
+  serverRecoverySuppressed.delete(name);
+  return startServer(name);
+}
+
 async function stopServer(name) {
+  serverRecoverySuppressed.add(name);
   cancelledBootAutoStart.add(name);
   if (managerRestartInFlight) {
     return { ok: false, error: "Manager đang self-restart; từ chối bắt đầu Server lifecycle mới." };
@@ -3846,6 +4427,9 @@ async function restartServerOnce(name, inFlightStart = null) {
 }
 
 async function restartServer(name) {
+  // Restart is explicit authority to run the Server again, so it also clears a
+  // prior Stop suppression before entering the normal ordered lifecycle path.
+  serverRecoverySuppressed.delete(name);
   cancelledBootAutoStart.add(name);
   if (managerRestartInFlight) {
     return { ok: false, restarted: false, error: "Manager đang self-restart; từ chối bắt đầu Server lifecycle mới." };
@@ -3897,6 +4481,7 @@ async function tunnelStatus(name, desiredEnv = null) {
   const persistedMode = persistedTunnelId && persistedApiKey ? "openai" : "cloudflare";
   const persistedHealthPort = Number(config.healthPort || persistedEnv.OPENAI_TUNNEL_HEALTH_PORT || 0);
   const persistedServerPort = Number(persistedEnv.PORT || 0);
+
   const oaPortPromise = healthPortValid ? isPortOpen(healthPort) : Promise.resolve(false);
   const oaProcessesPromise = processesWithCmdLineAsync("tunnel-client.exe", inst.profile);
   const desiredCfProcessesPromise = Number.isInteger(serverPort) && serverPort > 0 && serverPort < 65536
@@ -3926,9 +4511,25 @@ async function tunnelStatus(name, desiredEnv = null) {
   // transiently miss that one connect while the exact managed tunnel remains
   // live/ready. Only spend the health retry budget when a same-profile tunnel
   // process actually exists; stopped/conflict-only status remains cheap.
-  const oaHealthy = healthPortValid && oaPids.length > 0
+  const oaLocalHealthy = healthPortValid && oaPids.length > 0
     ? await tunnelClientHealth(healthPort)
     : false;
+  const oaControlPlaneFreshness = oaLocalHealthy
+    ? await tunnelClientControlPlaneFreshness(healthPort)
+    : {
+        supported: false,
+        fresh: null,
+        lastSuccessfulAt: null,
+        ageMs: null,
+        staleAfterMs: OPENAI_TUNNEL_CONTROL_PLANE_STALE_MS,
+        reason: "local-unhealthy",
+      };
+  // Current tunnel-client builds expose commands_poll_last_successful_timestamp_seconds.
+  // If that supported signal is stale/malformed, the transport is operationally
+  // unhealthy even while /healthz and /readyz remain green. Older builds or a
+  // transient metrics-read failure remain compatibility-unknown and do not grant
+  // disruptive authority by themselves.
+  const oaHealthy = oaLocalHealthy && oaControlPlaneFreshness.fresh !== false;
   const oaProcessStartedAt = oaProcesses.length === 1 ? oaProcesses[0].startedAt : null;
   // Always detect cloudflared processes targeting this instance's server port,
   // even when OpenAI mode is currently configured. Otherwise an old/unowned
@@ -4085,6 +4686,13 @@ async function tunnelStatus(name, desiredEnv = null) {
       runtimePathMatches: oaLaunchState?.runtimePathMatches === true,
       runtimeIdentity: expectedOaRuntimeIdentity,
       healthy: oaHealthy,
+      localHealthy: oaLocalHealthy,
+      controlPlaneFresh: oaControlPlaneFreshness.fresh,
+      controlPlaneFreshnessSupported: oaControlPlaneFreshness.supported,
+      controlPlaneLastSuccessAt: oaControlPlaneFreshness.lastSuccessfulAt,
+      controlPlaneFreshnessAgeMs: oaControlPlaneFreshness.ageMs,
+      controlPlaneFreshnessStaleAfterMs: oaControlPlaneFreshness.staleAfterMs,
+      controlPlaneFreshnessReason: oaControlPlaneFreshness.reason,
       url: desired ? controlPlaneUrl : config.lastTunnelUrl || null,
       healthPort,
       cloudflaredExists,
@@ -4371,6 +4979,8 @@ async function startTunnelUnlocked(name, { rollbackGateway = null } = {}) {
       "control_plane:",
       `  tunnel_id: ${env.OPENAI_TUNNEL_ID}`,
       "  api_key: env:OPENAI_TUNNEL_API_KEY",
+      `  poll_timeout: ${OPENAI_TUNNEL_POLL_TIMEOUT}`,
+      `  poll_deadline_guardrail: ${OPENAI_TUNNEL_POLL_DEADLINE_GUARDRAIL}`,
       "log:",
       // INFO emits one line per control-plane/MCP event and grows tunnel.log
       // continuously even when the Manager/Local Coder Server stay healthy for days.
@@ -4418,16 +5028,22 @@ async function startTunnelUnlocked(name, { rollbackGateway = null } = {}) {
     invalidateProcessScanCache();
     let processStartedAt = null;
     const identityReady = await waitFor(async () => {
-      const processIdentity = (await processesWithCmdLineAsync("tunnel-client.exe", profileFile))
-        .find((process) => process.pid === pid);
-      if (!processIdentity?.startedAt || !sameExecutablePath(processIdentity.executablePath, client.path)) return false;
+      const processIdentity = await exactProcessIdentityAsync(pid);
+      if (
+        !processIdentity?.startedAt
+        || !sameExecutablePath(processIdentity.executablePath, client.path)
+        || !String(processIdentity.commandLine || "").toLowerCase().includes(String(profileFile).toLowerCase())
+      ) return false;
       processStartedAt = processIdentity.startedAt;
       return true;
     }, 5000, 250);
     if (!identityReady || !processStartedAt) {
-      await killPidTree(pid);
       invalidateProcessScanCache();
-      const stopped = await waitFor(() => !isPidAlive(pid), 10000, 150);
+      // Without a captured CreationDate there is no safe destructive authority:
+      // the spawned child may already have exited and Windows may have reused the
+      // numeric PID. Preserve the ledger for bounded legacy recovery instead of
+      // taskkilling an unverifiable PID.
+      const stopped = !isPidAlive(pid);
       if (stopped) {
         await updateInstanceConfig(name, clearTunnelLaunchEvidence);
         await writePidFile(inst.tunnelPid, null);
@@ -4455,7 +5071,15 @@ async function startTunnelUnlocked(name, { rollbackGateway = null } = {}) {
     if (!up) {
       // Startup owns only the exact PID it just spawned. A same-profile process
       // that appears concurrently is not ours and must never be killed as cleanup.
-      const targets = isPidAlive(pid) ? [pid] : [];
+      const currentIdentity = isPidAlive(pid)
+        ? await exactProcessIdentityForAuthorityAsync(pid)
+        : null;
+      const targets = currentIdentity
+        && currentIdentity.startedAt === processStartedAt
+        && sameExecutablePath(currentIdentity.executablePath, client.path)
+        && String(currentIdentity.commandLine || "").toLowerCase().includes(String(profileFile).toLowerCase())
+        ? [pid]
+        : [];
       for (const p of targets) await killPidTree(p);
       invalidateProcessScanCache();
       const stopped = await waitFor(() => targets.every((p) => !isPidAlive(p)), 10000, 150);
@@ -4504,18 +5128,25 @@ async function startTunnelUnlocked(name, { rollbackGateway = null } = {}) {
   await writePidFile(inst.tunnelPid, pid);
   let processStartedAt = null;
   const identityReady = await waitFor(async () => {
-    const processIdentity = (await processesWithCmdLineAsync("cloudflared.exe", `localhost:${port}`))
-      .find((process) => process.pid === pid);
-    if (!processIdentity?.startedAt) return false;
+    const processIdentity = await exactProcessIdentityAsync(pid);
+    if (
+      !processIdentity?.startedAt
+      || !String(processIdentity.commandLine || "").toLowerCase().includes(`localhost:${port}`.toLowerCase())
+    ) return false;
     processStartedAt = processIdentity.startedAt;
     return true;
   }, 5000, 250);
   if (!identityReady || !processStartedAt) {
-    await killPidTree(pid);
     invalidateProcessScanCache();
-    const stopped = await waitFor(() => !isPidAlive(pid), 10000, 150);
-    await updateInstanceConfig(name, clearTunnelLaunchEvidence);
-    await writePidFile(inst.tunnelPid, stopped ? null : pid);
+    // Same fail-closed rule as OpenAI mode: no CreationDate means no destructive
+    // authority over a numeric PID that Windows could already have reused.
+    const stopped = !isPidAlive(pid);
+    if (stopped) {
+      await updateInstanceConfig(name, clearTunnelLaunchEvidence);
+      await writePidFile(inst.tunnelPid, null);
+    } else {
+      await writePidFile(inst.tunnelPid, pid);
+    }
     return {
       ok: false,
       error: "cloudflared started but its Windows CreationDate identity could not be captured; refusing to accept unverifiable tunnel ownership."
@@ -4539,7 +5170,16 @@ async function startTunnelUnlocked(name, { rollbackGateway = null } = {}) {
     if (!url) await new Promise((r) => setTimeout(r, 400));
   }
   if (!url) {
-    await killPidTree(pid);
+    const currentIdentity = isPidAlive(pid)
+      ? await exactProcessIdentityForAuthorityAsync(pid)
+      : null;
+    const cleanupKillAllowed = Boolean(
+      currentIdentity
+      && currentIdentity.startedAt === processStartedAt
+      && sameExecutablePath(currentIdentity.executablePath, CLOUDFLARED)
+      && String(currentIdentity.commandLine || "").toLowerCase().includes(`localhost:${port}`.toLowerCase())
+    );
+    if (cleanupKillAllowed) await killPidTree(pid);
     invalidateProcessScanCache();
     const stopped = await waitFor(() => !isPidAlive(pid), 5000, 150);
     if (stopped) {
@@ -4582,8 +5222,104 @@ async function stopTunnelUnlocked(name) {
     };
   }
   const targets = new Set();
-  if (Number.isInteger(st.ownedOpenAiPid) && isPidAlive(st.ownedOpenAiPid)) targets.add(st.ownedOpenAiPid);
-  if (Number.isInteger(st.ownedCloudflarePid) && isPidAlive(st.ownedCloudflarePid)) targets.add(st.ownedCloudflarePid);
+  const verifyFreshOwnedTarget = async (kind, pid) => {
+    if (!Number.isSafeInteger(pid) || pid <= 0 || !isPidAlive(pid)) {
+      return { ok: false, reason: "pid-not-running" };
+    }
+    // The Manager is Windows-first and only has a native CreationDate identity
+    // primitive there. Preserve the existing non-Windows ownership behavior
+    // instead of turning an unavailable hardening primitive into a regression.
+    if (!IS_WIN) return { ok: true, identity: null, legacyCompatibility: true };
+    const savedPid = await readPidFile(inst.tunnelPid);
+    if (savedPid !== pid) return { ok: false, reason: "pid-ledger-changed" };
+
+    const [config, env, pidFileStat, identity] = await Promise.all([
+      readInstanceConfig(name),
+      readInstanceEnv(name),
+      fsp.stat(inst.tunnelPid).catch(() => null),
+      exactProcessIdentityForAuthorityAsync(pid),
+    ]);
+    if (!identity || identity.pid !== pid) return { ok: false, reason: "exact-process-missing" };
+
+    const savedStartedAt = String(config.tunnelProcessStartedAt || "");
+    const exactGeneration = Boolean(savedStartedAt && identity.startedAt === savedStartedAt);
+    const legacyGeneration = Boolean(
+      !savedStartedAt
+      && legacyPidFileMatchesProcessStart({
+        processStartedAt: identity.startedAt,
+        pidFileMtimeMs: Number(pidFileStat?.mtimeMs),
+      })
+    );
+    if (!exactGeneration && !legacyGeneration) {
+      return { ok: false, reason: "process-generation-changed" };
+    }
+
+    if (kind === "openai") {
+      if (!sameExecutablePath(identity.executablePath, expectedOpenAiTunnelRuntimePath())) {
+        return { ok: false, reason: "runtime-path-changed" };
+      }
+      if (!String(identity.commandLine || "").toLowerCase().includes(String(inst.profile).toLowerCase())) {
+        return { ok: false, reason: "profile-identity-changed" };
+      }
+      if (legacyGeneration) {
+        const tunnelId = String(env.OPENAI_TUNNEL_ID || "");
+        const apiKey = String(env.OPENAI_TUNNEL_API_KEY || "");
+        const healthPort = Number(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 0);
+        const serverPort = Number(env.PORT || 0);
+        if (!tunnelId || !apiKey) return { ok: false, reason: "legacy-openai-config-missing" };
+        const allowedFingerprints = [
+          openAiTunnelLaunchFingerprint({
+            tunnelId,
+            apiKey,
+            healthPort,
+            serverPort,
+            runtimeIdentity: expectedOpenAiTunnelRuntimeIdentity(),
+          }),
+          legacyOpenAiTunnelLaunchFingerprintV1({ tunnelId, apiKey, healthPort, serverPort }),
+        ];
+        if (!allowedFingerprints.includes(config.openaiTunnelLaunchFingerprint)) {
+          return { ok: false, reason: "legacy-openai-fingerprint-changed" };
+        }
+      }
+    } else if (kind === "cloudflare") {
+      if (!sameExecutablePath(identity.executablePath, CLOUDFLARED)) {
+        return { ok: false, reason: "runtime-path-changed" };
+      }
+      if (legacyGeneration) {
+        const serverPort = Number(env.PORT || 0);
+        if (
+          !Number.isInteger(serverPort)
+          || serverPort <= 0
+          || serverPort > 65535
+          || !String(identity.commandLine || "").toLowerCase().includes(`localhost:${serverPort}`.toLowerCase())
+        ) {
+          return { ok: false, reason: "legacy-cloudflare-target-changed" };
+        }
+      }
+    } else {
+      return { ok: false, reason: "unsupported-tunnel-kind" };
+    }
+    return { ok: true, identity };
+  };
+
+  for (const [kind, pid] of [
+    ["openai", st.ownedOpenAiPid],
+    ["cloudflare", st.ownedCloudflarePid],
+  ]) {
+    if (!Number.isInteger(pid) || !isPidAlive(pid)) continue;
+    const freshAuthority = await verifyFreshOwnedTarget(kind, pid);
+    if (!freshAuthority.ok) {
+      invalidateProcessScanCache();
+      return {
+        ok: false,
+        mode: st.mode,
+        stopped: false,
+        staleProcessAuthority: true,
+        error: `Refusing to stop managed Tunnel PID ${pid}: fresh ${kind} process identity no longer matches Manager ownership (${freshAuthority.reason}).`,
+      };
+    }
+    targets.add(pid);
+  }
   if (targets.size === 0) return { ok: false, mode: st.mode, stopped: false, error: "Managed Tunnel is reported running but no owned process can be identified safely." };
 
   let killed = false;
@@ -4642,10 +5378,10 @@ async function stopTunnelUnlocked(name) {
   return { ok: true, mode: st.mode, kind: st.kind, stopped: true, forced: killed, portReleased: true };
 }
 
-async function finishTunnelDisruptionAdmission(name, gatewayState, trafficDrain, result) {
-  const admissionResume = trafficDrain?.admissionClosed
+async function finishTunnelDisruptionAdmission(name, gatewayState, trafficDrain, result, existingAdmissionResume = null) {
+  const admissionResume = existingAdmissionResume || (trafficDrain?.admissionClosed
     ? await resumeServerTrafficAdmission(name, gatewayState)
-    : { ok: true, skipped: true, reason: "admission-was-not-closed" };
+    : { ok: true, skipped: true, reason: "admission-was-not-closed" });
   if (!admissionResume.ok) {
     return {
       ...result,
@@ -4719,7 +5455,16 @@ async function startTunnel(name) {
   }
 }
 
+async function startTunnelExplicit(name) {
+  // Explicit Start supersedes an earlier explicit Stop for this Manager
+  // generation. Boot/background recovery intentionally calls startTunnel()
+  // directly so it cannot erase a Stop suppression that races supervision.
+  tunnelRecoverySuppressed.delete(name);
+  return startTunnel(name);
+}
+
 async function stopTunnel(name) {
+  tunnelRecoverySuppressed.add(name);
   cancelledBootAutoStart.add(name);
   if (managerRestartInFlight) {
     return { ok: false, error: "Manager đang self-restart; từ chối bắt đầu Tunnel lifecycle mới." };
@@ -4855,6 +5600,32 @@ async function restartTunnelUnlocked(name, before = null) {
       previousPid: prior.pid || null,
     });
   }
+
+  // The admission gate protects only the destructive old-Tunnel stop boundary.
+  // A replacement OpenAI tunnel cannot become /readyz-ready until its MCP
+  // initialize request is accepted by the Gateway. Keeping admission closed
+  // while startTunnelUnlocked() waits for readiness creates a circular deadlock:
+  // Gateway rejects initialize with 503 -> tunnel never becomes ready -> startup
+  // waits until timeout/rollback -> admission remains closed. Reopen admission
+  // immediately after the old transport is proven stopped, before spawning the
+  // replacement. There is no longer a serving Tunnel generation to race across
+  // the destructive stop boundary at that point.
+  const admissionResume = trafficDrain?.admissionClosed
+    ? await resumeServerTrafficAdmission(name, preflight.server)
+    : { ok: true, skipped: true, reason: "admission-was-not-closed" };
+  if (!admissionResume.ok) {
+    return {
+      ...stopped,
+      ok: false,
+      restarted: false,
+      preserved: false,
+      previousPid: prior.pid || null,
+      trafficDrain,
+      admissionResume,
+      error: `Old Tunnel stopped safely, but Gateway MCP admission could not be resumed before replacement startup: ${admissionResume.error || "unknown error"}. Replacement was not spawned to avoid an initialize/readiness deadlock.`,
+    };
+  }
+
   const started = await startTunnelUnlocked(name);
   if (!started.ok) {
     const rollback = await restorePriorHealthyTunnelUnlocked(name, prior, rollbackGateway);
@@ -4870,7 +5641,7 @@ async function restartTunnelUnlocked(name, before = null) {
       error: rollback.ok
         ? `${started.error || "Tunnel replacement failed"} Previous healthy Tunnel service was restored.`
         : `${started.error || "Tunnel replacement failed"} Rollback did not restore the previous healthy Tunnel service: ${rollback.error || rollback.reason || "unknown rollback failure"}`,
-    });
+    }, admissionResume);
   }
   return finishTunnelDisruptionAdmission(name, preflight.server, trafficDrain, {
     ...started,
@@ -4880,7 +5651,7 @@ async function restartTunnelUnlocked(name, before = null) {
     previousMode: prior.mode,
     previousPid: prior.pid || null,
     stop: stopped,
-  });
+  }, admissionResume);
 }
 
 function isExactBootRecoveryTunnelGeneration(reference, current) {
@@ -5043,6 +5814,9 @@ async function restartTunnelOnce(name, inFlightStart = null) {
 }
 
 async function restartTunnel(name) {
+  // Explicit Restart is authority to run Tunnel again, so clear a prior Stop
+  // suppression before entering the normal ordered replacement path.
+  tunnelRecoverySuppressed.delete(name);
   cancelledBootAutoStart.add(name);
   if (managerRestartInFlight) {
     return { ok: false, restarted: false, error: "Manager đang self-restart; từ chối bắt đầu Tunnel lifecycle mới." };
@@ -5139,6 +5913,74 @@ async function observeStaleConfigUnlocked(name) {
   };
 }
 
+async function quickNoConfigDriftEvidence(name) {
+  // Steady-state drift observation must not pay for Windows listener/CIM
+  // ownership scans when the currently serving generations already prove their
+  // desired configuration through identity-bearing health + persisted launch
+  // evidence. This helper is intentionally observation-only: false/unknown
+  // falls back to the full status path, while destructive lifecycle operations
+  // continue to require exact listener/process ownership proof.
+  const [env, config, serverLaunchEvidence] = await Promise.all([
+    readInstanceEnv(name),
+    readInstanceConfig(name),
+    readServerLaunchEvidence(name),
+  ]);
+  const inst = instPaths(name);
+  const serverPort = Number(env.PORT || 0);
+  if (!Number.isInteger(serverPort) || serverPort <= 0 || serverPort > 65535) {
+    return { noDrift: false, reason: "server-port-invalid" };
+  }
+  const serverPid = await readPidFile(inst.serverPid);
+  if (!serverPid || !isPidAlive(serverPid)) {
+    return { noDrift: false, reason: "server-pid-unavailable" };
+  }
+  const health = await serverHealth(serverPort);
+  if (
+    !health
+    || !isLocalCoderHealth(health, env, name)
+    || !isExactManagedLaunchGeneration(health, name, serverPid, serverLaunchEvidence, serverPort)
+  ) {
+    return { noDrift: false, reason: "server-launch-evidence-mismatch" };
+  }
+
+  const tunnelId = String(env.OPENAI_TUNNEL_ID || "");
+  const apiKey = String(env.OPENAI_TUNNEL_API_KEY || "");
+  if (!tunnelId || !apiKey) {
+    // Cloudflare has no equivalent persisted launch fingerprint; keep the full
+    // command-line proof for that compatibility mode.
+    return { noDrift: false, reason: "non-openai-tunnel" };
+  }
+  const tunnelPid = await readPidFile(inst.tunnelPid);
+  if (!tunnelPid || !isPidAlive(tunnelPid)) {
+    return { noDrift: false, reason: "tunnel-pid-unavailable" };
+  }
+  const tunnelProcessStartedAt = String(config.tunnelProcessStartedAt || "").trim();
+  const persistedFingerprint = String(config.openaiTunnelLaunchFingerprint || "").trim();
+  if (!tunnelProcessStartedAt || !/^[0-9a-f]{64}$/.test(persistedFingerprint)) {
+    return { noDrift: false, reason: "tunnel-launch-evidence-incomplete" };
+  }
+  const healthPort = Number(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 0);
+  if (!Number.isInteger(healthPort) || healthPort <= 0 || healthPort > 65535) {
+    return { noDrift: false, reason: "tunnel-health-port-invalid" };
+  }
+  const desiredFingerprint = openAiTunnelLaunchFingerprint({
+    tunnelId,
+    apiKey,
+    healthPort,
+    serverPort,
+    runtimeIdentity: expectedOpenAiTunnelRuntimeIdentity(),
+  });
+  if (persistedFingerprint !== desiredFingerprint) {
+    return { noDrift: false, reason: "tunnel-fingerprint-drift" };
+  }
+  return {
+    noDrift: true,
+    reason: "exact-serving-launch-evidence",
+    serverPid,
+    tunnelPid,
+  };
+}
+
 async function observeStaleConfigOnce() {
   if (managerRestartInFlight) return;
   try {
@@ -5150,6 +5992,11 @@ async function observeStaleConfigOnce() {
 
       let stale = false;
       try {
+        const quick = await quickNoConfigDriftEvidence(name);
+        if (quick.noDrift) {
+          staleConfigRetryAfter.delete(name);
+          continue;
+        }
         const [server, tunnel] = await Promise.all([serverStatus(name), tunnelStatus(name)]);
         stale = Boolean(
           (server.running && server.configDrift)
@@ -5188,6 +6035,524 @@ async function observeStaleConfigOnce() {
   } catch (err) {
     console.warn(`[Drift] stale configuration scan failed: ${String(err?.message || err).slice(0, 300)}`);
   }
+}
+
+function serverRecoveryAllowed(name) {
+  return Boolean(
+    !managerRestartInFlight
+    && !serverRecoverySuppressed.has(name)
+    && !serverStartInFlight.has(name)
+    && !serverRestartInFlight.has(name)
+    && !serverLifecycleChains.has(name)
+    && !instanceCatalogMutationInFlight.has(name)
+  );
+}
+
+async function appendServerLifecycleEvent(name, event) {
+  const inst = instPaths(name);
+  await fsp.mkdir(inst.dir, { recursive: true });
+  // Lifecycle evidence is Manager-owned (the child never holds this descriptor),
+  // so ordinary rename rotation is safe. Serialize rotation + append to preserve
+  // one JSON object per line even when multiple child callbacks settle together.
+  await enqueueFileMutation(inst.serverLifecycleLog, async () => {
+    await rotateLogFile(inst.serverLifecycleLog, 1024 * 1024, 2);
+    await fsp.appendFile(
+      inst.serverLifecycleLog,
+      JSON.stringify({
+        at: new Date().toISOString(),
+        manager_pid: process.pid,
+        manager_boot_id: getManagerBootId(),
+        instance: name,
+        ...event,
+      }) + "\n",
+      "utf8"
+    );
+  });
+}
+
+function managedServerExitExpectation(name) {
+  if (managerRestartInFlight) return "manager_restart";
+  if (serverRecoverySuppressed.has(name)) return "explicit_stop";
+  if (serverRestartInFlight.has(name)) return "explicit_restart";
+  if (serverStartInFlight.has(name)) return "startup_or_start_cleanup";
+  if (serverRecoveryInFlight.has(name)) return "recovery_startup_or_cleanup";
+  if (serverLifecycleChains.has(name)) return "managed_lifecycle";
+  if (instanceCatalogMutationInFlight.has(name)) return "catalog_mutation";
+  return null;
+}
+
+function scheduleUnexpectedServerRecovery(name, source = "poll") {
+  if (!serverRecoveryAllowed(name)) return false;
+  if (serverRecoveryInFlight.has(name)) return false;
+  if ((serverRecoveryRetryAfter.get(name) || 0) > Date.now()) return false;
+
+  const pending = enqueueServerCommand(
+    name,
+    () => enqueueRuntimeDeploy(() => recoverUnexpectedServerUnlocked(name))
+  );
+  serverRecoveryInFlight.set(name, pending);
+  void pending.then((result) => {
+    if (result?.ok === false) {
+      serverRecoveryRetryAfter.set(name, Date.now() + SERVER_RECOVERY_RETRY_COOLDOWN_MS);
+      console.warn("[Recovery] '" + name + "' Server restore from " + source + " failed: " + String(result.error || "unknown error").slice(0, 300));
+    } else if (!result?.skipped) {
+      serverRecoveryRetryAfter.delete(name);
+    }
+  }).catch((err) => {
+    serverRecoveryRetryAfter.set(name, Date.now() + SERVER_RECOVERY_RETRY_COOLDOWN_MS);
+    console.warn("[Recovery] '" + name + "' Server restore from " + source + " failed: " + String(err?.message || err).slice(0, 300));
+  }).finally(() => {
+    if (serverRecoveryInFlight.get(name) === pending) serverRecoveryInFlight.delete(name);
+  });
+  return true;
+}
+
+async function onManagedServerChildExit(name, exit) {
+  const pid = Number(exit?.pid);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return;
+
+  const expectation = managedServerExitExpectation(name);
+  let currentPid = null;
+  try {
+    currentPid = await readPidFile(instPaths(name).serverPid);
+  } catch {
+    // Corrupt/missing PID authority is handled by normal recovery preflight.
+  }
+
+  // If the PID ledger already advanced, this observer belongs to a superseded
+  // generation. Never let an older child exit resurrect or interfere with it.
+  const superseded = Boolean(currentPid && currentPid !== pid);
+  let autoStart = false;
+  try {
+    autoStart = (await readInstanceConfig(name))?.autoStart === true;
+  } catch {
+    autoStart = false;
+  }
+  const expected = Boolean(expectation || superseded);
+  const recoveryTriggered = Boolean(
+    !expected
+    && autoStart
+    && scheduleUnexpectedServerRecovery(name, "child-exit")
+  );
+
+  await appendServerLifecycleEvent(name, {
+    event: "server_exit",
+    pid,
+    code: Number.isInteger(exit?.code) ? exit.code : null,
+    signal: exit?.signal || null,
+    child_exit_at: exit?.at || null,
+    pid_ledger_at_observation: currentPid,
+    expected,
+    expected_reason: expectation || (superseded ? "superseded_generation" : null),
+    auto_start: autoStart,
+    recovery_triggered: recoveryTriggered,
+  });
+
+  if (!expected) {
+    console.warn(
+      "[Recovery] '" + name + "' managed child PID " + pid + " exited unexpectedly " +
+      "(code=" + String(exit?.code ?? "null") + " signal=" + String(exit?.signal || "null") + "); " +
+      (recoveryTriggered ? "immediate recovery queued." : "recovery not queued.")
+    );
+  }
+}
+
+async function recoverUnexpectedServerUnlocked(name) {
+  if (!serverRecoveryAllowed(name)) {
+    return { ok: true, skipped: true, reason: "suppressed" };
+  }
+
+  const config = await readInstanceConfig(name);
+  if (config?.autoStart !== true) {
+    return { ok: true, skipped: true, reason: "disabled" };
+  }
+
+  // Full identity-bearing status is required immediately before mutation. A
+  // missing/stale PID ledger can still correspond to a live exact-current
+  // runtime; serverStatus() repairs that case instead of spawning a duplicate.
+  const current = await serverStatus(name);
+  if (current.running) {
+    return { ok: true, skipped: true, reason: "running", server: current };
+  }
+
+  if (!serverRecoveryAllowed(name)) {
+    return { ok: true, skipped: true, reason: "suppressed" };
+  }
+  const latestConfig = await readInstanceConfig(name);
+  if (latestConfig?.autoStart !== true) {
+    return { ok: true, skipped: true, reason: "disabled" };
+  }
+
+  console.warn(`[Recovery] '${name}' managed Server disappeared unexpectedly; autoStart=true, restoring service.`);
+  const result = await ensureRuntimeAndServerUnlocked(name, { restartTarget: false });
+  if (result?.ok) {
+    console.warn(`[Recovery] '${name}' Server restored${result.pid ? ` as PID ${result.pid}` : ""}.`);
+  }
+  return result;
+}
+
+async function observeUnexpectedServerRecoveryOnce() {
+  if (managerRestartInFlight) return;
+  try {
+    const names = await listInstances();
+    for (const name of names) {
+      if (managerRestartInFlight) return;
+      if (!serverRecoveryAllowed(name)) continue;
+      if (serverRecoveryInFlight.has(name)) continue;
+      if ((serverRecoveryRetryAfter.get(name) || 0) > Date.now()) continue;
+
+      let config;
+      try {
+        config = await readInstanceConfig(name);
+      } catch (err) {
+        serverRecoveryRetryAfter.set(name, Date.now() + SERVER_RECOVERY_RETRY_COOLDOWN_MS);
+        console.warn(`[Recovery] '${name}' config read failed: ${String(err?.message || err).slice(0, 300)}`);
+        continue;
+      }
+      if (config?.autoStart !== true) {
+        serverRecoveryRetryAfter.delete(name);
+        continue;
+      }
+
+      // Healthy steady state stays cheap, but PID liveness alone is not identity:
+      // Windows can reuse a dead Server PID for an unrelated process. Require the
+      // configured /health endpoint to prove both instance_id and health.pid before
+      // skipping recovery. If that bounded proof fails, serverStatus() below handles
+      // port drift, stale ledgers, listener identity and fail-closed ownership.
+      const inst = instPaths(name);
+      const savedPid = await readPidFile(inst.serverPid);
+      if (savedPid && isPidAlive(savedPid)) {
+        try {
+          const env = await readInstanceEnv(name);
+          const configuredPort = Number(env.PORT || 0);
+          const configuredPortValid = Number.isInteger(configuredPort)
+            && configuredPort > 0
+            && configuredPort < 65536;
+          const health = configuredPortValid ? await serverHealth(configuredPort) : null;
+          if (isExactManagedRuntimeHealth(health, name, savedPid)) {
+            serverRecoveryRetryAfter.delete(name);
+            continue;
+          }
+        } catch (err) {
+          serverRecoveryRetryAfter.set(name, Date.now() + SERVER_RECOVERY_RETRY_COOLDOWN_MS);
+          console.warn(`[Recovery] '${name}' steady-state identity probe failed: ${String(err?.message || err).slice(0, 300)}`);
+          continue;
+        }
+      }
+
+      let observed;
+      try {
+        observed = await serverStatus(name);
+      } catch (err) {
+        serverRecoveryRetryAfter.set(name, Date.now() + SERVER_RECOVERY_RETRY_COOLDOWN_MS);
+        console.warn(`[Recovery] '${name}' Server status failed: ${String(err?.message || err).slice(0, 300)}`);
+        continue;
+      }
+      if (observed.running) {
+        // serverStatus() may have reconstructed a missing PID ledger from exact
+        // current health/listener identity. That is recovery without restart.
+        serverRecoveryRetryAfter.delete(name);
+        continue;
+      }
+      if (!serverRecoveryAllowed(name)) continue;
+
+      scheduleUnexpectedServerRecovery(name, "poll");
+    }
+  } catch (err) {
+    console.warn(`[Recovery] unexpected Server scan failed: ${String(err?.message || err).slice(0, 300)}`);
+  }
+}
+
+function startUnexpectedServerRecoverySupervisor() {
+  if (serverRecoveryTimer) return;
+  void observeUnexpectedServerRecoveryOnce();
+  serverRecoveryTimer = setInterval(() => {
+    void observeUnexpectedServerRecoveryOnce();
+  }, SERVER_RECOVERY_INTERVAL_MS);
+  serverRecoveryTimer.unref?.();
+}
+
+function tunnelRecoveryAllowed(name) {
+  return Boolean(
+    !managerRestartInFlight
+    && !tunnelRecoverySuppressed.has(name)
+    && !tunnelStartInFlight.has(name)
+    && !tunnelRestartInFlight.has(name)
+    && !tunnelLifecycleChains.has(name)
+    && !serverStartInFlight.has(name)
+    && !serverRestartInFlight.has(name)
+    && !serverRecoveryInFlight.has(name)
+    && !serverLifecycleChains.has(name)
+    && !instanceCatalogMutationInFlight.has(name)
+  );
+}
+
+async function confirmUnexpectedTunnelControlPlaneDrift(name, initial) {
+  const initialDecision = evaluateOpenAiTunnelRecoveryCandidate(initial);
+  if (!initialDecision.recover || !isExactBootRecoveryTunnelGeneration(initial, initial)) {
+    return {
+      confirmed: false,
+      reason: initialDecision.reason || "exact-current-generation-not-proven",
+      observation: initial,
+    };
+  }
+
+  let observation = initial;
+  for (let sample = 1; sample < TUNNEL_RECOVERY_CONFIRMATIONS; sample += 1) {
+    await new Promise((resolve) => setTimeout(resolve, TUNNEL_RECOVERY_CONFIRM_INTERVAL_MS));
+    if (managerRestartInFlight || tunnelRecoverySuppressed.has(name)) {
+      return { confirmed: false, cancelled: true, reason: "lifecycle-cancelled", observation };
+    }
+    observation = await tunnelStatus(name);
+    const decision = evaluateOpenAiTunnelRecoveryCandidate(observation);
+    if (!decision.recover) {
+      const recovered = Boolean(
+        observation.running
+        && observation.owned
+        && !observation.configDrift
+        && !observation.healthDrift
+      );
+      return {
+        confirmed: false,
+        recovered,
+        reason: recovered ? "control-plane-recovered" : decision.reason,
+        observation,
+      };
+    }
+    if (!isExactBootRecoveryTunnelGeneration(initial, observation)) {
+      return { confirmed: false, reason: "generation-or-authority-changed", observation };
+    }
+  }
+  return { confirmed: true, observation };
+}
+
+async function recoverUnexpectedTunnelUnlocked(name) {
+  if (!tunnelRecoveryAllowed(name)) {
+    return { ok: true, skipped: true, reason: "suppressed" };
+  }
+  const config = await readInstanceConfig(name);
+  if (config?.autoStart !== true) {
+    return { ok: true, skipped: true, reason: "disabled" };
+  }
+
+  let current = await tunnelStatus(name);
+  if (!current.running) {
+    const gateway = await enqueueRuntimeDeploy(
+      () => ensureRuntimeAndServerUnlocked(name, { restartTarget: false })
+    );
+    if (!gateway.ok) {
+      return { ...gateway, ok: false, recovered: false, recoveryReason: "tunnel-absent" };
+    }
+    if (!tunnelRecoveryAllowed(name)) {
+      return { ok: true, skipped: true, reason: "suppressed" };
+    }
+    if ((await readInstanceConfig(name))?.autoStart !== true) {
+      return { ok: true, skipped: true, reason: "disabled" };
+    }
+    current = await tunnelStatus(name);
+    if (current.running) {
+      return { ok: true, skipped: true, reason: "running", tunnel: current };
+    }
+    console.warn(`[Recovery] '${name}' managed Tunnel disappeared unexpectedly; autoStart=true, restoring service.`);
+    const started = await enqueueTunnelLifecycle(name, () => startTunnelUnlocked(name));
+    return {
+      ...started,
+      recovered: started?.ok === true,
+      recoveryReason: "tunnel-absent",
+    };
+  }
+
+  const decision = evaluateOpenAiTunnelRecoveryCandidate(current);
+  if (!decision.recover) {
+    return { ok: true, skipped: true, reason: decision.reason, tunnel: current };
+  }
+
+  const confirmation = await confirmUnexpectedTunnelControlPlaneDrift(name, current);
+  if (!confirmation.confirmed) {
+    if (confirmation.cancelled) {
+      return { ok: true, skipped: true, cancelled: true, reason: confirmation.reason };
+    }
+    if (confirmation.recovered) {
+      return {
+        ok: true,
+        skipped: true,
+        recovered: false,
+        reason: confirmation.reason,
+        tunnel: confirmation.observation,
+      };
+    }
+    return {
+      ok: true,
+      skipped: true,
+      recovered: false,
+      reason: confirmation.reason,
+      tunnel: confirmation.observation,
+    };
+  }
+
+  if (managerRestartInFlight || tunnelRecoverySuppressed.has(name)) {
+    return { ok: true, skipped: true, cancelled: true, reason: "lifecycle-cancelled" };
+  }
+  if ((await readInstanceConfig(name))?.autoStart !== true) {
+    return { ok: true, skipped: true, reason: "disabled" };
+  }
+
+  console.warn(
+    `[Recovery] '${name}' OpenAI Tunnel control-plane poll remained stale across ${TUNNEL_RECOVERY_CONFIRMATIONS} exact-generation observations; restarting transport.`
+  );
+  const restarted = await enqueueTunnelLifecycle(
+    name,
+    () => restartTunnelUnlocked(name, confirmation.observation)
+  );
+  return {
+    ...restarted,
+    recovered: restarted?.ok === true,
+    recoveryReason: "control-plane-stale",
+  };
+}
+
+function scheduleUnexpectedTunnelRecovery(name, source = "poll") {
+  if (!tunnelRecoveryAllowed(name)) return false;
+  if (tunnelRecoveryInFlight.has(name)) return false;
+  if ((tunnelRecoveryRetryAfter.get(name) || 0) > Date.now()) return false;
+
+  const pending = enqueueTunnelCommand(name, () => recoverUnexpectedTunnelUnlocked(name));
+  tunnelRecoveryInFlight.set(name, pending);
+  void pending.then((result) => {
+    if (result?.ok === false) {
+      tunnelRecoveryRetryAfter.set(name, Date.now() + TUNNEL_RECOVERY_RETRY_COOLDOWN_MS);
+      console.warn(
+        `[Recovery] '${name}' Tunnel restore from ${source} failed: ${String(result.error || "unknown error").slice(0, 300)}`
+      );
+    } else if (result?.recovered === true) {
+      // Avoid restart storms if the upstream path remains degraded immediately
+      // after a successful local replacement.
+      tunnelRecoveryRetryAfter.set(name, Date.now() + TUNNEL_RECOVERY_RETRY_COOLDOWN_MS);
+      console.warn(`[Recovery] '${name}' Tunnel recovered from ${source}.`);
+    } else if (!result?.skipped) {
+      tunnelRecoveryRetryAfter.delete(name);
+    }
+  }).catch((err) => {
+    tunnelRecoveryRetryAfter.set(name, Date.now() + TUNNEL_RECOVERY_RETRY_COOLDOWN_MS);
+    console.warn(
+      `[Recovery] '${name}' Tunnel restore from ${source} failed: ${String(err?.message || err).slice(0, 300)}`
+    );
+  }).finally(() => {
+    if (tunnelRecoveryInFlight.get(name) === pending) tunnelRecoveryInFlight.delete(name);
+  });
+  return true;
+}
+
+async function observeUnexpectedTunnelRecoveryOnce() {
+  if (managerRestartInFlight) return;
+  try {
+    const names = await listInstances();
+    for (const name of names) {
+      if (managerRestartInFlight) return;
+      if (!tunnelRecoveryAllowed(name)) continue;
+      if (tunnelRecoveryInFlight.has(name)) continue;
+      if ((tunnelRecoveryRetryAfter.get(name) || 0) > Date.now()) continue;
+
+      let config;
+      try {
+        config = await readInstanceConfig(name);
+      } catch (err) {
+        tunnelRecoveryRetryAfter.set(name, Date.now() + TUNNEL_RECOVERY_RETRY_COOLDOWN_MS);
+        console.warn(`[Recovery] '${name}' Tunnel config read failed: ${String(err?.message || err).slice(0, 300)}`);
+        continue;
+      }
+      if (config?.autoStart !== true) {
+        tunnelRecoveryRetryAfter.delete(name);
+        continue;
+      }
+
+      const inst = instPaths(name);
+      const savedPid = await readPidFile(inst.tunnelPid);
+      let requiresFullStatus = !(savedPid && isPidAlive(savedPid));
+      if (!requiresFullStatus) {
+        try {
+          const env = await readInstanceEnv(name);
+          const tunnelId = String(env.OPENAI_TUNNEL_ID || "");
+          const apiKey = String(env.OPENAI_TUNNEL_API_KEY || "");
+          const savedStartedAt = String(config.tunnelProcessStartedAt || "");
+          // The cheap freshness path is observation-only, but it still must not
+          // trust a numeric PID by itself. Reuse the shared 10s process snapshot
+          // to prove this is the one same-profile OpenAI generation before
+          // allowing fresh metrics to skip the heavier full status scan. A rare
+          // PID-reuse race can therefore delay observation by at most the cache
+          // window; destructive Stop/Restart authority is separately revalidated
+          // with a forced exact PID/CreationDate query immediately before kill.
+          const quickCandidates = tunnelId && apiKey && savedStartedAt
+            ? (await processesWithCmdLineAsync("tunnel-client.exe", inst.profile))
+                .filter((process) => isPidAlive(process.pid))
+            : [];
+          const quickIdentityExact = Boolean(
+            quickCandidates.length === 1
+            && quickCandidates[0].pid === savedPid
+            && quickCandidates[0].startedAt === savedStartedAt
+            && sameExecutablePath(quickCandidates[0].executablePath, expectedOpenAiTunnelRuntimePath())
+          );
+          if (!quickIdentityExact) {
+            requiresFullStatus = true;
+          } else {
+            const healthPort = Number(config.healthPort || env.OPENAI_TUNNEL_HEALTH_PORT || 8080);
+            const freshness = await tunnelClientControlPlaneFreshness(healthPort);
+            if (freshness.supported === true && freshness.fresh === true) {
+              tunnelRecoveryRetryAfter.delete(name);
+              continue;
+            }
+            if (freshness.supported === true && freshness.fresh === false) {
+              requiresFullStatus = true;
+            } else {
+              // Missing metrics on an older client is not a recovery signal. Only
+              // fall back to exact status if local readiness is also gone, which
+              // distinguishes compatibility-unknown from a disappeared transport.
+              const localHealthy = await tunnelClientHealth(healthPort);
+              if (localHealthy) {
+                tunnelRecoveryRetryAfter.delete(name);
+                continue;
+              }
+              requiresFullStatus = true;
+            }
+          }
+        } catch {
+          requiresFullStatus = true;
+        }
+      }
+      if (!requiresFullStatus) continue;
+
+      let observed;
+      try {
+        observed = await tunnelStatus(name);
+      } catch (err) {
+        tunnelRecoveryRetryAfter.set(name, Date.now() + TUNNEL_RECOVERY_RETRY_COOLDOWN_MS);
+        console.warn(`[Recovery] '${name}' Tunnel status failed: ${String(err?.message || err).slice(0, 300)}`);
+        continue;
+      }
+      if (!tunnelRecoveryAllowed(name)) continue;
+      if (!observed.running) {
+        scheduleUnexpectedTunnelRecovery(name, "poll-absent");
+        continue;
+      }
+      const decision = evaluateOpenAiTunnelRecoveryCandidate(observed);
+      if (decision.recover) {
+        scheduleUnexpectedTunnelRecovery(name, "poll-control-plane-stale");
+      } else {
+        tunnelRecoveryRetryAfter.delete(name);
+      }
+    }
+  } catch (err) {
+    console.warn(`[Recovery] unexpected Tunnel scan failed: ${String(err?.message || err).slice(0, 300)}`);
+  }
+}
+
+function startUnexpectedTunnelRecoverySupervisor() {
+  if (tunnelRecoveryTimer) return;
+  void observeUnexpectedTunnelRecoveryOnce();
+  tunnelRecoveryTimer = setInterval(() => {
+    void observeUnexpectedTunnelRecoveryOnce();
+  }, TUNNEL_RECOVERY_INTERVAL_MS);
+  tunnelRecoveryTimer.unref?.();
 }
 
 function startStaleConfigObserver() {
@@ -5363,7 +6728,7 @@ async function ensureManagedRuntimeDefaults(name) {
       }
       if (Object.keys(updates).length === 0) return { changed: false };
       const next = serializeDotEnv({ ...env, ...updates }, raw);
-      await atomicWriteFile(file, next, "utf8");
+      await atomicWriteSecretFile(file, next, "utf8");
       return { changed: true, updates };
     } catch (err) {
       if (err?.code === "ENOENT") return { changed: false };
@@ -5679,6 +7044,10 @@ async function createInstanceUnlocked(body) {
   if (!INSTANCE_NAME_RE.test(name)) {
     return { ok: false, error: "Tên instance: 2–32 ký tự, chỉ chữ thường/số/gạch ngang, bắt đầu bằng chữ hoặc số." };
   }
+  if (body.fullDiskAccess !== undefined && typeof body.fullDiskAccess !== "boolean") {
+    return { ok: false, error: "FULL_DISK_ACCESS must be a boolean when creating an instance." };
+  }
+  const fullDiskAccess = body.fullDiskAccess === true;
   const existingInstances = await listInstances();
   if (existingInstances.includes(name)) {
     return { ok: false, error: `Instance '${name}' đã tồn tại.` };
@@ -5730,6 +7099,7 @@ async function createInstanceUnlocked(body) {
     `PORT=${port}`,
     `ADMIN_PORT=${adminPort}`,
     `WORKSPACE_PATH=${ws}`,
+    `FULL_DISK_ACCESS=${fullDiskAccess ? "true" : "false"}`,
     "OPENAI_TUNNEL_ID=",
     "OPENAI_TUNNEL_API_KEY=",
     `OPENAI_TUNNEL_HEALTH_PORT=${healthPort}`,
@@ -5740,6 +7110,9 @@ async function createInstanceUnlocked(body) {
     `MCP_SESSION_CLEANUP_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_CLEANUP_MS}`,
     `MCP_SESSION_DELETE_GRACE_MS=${SESSION_POLICY_DEFAULTS.MCP_SESSION_DELETE_GRACE_MS}`,
     `MCP_MAX_SESSIONS=${SESSION_POLICY_DEFAULTS.MCP_MAX_SESSIONS}`,
+    "EXTRA_WORKSPACE_PATHS=",
+    "PROJECT_MEMORY_MAX_BYTES=0",
+    "PROJECT_MEMORY_MAX_LINES=0",
     "AUDIT_LOG_PATH=.mcp-audit.log",
     "",
   ].join("\n");
@@ -5752,7 +7125,7 @@ async function createInstanceUnlocked(body) {
   const stagedConfig = path.join(stageDir, "config.json");
   await fsp.mkdir(stageDir, { recursive: false });
   try {
-    await atomicWriteFile(stagedEnv, envText, "utf8");
+    await atomicWriteSecretFile(stagedEnv, envText, "utf8");
     await writeJson(stagedConfig, {
       lastTunnelUrl: "",
       healthPort,
@@ -6017,6 +7390,7 @@ async function saveInstanceEnvUnlocked(name, body) {
   const inst = instPaths(name);
   const original = await readInstanceEnvRaw(name);
   const originalValues = parseDotEnv(original);
+  const structuredSave = typeof body.raw !== "string";
   let next;
   if (typeof body.raw === "string") {
     next = restoreMaskedRawEnv(body.raw, originalValues);
@@ -6098,8 +7472,9 @@ async function saveInstanceEnvUnlocked(name, body) {
   // config authority is readable before committing `.env`; otherwise a corrupt
   // config could make the API return failure after silently changing runtime
   // configuration. A later I/O race is handled by rolling `.env` back below.
+  let originalConfig;
   try {
-    await readInstanceConfig(name);
+    originalConfig = await readInstanceConfig(name);
   } catch (err) {
     return {
       ok: false,
@@ -6108,7 +7483,22 @@ async function saveInstanceEnvUnlocked(name, body) {
     };
   }
 
-  await atomicWriteFile(inst.env, next, "utf8");
+  if (structuredSave) {
+    const originalSemanticEnv = structuredEnvSemantics(originalValues, originalConfig);
+    const nextSemanticEnv = structuredEnvSemantics(parsed, originalConfig);
+    const configHealthPort = Number(originalConfig.healthPort || oldHealthPort || 8080);
+    const configAutoStart = originalConfig.autoStart === true;
+    const targetAutoStart = typeof body.autoStart === "boolean" ? body.autoStart : configAutoStart;
+    if (
+      sameEnvSemantics(originalSemanticEnv, nextSemanticEnv)
+      && hp === configHealthPort
+      && targetAutoStart === configAutoStart
+    ) {
+      return { ok: true, path: inst.env, unchanged: true };
+    }
+  }
+
+  await atomicWriteSecretFile(inst.env, next, "utf8");
   try {
     await updateInstanceConfig(name, (config) => {
       config.healthPort = hp;
@@ -6117,7 +7507,7 @@ async function saveInstanceEnvUnlocked(name, body) {
   } catch (err) {
     let rollbackError = null;
     try {
-      await atomicWriteFile(inst.env, original, "utf8");
+      await atomicWriteSecretFile(inst.env, original, "utf8");
     } catch (restoreErr) {
       rollbackError = String(restoreErr?.message || restoreErr).slice(0, 500);
     }
@@ -6326,6 +7716,9 @@ async function handleApi(req, res, url, body, instanceAdmission = null) {
     const [instances, manager] = await Promise.all([
       Promise.all(names.map(async (n) => {
       try {
+        // /api/instances is the canonical ownership-bearing status contract.
+        // It must retain strict identity proof and PID-ledger recovery semantics;
+        // callers that only need a cheap catalog already have /api/instance-catalog.
         return await instanceBundle(n, { includeCheck: false });
       } catch (err) {
         // một instance lỗi (vd env bị xóa) không được làm 500 toàn bộ list
@@ -6418,11 +7811,11 @@ async function handleApi(req, res, url, body, instanceAdmission = null) {
 
     if (req.method === "POST" && sub === "/check") return json(res, 200, await checkConfigRequest(name, body));
 
-    if (req.method === "POST" && sub === "/server/start") return json(res, 200, await dispatchInstanceMutation(() => startServer(name)));
+    if (req.method === "POST" && sub === "/server/start") return json(res, 200, await dispatchInstanceMutation(() => startServerExplicit(name)));
     if (req.method === "POST" && sub === "/server/stop") return json(res, 200, await dispatchInstanceMutation(() => stopServer(name)));
     if (req.method === "POST" && sub === "/server/restart") return json(res, 200, await dispatchInstanceMutation(() => restartServer(name)));
 
-    if (req.method === "POST" && sub === "/tunnel/start") return json(res, 200, await dispatchInstanceMutation(() => startTunnel(name)));
+    if (req.method === "POST" && sub === "/tunnel/start") return json(res, 200, await dispatchInstanceMutation(() => startTunnelExplicit(name)));
     if (req.method === "POST" && sub === "/tunnel/stop") return json(res, 200, await dispatchInstanceMutation(() => stopTunnel(name)));
     if (req.method === "POST" && sub === "/tunnel/restart") return json(res, 200, await dispatchInstanceMutation(() => restartTunnel(name)));
 
@@ -6574,7 +7967,7 @@ async function handleApi(req, res, url, body, instanceAdmission = null) {
   }
 
   if (req.method === "POST" && p === "/api/server/start") {
-    return json(res, 200, await dispatchDefaultMutation(() => startServer(dname)));
+    return json(res, 200, await dispatchDefaultMutation(() => startServerExplicit(dname)));
   }
 
   if (req.method === "POST" && p === "/api/server/stop") {
@@ -6586,7 +7979,7 @@ async function handleApi(req, res, url, body, instanceAdmission = null) {
   }
 
   if (req.method === "POST" && p === "/api/tunnel/start") {
-    return json(res, 200, await dispatchDefaultMutation(() => startTunnel(dname)));
+    return json(res, 200, await dispatchDefaultMutation(() => startTunnelExplicit(dname)));
   }
 
   if (req.method === "POST" && p === "/api/tunnel/stop") {
@@ -6879,8 +8272,11 @@ async function main() {
     console.error(`[Auto] bootstrap supervisor failed: ${String((err && err.message) || err).slice(0, 300)}`);
   }).finally(() => {
     // Bootstrap handles the initial desired state. Afterwards continuously
-    // observe stale configuration on already-running Server/Tunnel processes.
-    // Healthy serving generations are preserved; maintenance requires explicit Restart.
+    // recover only truly absent autoStart Servers and separately observe stale
+    // configuration on already-running Server/Tunnel processes. Healthy serving
+    // generations are preserved; maintenance requires explicit Restart.
+    startUnexpectedServerRecoverySupervisor();
+    startUnexpectedTunnelRecoverySupervisor();
     startStaleConfigObserver();
   });
 }

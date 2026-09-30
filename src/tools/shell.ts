@@ -163,17 +163,37 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       annotations: toolAnnotations("command"),
     },
     async ({ command, working_directory }) => {
+      const requestStartedAt = performance.now();
       requireCommandAllowed(command);
       const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
       const configuredTimeoutMs = timeoutSec * 1000;
       const effectiveTimeoutMs = clampSyncTimeoutMs(configuredTimeoutMs);
+      const validationFinishedAt = performance.now();
       const result = await execInShellSession(command, defaultCwd, effectiveTimeoutMs, cwdOverride);
+      const commandFinishedAt = performance.now();
       const commandOutcome = classifyCommandOutcome(
         command,
         result.exit_code,
         result.stderr,
         result.timed_out
       );
+      const auditStartedAt = performance.now();
+      await audit({
+        tool: "run_command",
+        action: "command",
+        target: result.cwd,
+        status: commandOutcome === "failed" || commandOutcome === "timed_out" ? "error" : "ok",
+        details: {
+          command,
+          exit_code: result.exit_code,
+          command_outcome: commandOutcome,
+          shell_strategy: result.shell_strategy,
+          shell_executable: result.shell_executable,
+          spawn_ms: result.spawn_ms,
+          command_ms: result.command_ms,
+        },
+      });
+      const requestFinishedAt = performance.now();
       const response = {
         ...result,
         command_outcome: commandOutcome,
@@ -187,14 +207,14 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         next_action: result.timed_out
           ? "Continue the task. This command was terminated at the synchronous response budget; inspect any possible side effects, then use start_process + process_output for long-running work. Do not treat this as an MCP session or ChatGPT turn termination."
           : null,
+        timing: {
+          validation_ms: Math.max(0, validationFinishedAt - requestStartedAt),
+          spawn_ms: result.spawn_ms ?? null,
+          command_ms: result.command_ms ?? Math.max(0, commandFinishedAt - validationFinishedAt),
+          audit_ms: Math.max(0, requestFinishedAt - auditStartedAt),
+          total_ms: Math.max(0, requestFinishedAt - requestStartedAt),
+        },
       };
-      await audit({
-        tool: "run_command",
-        action: "command",
-        target: result.cwd,
-        status: commandOutcome === "failed" || commandOutcome === "timed_out" ? "error" : "ok",
-        details: { command, exit_code: result.exit_code, command_outcome: commandOutcome },
-      });
       return toolResult("run_command", response, {
         ok: commandOutcome !== "failed" && commandOutcome !== "timed_out",
         summary:

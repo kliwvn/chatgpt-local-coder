@@ -199,6 +199,18 @@ try {
       /continuation_required=true.*process_output\.running=true.*keep polling with process_output until the process reaches running=false/i.test(CODEX_AGENT_PROMPT),
     CODEX_AGENT_PROMPT.slice(0, 7600)
   );
+  check(
+    "multi-repo instructions allow trusted dynamic binding without shared-cwd contamination",
+    /non-default project.*FULL_DISK_ACCESS=true.*bound dynamically through project_context\(path\).*FULL_DISK_ACCESS=false.*exact configured workspace root/is.test(CODEX_AGENT_PROMPT) &&
+      /Persistent cwd\/history are instance-global, not chat-scoped.*pass working_directory explicitly.*isolated.*does not mutate persistent cwd\/history/is.test(CODEX_AGENT_PROMPT) &&
+      /For shell\/build\/test work in that non-default project, pass working_directory/is.test(CODEX_AGENT_PROMPT),
+    CODEX_AGENT_PROMPT.slice(0, 9000)
+  );
+  check(
+    "quickstart requires isolated working_directory for non-default repo shell work",
+    /For run_command\/start_process in that repo, pass working_directory explicitly.*instance-global across chats.*isolated one-off/is.test(String(status.quickstart || "")),
+    String(status.quickstart || "").slice(0, 4200)
+  );
   check("agent_status process sandbox required", status.process_security?.process_sandbox_mode === "required", `${status.process_security?.process_sandbox_mode}`);
   check("agent_status AppContainer backend", status.process_security?.sandbox_backend === "windows_appcontainer", `${status.process_security?.sandbox_backend}`);
   check("agent_status sandbox self-test passed", status.process_security?.sandbox_self_test === "passed", `${status.process_security?.sandbox_self_test}`);

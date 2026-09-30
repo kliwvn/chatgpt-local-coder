@@ -21,18 +21,45 @@ function runChild(file, args, options = {}) {
     child.stdout.on("data", (chunk) => { stdout += String(chunk); });
     child.stderr.on("data", (chunk) => { stderr += String(chunk); });
     const timer = setTimeout(() => {
-      try { child.kill(); } catch {}
-      reject(new Error(`child timed out: ${file} ${args.join(" ")}`));
+      try {
+        if (process.platform === "win32" && child.pid) {
+          spawnSync("taskkill.exe", ["/pid", String(child.pid), "/t", "/f"], {
+            stdio: "ignore",
+            windowsHide: true,
+            timeout: 5000,
+          });
+        } else {
+          child.kill();
+        }
+      } catch {}
+      reject(new Error(
+        `child timed out: ${file} ${args.join(" ")}\n` +
+        `stdout=${JSON.stringify(stdout)}\nstderr=${JSON.stringify(stderr)}`
+      ));
     }, options.timeout || 10000);
     child.once("error", (err) => {
       clearTimeout(timer);
       reject(err);
     });
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       clearTimeout(timer);
       resolve({ status: code, signal, stdout, stderr });
     });
   });
+}
+
+async function removeTempBounded(dir) {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      const transient = ["EBUSY", "ENOTEMPTY", "EPERM", "EACCES"].includes(err?.code);
+      if (!transient || Date.now() >= deadline) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
 }
 
 assert.match(source, /CLC_OS_SANDBOX%"=="windows_appcontainer/i);
@@ -179,12 +206,19 @@ assert.match(
 );
 
 if (process.platform === "win32") {
+  // Windows Defender/AV on the deployment host can delay each fresh
+  // powershell.exe by 10-16s. The tunnel fixture below legitimately executes
+  // two PowerShell processes in sequence (manager probe + API action), so 30s
+  // is not a stable functional-test budget under host contention. Keep this
+  // bounded but comfortably above the measured cold-start envelope; these
+  // assertions verify fail-closed/exit propagation, not startup performance.
+  const WINDOWS_LAUNCHER_TEST_TIMEOUT_MS = 60_000;
   const run = spawnSync("cmd.exe", ["/d", "/c", launcher, "start"], {
     cwd: root,
     env: { ...process.env, CLC_OS_SANDBOX: "windows_appcontainer" },
     stdio: "ignore",
     windowsHide: true,
-    timeout: 5000,
+    timeout: WINDOWS_LAUNCHER_TEST_TIMEOUT_MS,
   });
   assert.equal(run.error, undefined, run.error?.message);
   assert.equal(run.status, 1, `sandboxed launcher start must exit 1, got ${run.status}`);
@@ -198,19 +232,26 @@ if (process.platform === "win32") {
     // Point APPDATA at a regular file so WScript.Shell cannot save the .lnk below it.
     const fakeAppData = path.join(tmp, "appdata-file");
     await fs.writeFile(fakeAppData, "not-a-directory", "utf8");
+    const autostartFailEnv = { ...process.env, APPDATA: fakeAppData };
+    // ServiceHub-managed Local Coder processes intentionally export this override.
+    // This fixture is testing the APPDATA fallback, so inheriting the live override
+    // would route the child to a real writable Startup directory and false-green.
+    delete autostartFailEnv.CLC_STARTUP_DIR;
     const autostartFail = spawnSync("cmd.exe", ["/d", "/c", isolatedLauncher, "autostart"], {
       cwd: tmp,
-      env: { ...process.env, APPDATA: fakeAppData },
+      env: autostartFailEnv,
       encoding: "utf8",
       windowsHide: true,
-      timeout: 10000,
+      timeout: WINDOWS_LAUNCHER_TEST_TIMEOUT_MS,
     });
     assert.equal(autostartFail.error, undefined, autostartFail.error?.message);
     assert.notEqual(autostartFail.status, 0, `autostart creation failure must propagate non-zero, output=${autostartFail.stdout}${autostartFail.stderr}`);
 
     // A real Manager-identity health response followed by a failed tunnel action
     // must also propagate the PowerShell/API failure through cmd.exe.
+    const fakeManagerRequests = [];
     const fakeManager = http.createServer((req, res) => {
+      fakeManagerRequests.push(`${req.method} ${req.url}`);
       res.setHeader("content-type", "application/json");
       if (req.url === "/api/health") {
         res.end(JSON.stringify({ ok: true, name: "chatgpt-local-coder-manager", pid: process.pid }));
@@ -234,24 +275,29 @@ if (process.platform === "win32") {
     try {
       const port = fakeManager.address().port;
       await fs.writeFile(path.join(tmp, ".env"), `MANAGER_PORT=${port}\n`, "utf8");
-      const tunnelFail = await runChild("cmd.exe", ["/d", "/c", isolatedLauncher, "tunnel", "start"], {
-        cwd: tmp,
-        windowsHide: true,
-        timeout: 10000,
-      });
+      let tunnelFail;
+      try {
+        tunnelFail = await runChild("cmd.exe", ["/d", "/c", isolatedLauncher, "tunnel", "start"], {
+          cwd: tmp,
+          windowsHide: true,
+          timeout: WINDOWS_LAUNCHER_TEST_TIMEOUT_MS,
+        });
+      } catch (error) {
+        throw new Error(`${error.message}\nfake_manager_requests=${JSON.stringify(fakeManagerRequests)}`);
+      }
       assert.notEqual(tunnelFail.status, 0, `failed tunnel API action must propagate non-zero, output=${tunnelFail.stdout}${tunnelFail.stderr}`);
 
       const statusOk = await runChild("cmd.exe", ["/d", "/c", isolatedLauncher, "status"], {
         cwd: tmp,
         windowsHide: true,
-        timeout: 10000,
+        timeout: WINDOWS_LAUNCHER_TEST_TIMEOUT_MS,
       });
       assert.equal(statusOk.status, 0, `valid fake Manager identity should satisfy status, output=${statusOk.stdout}${statusOk.stderr}`);
     } finally {
       await new Promise((resolve) => fakeManager.close(resolve));
     }
   } finally {
-    await fs.rm(tmp, { recursive: true, force: true });
+    await removeTempBounded(tmp);
   }
 }
 

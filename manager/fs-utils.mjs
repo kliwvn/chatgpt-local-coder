@@ -253,6 +253,75 @@ export async function readResponseTextBounded(response, maxBytes, label = "respo
 }
 
 /**
+ * Scan a streaming text response for the first line whose prefix is an exact
+ * metric/token name, without buffering the full response body. The byte ceiling
+ * applies only to bytes consumed while searching, so a very large response can
+ * still be handled safely when the required line appears early enough.
+ *
+ * Returns null when the stream ends without a matching line.
+ */
+export async function readResponseLineByPrefixBounded(
+  response,
+  prefix,
+  maxBytes,
+  label = "response"
+) {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error("maxBytes must be a positive safe integer");
+  }
+  const target = String(prefix || "");
+  if (!target || /[\r\n]/.test(target)) {
+    throw new Error("prefix must be a non-empty single-line string");
+  }
+  if (!response?.body) return null;
+
+  const matches = (rawLine) => {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (!line.startsWith(target)) return null;
+    const boundary = line[target.length];
+    if (boundary !== undefined && boundary !== "{" && !/\s/.test(boundary)) return null;
+    return line;
+  };
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let total = 0;
+  let pending = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        pending += decoder.decode();
+        const match = matches(pending);
+        return match;
+      }
+
+      const buffer = Buffer.isBuffer(value) ? value : Buffer.from(value);
+      total += buffer.length;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error(`${label} exceeds ${maxBytes} bytes while searching (${total} bytes received)`);
+      }
+
+      pending += decoder.decode(value, { stream: true });
+      while (true) {
+        const newline = pending.indexOf("\n");
+        if (newline < 0) break;
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        const match = matches(line);
+        if (match !== null) {
+          await reader.cancel().catch(() => undefined);
+          return match;
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
  * Stream a Fetch Response to disk with an exact byte ceiling. The payload is
  * written to a sibling temp file and committed only after the full stream fits,
  * so oversized/truncated downloads never replace a known-good destination.
@@ -388,8 +457,64 @@ export function extractSingleZipEntryBoundedWindows(zipFile, outputFile, entryBa
   };
 }
 
-/** Atomic same-directory replace with a Windows-safe backup/rollback fallback. */
-export async function atomicWriteFile(file, data, encoding = "utf8") {
+let cachedWindowsUserSid = null;
+
+function currentWindowsUserSid() {
+  if (cachedWindowsUserSid) return cachedWindowsUserSid;
+  const result = spawnSync("whoami.exe", ["/user", "/fo", "csv", "/nh"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 5000,
+  });
+  if (result.error || result.status !== 0) {
+    const detail = String(result.error?.message || result.stderr || result.stdout || "unknown error").trim().slice(0, 500);
+    throw new Error(`SECRET_ACL_USER_SID_FAILED: unable to resolve current Windows user SID: ${detail}`);
+  }
+  const match = String(result.stdout || "").match(/S-\d(?:-\d+)+/);
+  if (!match) throw new Error("SECRET_ACL_USER_SID_FAILED: whoami output did not contain a SID");
+  cachedWindowsUserSid = match[0];
+  return cachedWindowsUserSid;
+}
+
+/**
+ * Remove inherited ACLs from a secret authority file and retain access only for
+ * the current service account, SYSTEM, and local Administrators. On POSIX the
+ * equivalent contract is owner read/write only.
+ */
+export async function hardenSecretFilePermissions(file) {
+  const stat = await fs.lstat(file);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new Error(`SECRET_ACL_INVALID_FILE: secret authority must be a regular non-symlink file: ${file}`);
+  }
+  if (process.platform !== "win32") {
+    await fs.chmod(file, 0o600);
+    return;
+  }
+
+  const userSid = currentWindowsUserSid();
+  const result = spawnSync(
+    "icacls.exe",
+    [
+      file,
+      "/inheritance:r",
+      "/grant:r",
+      `*${userSid}:(F)`,
+      "*S-1-5-18:(F)",
+      "*S-1-5-32-544:(F)",
+    ],
+    {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 10_000,
+    }
+  );
+  if (result.error || result.status !== 0) {
+    const detail = String(result.error?.message || result.stderr || result.stdout || "unknown error").trim().slice(0, 500);
+    throw new Error(`SECRET_ACL_HARDEN_FAILED: icacls failed for ${file}: ${detail}`);
+  }
+}
+
+async function atomicWriteFilePrepared(file, data, encoding, prepareTemp = null) {
   await fs.mkdir(path.dirname(file), { recursive: true });
   const token = `${process.pid}-${Date.now().toString(36)}-${(++writeSeq).toString(36)}`;
   const tmp = `${file}.tmp-${token}`;
@@ -398,6 +523,7 @@ export async function atomicWriteFile(file, data, encoding = "utf8") {
   let committed = false;
   await fs.writeFile(tmp, data, encoding);
   try {
+    if (prepareTemp) await prepareTemp(tmp);
     try {
       await fs.rename(tmp, file);
       committed = true;
@@ -432,4 +558,17 @@ export async function atomicWriteFile(file, data, encoding = "utf8") {
     await fs.rm(tmp, { force: true }).catch(() => undefined);
     if (committed && backupCreated) await fs.rm(backup, { force: true }).catch(() => undefined);
   }
+}
+
+/** Atomic same-directory replace with a Windows-safe backup/rollback fallback. */
+export async function atomicWriteFile(file, data, encoding = "utf8") {
+  return atomicWriteFilePrepared(file, data, encoding);
+}
+
+/**
+ * Atomic secret write whose replacement bytes already have a restrictive ACL
+ * before they become authority at the destination path.
+ */
+export async function atomicWriteSecretFile(file, data, encoding = "utf8") {
+  return atomicWriteFilePrepared(file, data, encoding, hardenSecretFilePermissions);
 }

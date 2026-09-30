@@ -5,7 +5,11 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const root = await fs.mkdtemp(path.join(path.dirname(repoRoot), "clc-git-appcontainer-"));
+const configuredWorkspace = process.env.WORKSPACE_PATH?.trim();
+const testBase = configuredWorkspace && path.isAbsolute(configuredWorkspace)
+  ? path.resolve(configuredWorkspace)
+  : path.resolve(repoRoot, "..");
+const root = await fs.mkdtemp(path.join(testBase, "clc-git-appcontainer-"));
 const repo = path.join(root, "repo");
 const old = {
   FULL_DISK_ACCESS: process.env.FULL_DISK_ACCESS,

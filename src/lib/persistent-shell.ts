@@ -16,6 +16,11 @@ export interface ShellExecResult {
   stdout_truncated?: boolean;
   stderr_truncated?: boolean;
   output_max_chars?: number;
+  shell_strategy?: "direct_exec" | "cmd_fast" | "powershell" | "bash";
+  shell_executable?: string;
+  spawn_ms?: number;
+  command_ms?: number;
+  shell_total_ms?: number;
 }
 
 import {
@@ -190,8 +195,136 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
   return { cwd, command: rest || "pwd", changed };
 }
 
-export function buildShellProcessInvocation(command: string): { executable: string; args: string[] } {
-  const executable = process.platform === "win32" ? "powershell.exe" : "bash";
+const WINDOWS_CMD_FAST_PATH_COMMANDS = new Set([
+  "bun", "cargo", "cmake", "cmd", "docker", "dotnet", "fd", "gh", "git",
+  "go", "gradle", "gradlew", "java", "javac", "mvn", "ninja", "node", "npm",
+  "npm.cmd", "npx", "npx.cmd", "pip", "pip3", "pnpm", "pnpm.cmd", "py",
+  "python", "python3", "rg", "rustc", "tsc", "where", "yarn", "yarn.cmd", "echo",
+]);
+
+const WINDOWS_DIRECT_EXEC_COMMANDS = new Set([
+  "bun", "bun.exe", "cargo", "cargo.exe", "cmake", "cmake.exe",
+  "docker", "docker.exe", "dotnet", "dotnet.exe", "fd", "fd.exe",
+  "gh", "gh.exe", "git", "git.exe", "go", "go.exe", "java", "java.exe",
+  "javac", "javac.exe", "ninja", "ninja.exe", "node", "node.exe",
+  "py", "py.exe", "python", "python.exe", "python3", "python3.exe",
+  "rg", "rg.exe", "rustc", "rustc.exe",
+]);
+
+function parseWindowsDirectCommand(command: string): { executable: string; args: string[] } | null {
+  if (process.platform !== "win32" || !getFullDiskAccess()) return null;
+
+  const tokens: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+  let tokenStarted = false;
+
+  const pushToken = () => {
+    if (!tokenStarted) return;
+    tokens.push(current);
+    current = "";
+    tokenStarted = false;
+  };
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (ch === "\r" || ch === "\n") return null;
+
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+        tokenStarted = true;
+        continue;
+      }
+      // PowerShell interpolation/escaping has shell semantics that direct argv
+      // execution must not silently reinterpret.
+      if (ch === "$" || ch === "`") return null;
+      current += ch;
+      tokenStarted = true;
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      pushToken();
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      tokenStarted = true;
+      continue;
+    }
+    if (";&|<>$`%^!()#*?".includes(ch)) return null;
+    current += ch;
+    tokenStarted = true;
+  }
+
+  if (quote) return null;
+  pushToken();
+  if (tokens.length === 0) return null;
+
+  const executable = tokens[0];
+  const token = path.basename(executable).toLowerCase();
+  if (!WINDOWS_DIRECT_EXEC_COMMANDS.has(token)) return null;
+  return { executable, args: tokens.slice(1) };
+}
+
+function firstCommandToken(command: string): string | null {
+  const trimmed = command.trim();
+  if (!trimmed || trimmed.startsWith('"') || trimmed.startsWith("'")) return null;
+  const match = trimmed.match(/^([^\s&|<>]+)/);
+  if (!match) return null;
+  return path.basename(match[1]).toLowerCase();
+}
+
+function hasUnsafeCmdFastPathSyntax(command: string): boolean {
+  // child_process.spawn must quote the final `/c` argument for Windows. If the
+  // command itself also contains double quotes, cmd.exe's /s quote-stripping
+  // rules can change argv semantics (e.g. node -p "40+2" evaluates a string
+  // literal instead of the expression). Keep the optimization deliberately
+  // narrow rather than implementing another Windows shell parser here.
+  if (command.includes('"')) return true;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (ch === "$" || ch === "`" || ch === "\r" || ch === "\n") return true;
+    if ("';|&<>%^!()#".includes(ch)) return true;
+  }
+  return (
+    /@[{(]/.test(command) ||
+    /\[[A-Za-z_][^\]]*\]::/.test(command) ||
+    /\s-(?:and|or|eq|ne|lt|le|gt|ge|match|like|contains|in)\s/i.test(command)
+  );
+}
+
+function shouldUseWindowsCmdFastPath(command: string): boolean {
+  if (process.platform !== "win32" || !getFullDiskAccess()) return false;
+  if (hasUnsafeCmdFastPathSyntax(command)) return false;
+  const token = firstCommandToken(command);
+  return token !== null && WINDOWS_CMD_FAST_PATH_COMMANDS.has(token);
+}
+
+export function buildShellProcessInvocation(command: string): {
+  executable: string;
+  args: string[];
+  strategy: "direct_exec" | "cmd_fast" | "powershell" | "bash";
+} {
+  if (process.platform !== "win32") {
+    return { executable: "bash", args: ["-lc", command], strategy: "bash" };
+  }
+
+  const direct = parseWindowsDirectCommand(command);
+  if (direct) {
+    return { ...direct, strategy: "direct_exec" };
+  }
+
+  if (shouldUseWindowsCmdFastPath(command)) {
+    return {
+      executable: process.env.ComSpec || process.env.COMSPEC || "cmd.exe",
+      args: ["/d", "/s", "/c", command],
+      strategy: "cmd_fast",
+    };
+  }
+
+  const executable = "powershell.exe";
   // Git for Windows/MSYS resolves getcwd() by enumerating path ancestry. A
   // strict AppContainer intentionally grants workspace ancestors only traverse
   // metadata, so launching git.exe directly with the workspace as process cwd
@@ -262,10 +395,8 @@ if ($script:__clcRealGit) {
   // check fails (PSSecurityException) for PATH-resolved script commands (npm,
   // *.ps1), so every agent shell would error. Bypass only affects this process,
   // which already executes arbitrary agent commands by design.
-  const args = process.platform === "win32"
-    ? ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", shellCommand]
-    : ["-lc", command];
-  return { executable, args };
+  const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", shellCommand];
+  return { executable, args, strategy: "powershell" };
 }
 
 async function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
@@ -288,6 +419,8 @@ async function runOnce(command: string, cwd: string, timeoutMs: number): Promise
     env: process.env,
     timeoutMs,
   });
+  const launchedAt = Date.now();
+  const spawnMs = launchedAt - startedAt;
   const child = handle.child;
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
@@ -308,6 +441,11 @@ async function runOnce(command: string, cwd: string, timeoutMs: number): Promise
     stdout_truncated: stdoutTruncated,
     stderr_truncated: stderrTruncated,
     output_max_chars: SHELL_OUTPUT_MAX_CHARS,
+    shell_strategy: invocation.strategy,
+    shell_executable: invocation.executable,
+    spawn_ms: spawnMs,
+    command_ms: Math.max(0, Date.now() - launchedAt),
+    shell_total_ms: Math.max(0, Date.now() - startedAt),
   });
 
   const settle = (fn: () => void) => {
@@ -368,6 +506,11 @@ async function runOnce(command: string, cwd: string, timeoutMs: number): Promise
         stdout_truncated: stdoutTruncated,
         stderr_truncated: stderrTruncated,
         output_max_chars: SHELL_OUTPUT_MAX_CHARS,
+        shell_strategy: invocation.strategy,
+        shell_executable: invocation.executable,
+        spawn_ms: spawnMs,
+        command_ms: Math.max(0, Date.now() - launchedAt),
+        shell_total_ms: Math.max(0, Date.now() - startedAt),
       });
     });
   });

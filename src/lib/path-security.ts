@@ -78,20 +78,23 @@ function isWithinWorkspace(resolved: string): boolean {
 }
 
 export function getContextReadRoots(): string[] {
-  // ~/.agents is the canonical user-global harness tree. It is a narrow,
-  // read-only context source: mutation/process authority still goes through
-  // validatePath() and therefore remains bounded by workspace roots unless
-  // FULL_DISK_ACCESS=true. Fail closed if the canonical root itself is an alias.
-  const root = trustedCanonicalContextPath(path.join(os.homedir(), ".agents"), "directory");
-  return root ? [root] : [];
+  // Only the two owned read-only subtrees are context roots. The ~/.agents
+  // parent may contain unrelated/retired execution-environment state and must
+  // not become readable merely because the Harness bootstrap lives beside it.
+  return [
+    path.join(os.homedir(), ".agents", "global-harness"),
+    path.join(os.homedir(), ".agents", "skills"),
+  ]
+    .map((candidate) => trustedCanonicalContextPath(candidate, "directory"))
+    .filter((candidate): candidate is string => candidate !== null);
 }
 
 export function getContextReadFiles(): string[] {
-  // Do not authorize the whole ~/.codex directory: it can contain unrelated
-  // runtime/config material. Only the canonical text surfaces explicitly owned
-  // by the Global Harness are readable outside the workspace, and only when the
-  // file itself is a real canonical file rather than a symlink/reparse alias.
+  // Do not authorize the whole ~/.agents or ~/.codex directory: both may contain
+  // unrelated runtime/history/config material. Only exact canonical bootstrap /
+  // continuity text files are readable outside the workspace.
   return [
+    path.join(os.homedir(), ".agents", "AGENTS.md"),
     path.join(os.homedir(), ".codex", "AGENTS.md"),
     path.join(os.homedir(), ".codex", "GLOBAL_IMPLEMENTATION_NOTES.md"),
   ]
@@ -147,9 +150,38 @@ export async function validatePath(inputPath: string): Promise<string> {
 }
 
 /**
+ * Validate one path against an explicit request-local root set.
+ *
+ * Unlike validatePath(), this boundary is enforced even when FULL_DISK_ACCESS
+ * is enabled. Callers use it for automatically loaded project-controlled
+ * context where trusted full-machine authority must not silently widen the
+ * scope selected for that individual load.
+ *
+ * The supplied roots are never written into process-global workspace state, so
+ * concurrent MCP sessions can validate different project contexts safely.
+ */
+export async function validatePathWithinRoots(inputPath: string, roots: string[]): Promise<string> {
+  const trimmed = inputPath.trim();
+  if (!trimmed) throw new Error("Path is empty");
+  if (!roots.length) throw new Error("Explicit workspace root set is empty");
+
+  const resolved = path.isAbsolute(trimmed)
+    ? path.resolve(trimmed)
+    : path.resolve(defaultCwd, trimmed);
+  const canonical = await canonicalizeForBoundary(resolved);
+  const canonicalRoots = roots.map(canonicalizeExistingSync);
+  if (!canonicalRoots.some((root) => isWithinRoot(root, canonical))) {
+    throw new Error(
+      `Path nằm ngoài explicit workspace roots (${canonicalRoots.join("; ")}): ${canonical}.`
+    );
+  }
+  return canonical;
+}
+
+/**
  * Read-only context exception for canonical user-global Harness surfaces.
  * This exists so the canonical ~/.agents/AGENTS.md bootstrap can selectively load
- * exact ~/.agents modules plus allowlisted Harness-owned ~/.codex text when
+ * Global Harness modules, skill bodies, plus allowlisted Harness-owned ~/.codex text when
  * needed, even while FULL_DISK_ACCESS=false. It intentionally does not widen
  * write, shell, Git, hook, upstream, or project authority: those paths continue
  * to use validatePath().
@@ -178,18 +210,30 @@ export async function validateContextReadPath(inputPath: string): Promise<string
   throw new Error(
     `Path nằm ngoài workspace (${workspaceRoots.join("; ")}): ${canonical}. ` +
       "Chỉ read_text_file được phép đọc chọn lọc canonical Global Harness context " +
-      "(~/.agents và các file text ~/.codex được allowlist); bật FULL_DISK_ACCESS=true nếu muốn truy cập ngoài các phạm vi này."
+      "(~/.agents/AGENTS.md, ~/.agents/global-harness/**, ~/.agents/skills/** và các file text ~/.codex được allowlist); " +
+      "bật FULL_DISK_ACCESS=true nếu muốn truy cập ngoài các phạm vi này."
   );
 }
 
 /**
- * Context switching is narrower than ordinary file access: an explicit project
- * context target must equal a configured workspace root. Being a descendant of
- * a broad parent is not enough, otherwise a collection root can silently turn
- * into cross-repository authority.
+ * Resolve an explicit project-context root.
+ *
+ * In strict mode, context switching is narrower than ordinary file access: the
+ * target must equal a configured workspace root. A broad collection root does
+ * not silently authorize child repositories as independent context owners.
+ *
+ * In trusted FULL_DISK_ACCESS mode, WORKSPACE_PATH is only the default
+ * project/cwd. The user may explicitly target another repository without
+ * pre-registering it in EXTRA_WORKSPACE_PATHS, so any canonical existing
+ * directory is a valid project-context root.
  */
 export async function validateConfiguredWorkspaceRoot(inputPath: string): Promise<string> {
   const canonical = await validatePath(inputPath);
+  const stat = await fsp.stat(canonical).catch(() => null);
+  if (!stat?.isDirectory()) {
+    throw new Error(`PROJECT_CONTEXT_INVALID_ROOT: ${canonical} is not an existing directory.`);
+  }
+  if (getFullDiskAccess()) return canonical;
   if (!workspaceRoots.some((root) => sameCanonicalPath(root, canonical))) {
     throw new Error(
       `PROJECT_CONTEXT_SCOPE_DENIED: ${canonical} is not an explicitly configured workspace root. ` +

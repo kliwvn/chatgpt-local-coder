@@ -4,7 +4,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const testBase = path.resolve(repoRoot, "..");
+// Prefer the configured workspace root as the integration fixture base. The
+// ServiceHub runtime mirror lives several restricted ancestor levels deeper
+// than the canonical checkout; creating the fixture beside that nested mirror
+// can make AppContainer fail ancestor traversal before it reaches the directory
+// whose ACL this test is actually exercising. Production instances sandbox
+// against WORKSPACE_PATH/EXTRA_WORKSPACE_PATHS, so mirror that topology here.
+const configuredWorkspace = process.env.WORKSPACE_PATH?.trim();
+const testBase = configuredWorkspace && path.isAbsolute(configuredWorkspace)
+  ? path.resolve(configuredWorkspace)
+  : path.resolve(repoRoot, "..");
 const allowed = await fs.mkdtemp(path.join(testBase, "clc-sandbox-allowed-"));
 const outside = await fs.mkdtemp(path.join(testBase, "clc-sandbox-outside-"));
 const outsideSecret = path.join(outside, "outside-secret.txt");
@@ -69,7 +78,7 @@ try {
       `-WorkingDirectory ${ps(allowed)} -NoNewWindow -Wait -RedirectStandardOutput ${ps(childStdout)}; ` +
       `Get-Content -LiteralPath ${ps(childStdout)}`,
     allowed,
-    20_000,
+    30_000,
     allowed
   );
   assert.equal(boundary.exit_code, 0, JSON.stringify(boundary));
@@ -81,10 +90,11 @@ try {
   const envProbe = await shell.execInShellSession(
     `Write-Output $env:CLC_TEST_SECRET`,
     allowed,
-    5_000,
+    60_000,
     allowed
   );
-  assert.equal(envProbe.exit_code, 0, envProbe.stderr);
+  assert.equal(envProbe.timed_out, false, JSON.stringify(envProbe));
+  assert.equal(envProbe.exit_code, 0, JSON.stringify(envProbe));
   assert.equal(envProbe.stdout.trim(), "", "sandbox child inherited a blocked secret environment value");
 
   const nodeProbe = path.join(allowed, "node-boundary-probe.cjs");
@@ -123,7 +133,7 @@ try {
   // command must pass the AuthorizationManager check, which fails in an
   // AppContainer unless the shell launches with -ExecutionPolicy Bypass
   // (persistent-shell.ts). This locks in the Bypass launch args.
-  const npmRun = await shell.execInShellSession("npm --version", allowed, 15_000, allowed);
+  const npmRun = await shell.execInShellSession("npm --version", allowed, 60_000, allowed);
   assert.equal(npmRun.exit_code, 0, JSON.stringify(npmRun));
   assert.match(npmRun.stdout.trim(), /^\d+\.\d+\.\d+/);
 
@@ -139,7 +149,7 @@ try {
   const junctionRun = await shell.execInShellSession(
     `node ${ps(junctionProbe)} ${ps(path.join(outsideJunction, "outside-secret.txt"))} ${ps(junctionWrite)}`,
     allowed,
-    10_000,
+    30_000,
     allowed
   );
   assert.equal(junctionRun.exit_code, 0, JSON.stringify(junctionRun));

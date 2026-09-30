@@ -88,7 +88,17 @@ async function callTool(port, sessionId, id, name, args) {
     },
     body: JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } }),
   });
-  return { status: response.status, text: await response.text() };
+  const text = await response.text();
+  let json = null;
+  try {
+    json = text ? JSON.parse(text) : null;
+  } catch {}
+  return {
+    status: response.status,
+    text,
+    json,
+    structuredContent: json?.result?.structuredContent,
+  };
 }
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "clc-filesystem-safety-"));
@@ -137,6 +147,19 @@ try {
   }
   assert(descendantContextRejected, "project context accepted an arbitrary descendant instead of an exact configured root");
 
+  // In trusted full-disk mode WORKSPACE_PATH is a default context/cwd, not a
+  // project allowlist. An explicitly targeted repository may therefore become
+  // the project_context root without being predeclared in EXTRA_WORKSPACE_PATHS.
+  const dynamicContextRoot = path.join(root, "scope-dynamic");
+  await fs.mkdir(path.join(dynamicContextRoot, ".git"), { recursive: true });
+  process.env.FULL_DISK_ACCESS = "true";
+  const dynamicContext = await validateConfiguredWorkspaceRoot(dynamicContextRoot);
+  assert(
+    path.normalize(dynamicContext) === path.normalize(await fs.realpath(dynamicContextRoot)),
+    "full-disk project context rejected an explicitly targeted dynamic repository"
+  );
+  process.env.FULL_DISK_ACCESS = "false";
+
   setDefaultCwd(workspace);
   setWorkspaceRoots([workspace]);
 
@@ -165,6 +188,19 @@ try {
     path.normalize(harnessReadPath).toLowerCase().includes(`${path.sep}.agents${path.sep}`.toLowerCase()),
     "context read path did not authorize canonical ~/.agents Global Harness tree"
   );
+  const harnessBootstrap = path.join(os.homedir(), ".agents", "AGENTS.md");
+  const harnessBootstrapReadPath = await validateContextReadPath(harnessBootstrap);
+  assert(
+    path.normalize(harnessBootstrapReadPath).toLowerCase() === path.normalize(harnessBootstrap).toLowerCase(),
+    "context read path did not authorize the canonical ~/.agents/AGENTS.md bootstrap"
+  );
+  let unownedAgentsSiblingRejected = false;
+  try {
+    await validateContextReadPath(path.join(os.homedir(), ".agents", "__clc-unowned-probe__", "secret.md"));
+  } catch {
+    unownedAgentsSiblingRejected = true;
+  }
+  assert(unownedAgentsSiblingRejected, "context read exception authorized an unowned ~/.agents sibling namespace");
   let harnessMutationPathRejected = false;
   try {
     await validatePath(harnessProbe);
@@ -201,6 +237,21 @@ try {
     .join("\n");
   assert(!projectMemoryText.includes(memorySecret), "project memory imported content outside workspace");
   assert(projectMemoryText.includes("import blocked"), "blocked project-memory import was not surfaced safely");
+
+  // FULL_DISK_ACCESS widens deliberate agent file/process authority, but it
+  // must not let project-controlled bootstrap imports silently widen the
+  // request-local project-memory boundary supplied by the caller.
+  process.env.FULL_DISK_ACCESS = "true";
+  const trustedModeMemory = await loadProjectMemory(workspace, {
+    maxBytes: 100000,
+    maxLines: 1000,
+    workspaceRoots: [workspace],
+    includeUserMemory: false,
+  });
+  const trustedModeProjectText = trustedModeMemory.sections.map((section) => section.content).join("\n");
+  assert(!trustedModeProjectText.includes(memorySecret), "trusted mode let project memory auto-import outside its explicit roots");
+  assert(trustedModeProjectText.includes("import blocked"), "trusted-mode project-memory boundary did not surface blocked import");
+  process.env.FULL_DISK_ACCESS = "false";
 
   // A workspace root that is itself a symlink/junction remains usable because
   // both the configured root and requested path are canonicalized consistently.
@@ -372,7 +423,7 @@ try {
     // First-time sandbox prepare + self-test on a fresh policy ledger is a real
     // OS operation and legitimately takes several seconds; give the isolated
     // server a bounded but realistic window.
-    await waitForHealth(port, 30000, server, () => serverDiagnosticLog);
+    await waitForHealth(port, 90000, server, () => serverDiagnosticLog);
 
     const [sessionA, sessionB] = await Promise.all([initialize(port, 1), initialize(port, 2)]);
     await Promise.all([
@@ -406,14 +457,18 @@ try {
         glob: "*.txt",
         output_mode: "content",
       });
-      assert(!grepEscape.text.includes("TOP_SECRET"), "grep followed an unvalidated symlink file outside workspace");
+      const grepOutput = grepEscape.structuredContent?.data?.output;
+      assert(typeof grepOutput === "string", `grep returned no structured output: ${grepEscape.text.slice(0, 800)}`);
+      assert(!grepOutput.includes("TOP_SECRET"), "grep followed an unvalidated symlink file outside workspace");
 
       const globEscape = await callTool(port, sessionA, 16, "glob", {
         path: mcpWorkspace,
         pattern: "**/*.txt",
         max_results: 100,
       });
-      assert(!globEscape.text.includes("secret-link.txt"), "glob exposed an unvalidated symlink-file target");
+      const globMatches = globEscape.structuredContent?.data?.matches;
+      assert(Array.isArray(globMatches), `glob returned no structured matches: ${globEscape.text.slice(0, 800)}`);
+      assert(!globMatches.some((match) => String(match).endsWith("secret-link.txt")), "glob exposed an unvalidated symlink-file target");
     }
 
     // Exercise the real EXDEV path when the test workspace and repository live

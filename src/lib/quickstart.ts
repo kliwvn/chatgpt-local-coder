@@ -1,12 +1,14 @@
 export const MCP_QUICKSTART = `
 ## Tool workflow (when agent_status is called)
 1. Project memory + git state are already in MCP instructions from WORKSPACE_PATH.
-2. Stay in the primary WORKSPACE_PATH by default. Do not discover or switch to another repo on your own.
-3. project_context(path) may target only an exact configured workspace root; use an extra root only when the user's current request explicitly targets it.
-4. Explore with glob (file names) and grep (content), then read_text_file.
-5. Edit with apply_patch (preferred), multi_edit, or write_file for new files.
-6. Run builds/tests with run_command (short) or start_process + process_output (long). timed_out=true from run_command is a per-call synchronous response-budget timeout, not an MCP session or ChatGPT turn termination; inspect possible side effects, continue the task, and use start_process + process_output for long work.
-7. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
+2. WORKSPACE_PATH is the default project/cwd, not a mandate to stay there when the user explicitly targets another repo.
+3. Before substantive work in a different explicitly targeted repo, call project_context(path). With FULL_DISK_ACCESS=true it may bind that canonical repo directory dynamically; with FULL_DISK_ACCESS=false it must be an exact configured workspace root.
+   For run_command/start_process in that repo, pass working_directory explicitly. Persistent shell cwd/history are instance-global across chats; an explicit working_directory is an isolated one-off and does not mutate that shared state.
+4. When a workspace root is a broad collection (for example C:\\AI_Home), inspect agent_status.repo_catalog and choose the narrowest matching repo path before recursive glob/grep. Use the collection root only when the target repo is genuinely unknown or the task spans repos.
+5. Explore with glob (file names) and grep (content), then read_text_file.
+6. Edit with apply_patch (preferred), multi_edit, or write_file for new files.
+7. Run builds/tests with run_command (short) or start_process + process_output (long). timed_out=true from run_command is a per-call synchronous response-budget timeout, not an MCP session or ChatGPT turn termination; inspect possible side effects, continue the task, and use start_process + process_output for long work.
+8. Undo file edits with rewind (list → preview → restore). Shell/bash file changes are not tracked.
 
 Use typed file/Git mutation tools whenever one exists; do not retry a host-blocked typed write through run_command/start_process. Generic shell is a broader action, not a permission workaround.
 mcp_servers(refresh=true) refreshes Local Coder upstream MCPs only; it does not refresh/rebind the ChatGPT → Local Coder connector, ChatGPT app permissions, or host session/cache state.
@@ -23,7 +25,7 @@ All tools return JSON: { ok, tool, summary, data }
 - glob / grep / read_text_file: explore (offset+limit for partial reads)
 - apply_patch: single-file @@ hunks OR multi-file *** Begin Patch format
 - create_directory / delete_directory / copy_file / move_file / delete_file
-- run_command: persistent shell (cd persists); shell_status / shell_reset
+- run_command: persistent shell (cd persists instance-wide); use working_directory for isolated non-default/multi-repo commands; shell_status / shell_reset
 - git_status / git_diff / git_add / git_commit / git_branch / git_restore / git_stash
 - rewind: action=list|preview|restore|status — undo file edits via automatic checkpoints
 - mcp_servers / mcp_tools / mcp_call — delegate to upstream MCP servers on this machine
@@ -45,7 +47,7 @@ All tools return JSON: { ok, tool, summary, data }
 *** End Patch
 
 ## Paths
-Mutation/project-discovery paths follow FULL_DISK_ACCESS + workspace roots. Relative paths resolve from default cwd. read_text_file additionally has narrow read-only access to canonical Global Harness context (~/.agents plus exact allowlisted Harness-owned ~/.codex text files) so the injected bootstrap/router can selectively load what it requests.
+Mutation/project-discovery paths follow FULL_DISK_ACCESS + workspace roots. Relative paths resolve from default cwd. read_text_file additionally has narrow read-only access to canonical bootstrap/Harness/skill context (~/.agents/AGENTS.md + ~/.agents/global-harness/** + ~/.agents/skills/** plus exact allowlisted Harness-owned ~/.codex text files) so the injected bootstrap/router can selectively load what it requests.
 With FULL_DISK_ACCESS=false, write/shell/Git/hook/upstream/project authority remains workspace-scoped and agent-triggered shell/Git/hook/child process trees must pass the Windows AppContainer self-test; sandbox failure is fail-closed. FULL_DISK_ACCESS=true is explicit trusted native full-machine mode.
 `.trim();
 
@@ -60,15 +62,17 @@ export function buildServerInstructions(
     `Default project: ${workspaceRoot}`,
     fullDiskAccess
       ? "Path-aware/process access: explicit trusted native full-machine mode."
-      : "Mutation/project/process access: exact workspace roots. read_text_file also has narrow read-only access to canonical Global Harness context (~/.agents plus exact allowlisted Harness-owned ~/.codex text files). Agent-triggered local process trees require the Windows AppContainer sandbox and fail closed if its self-test is unhealthy.",
+      : "Mutation/project/process access: exact workspace roots. read_text_file also has narrow read-only access to canonical bootstrap/Harness/skill context (~/.agents/AGENTS.md + ~/.agents/global-harness/** + ~/.agents/skills/** plus exact allowlisted Harness-owned ~/.codex text files). Agent-triggered local process trees require the Windows AppContainer sandbox and fail closed if its self-test is unhealthy.",
     "Tag this connector in ChatGPT before every task.",
   ].join("\n");
 
   const footer = [
     "## Quick pointers",
     `Workspace roots: ${workspaceRoots.join("; ")}`,
-    "agent_status — full tool cheat sheet + apply_patch format",
-    "project_context(path) — load context only from an exact configured workspace root; never auto-switch projects",
+    "agent_status — full tool cheat sheet + repo_catalog + apply_patch format",
+    fullDiskAccess
+      ? "project_context(path) — bind an explicitly user-targeted canonical project dynamically; WORKSPACE_PATH remains only the default"
+      : "project_context(path) — strict mode: target an exact configured workspace root; never auto-switch projects",
   ].join("\n");
 
   const body = contextBlock?.trim();

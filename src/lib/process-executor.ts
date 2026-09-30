@@ -87,6 +87,12 @@ const sandboxBinRoot = path.join(sandboxNativeRoot, "bin");
 const legacyRunnerPath = path.join(sandboxBinRoot, "SandboxRunner.exe");
 const runnerPointerPath = path.join(sandboxBinRoot, "SandboxRunner.current");
 const defaultChildProbePath = path.join(sandboxNativeRoot, "bin", "SandboxChildProbe.exe");
+// SandboxRunner enforces the requested process timeout, then can spend up to
+// 5s waiting for the root process plus 5s joining each stdout/stderr pump after
+// Job termination. The outer Node collector must outlive that bounded teardown
+// or it kills the broker first and masks the real broker timeout as a collection
+// timeout. Keep an extra 5s scheduler/AV margin above the runner's 15s teardown.
+const SANDBOX_BROKER_TEARDOWN_GRACE_MS = 20_000;
 
 let sandboxState: SandboxState | null = null;
 let status: ProcessSecurityStatus = buildInitialStatus();
@@ -451,56 +457,42 @@ async function runSandboxSelfTest(state: SandboxState): Promise<void> {
   if (!insideBase) throw new Error(`${OS_SANDBOX_SELF_TEST_FAILED}: no writable workspace root`);
   const selfRoot = await fs.mkdtemp(path.join(insideBase, ".clc-sandbox-selftest-"));
   const outsideRoot = await createOutsideSelfTestDir(state.rwRoots);
-  const insideRead = path.join(selfRoot, "inside-read.txt");
-  const insideWrite = path.join(selfRoot, "inside-write.txt");
   const childProbe = path.join(selfRoot, "SandboxChildProbe.exe");
   const childMarker = path.join(selfRoot, "child-marker.txt");
-  const childStdout = path.join(selfRoot, "child-stdout.txt");
   const outsideRead = path.join(outsideRoot, "outside-secret.txt");
   const outsideWrite = path.join(outsideRoot, "outside-write.txt");
 
   try {
-    await fs.writeFile(insideRead, "inside", "utf8");
     await fs.writeFile(outsideRead, "outside-secret", "utf8");
     await fs.copyFile(defaultChildProbePath, childProbe);
-    const powershell = path.join(
-      process.env.SystemRoot || process.env.WINDIR || "C:\\Windows",
-      "System32",
-      "WindowsPowerShell",
-      "v1.0",
-      "powershell.exe"
-    );
-    const ps = (value: string) => `'${value.replaceAll("'", "''")}'`;
-    const command = [
-      "$ErrorActionPreference='Stop'",
-      `$insideRead=${ps(insideRead)}`,
-      `$insideWrite=${ps(insideWrite)}`,
-      `$outsideRead=${ps(outsideRead)}`,
-      `$outsideWrite=${ps(outsideWrite)}`,
-      "$okInsideRead=$false; try { [IO.File]::ReadAllText($insideRead)|Out-Null; $okInsideRead=$true } catch {}",
-      "$okInsideWrite=$false; try { [IO.File]::WriteAllText($insideWrite,'inside-ok'); $okInsideWrite=$true } catch {}",
-      "$outsideReadDenied=$false; try { [IO.File]::ReadAllText($outsideRead)|Out-Null } catch [UnauthorizedAccessException] { $outsideReadDenied=$true } catch {}",
-      "$outsideWriteDenied=$false; try { [IO.File]::WriteAllText($outsideWrite,'escape') } catch [UnauthorizedAccessException] { $outsideWriteDenied=$true } catch {}",
-      `$child=Start-Process -FilePath ${ps(childProbe)} -ArgumentList @(${ps(childMarker)},${ps(outsideRead)},${ps(outsideWrite)}) -WorkingDirectory ${ps(selfRoot)} -NoNewWindow -Wait -PassThru -RedirectStandardOutput ${ps(childStdout)}`,
-      `$childText=if (Test-Path -LiteralPath ${ps(childStdout)}) { Get-Content -LiteralPath ${ps(childStdout)} -Raw } else { '' }`,
-      "$childReadDenied=$childText -match 'outside_read=denied'",
-      "$childWriteDenied=$childText -match 'outside_write=denied'",
-      "if (-not $okInsideRead -or -not $okInsideWrite -or -not $outsideReadDenied -or -not $outsideWriteDenied -or $child.ExitCode -ne 0 -or -not $childReadDenied -or -not $childWriteDenied) { exit 93 }",
-      "Write-Output 'sandbox_self_test=passed'",
-    ].join("; ");
+    // Keep startup verification shell-free. PowerShell + Start-Process with
+    // redirected nested-child stdout can block inside an AppContainer even when
+    // the filesystem boundary itself is healthy, turning startup into a false
+    // fail-closed timeout. The native probe directly proves the properties we
+    // need here: executable launch inside the approved root, write access inside
+    // that root, and read/write denial outside it. Deeper descendant inheritance
+    // remains covered by the dedicated process-security boundary suite.
+    const selfTestTimeoutMs = 15_000;
     const result = await invokeSandboxedProcess(state, {
-      executable: powershell,
-      args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+      executable: childProbe,
+      args: [childMarker, outsideRead, outsideWrite],
       cwd: selfRoot,
-      timeoutMs: 20_000,
+      timeoutMs: selfTestTimeoutMs,
     });
-    const { stdout, stderr, code } = await collectProcess(result.child, 25_000);
-    if (code !== 0 || !stdout.includes("sandbox_self_test=passed")) {
+    const { stdout, stderr, code } = await collectProcess(
+      result.child,
+      selfTestTimeoutMs + SANDBOX_BROKER_TEARDOWN_GRACE_MS
+    );
+    if (
+      code !== 0 ||
+      !stdout.includes("outside_read=denied") ||
+      !stdout.includes("outside_write=denied")
+    ) {
       throw new Error(`${OS_SANDBOX_SELF_TEST_FAILED}: exit=${code}; stderr=${stderr.trim().slice(-1000)}`);
     }
     const childMarkerValue = await fs.readFile(childMarker, "utf8").then((value) => value.trim(), () => "");
     if (childMarkerValue !== "child-ok") {
-      throw new Error(`${OS_SANDBOX_SELF_TEST_FAILED}: nested child did not launch inside allowed root`);
+      throw new Error(`${OS_SANDBOX_SELF_TEST_FAILED}: native probe could not write inside allowed root`);
     }
     if (existsSync(outsideWrite)) {
       throw new Error(`${OS_SANDBOX_SELF_TEST_FAILED}: outside write marker exists`);
@@ -513,13 +505,17 @@ async function runSandboxSelfTest(state: SandboxState): Promise<void> {
     // strict mode never reports a false-green process sandbox.
     const git = findExecutableOnPath("git");
     if (git) {
+      const gitProbeTimeoutMs = 10_000;
       const gitResult = await invokeSandboxedProcess(state, {
         executable: git,
         args: ["--version"],
         cwd: selfRoot,
-        timeoutMs: 10_000,
+        timeoutMs: gitProbeTimeoutMs,
       });
-      const gitCollected = await collectProcess(gitResult.child, 15_000);
+      const gitCollected = await collectProcess(
+        gitResult.child,
+        gitProbeTimeoutMs + SANDBOX_BROKER_TEARDOWN_GRACE_MS
+      );
       if (gitCollected.code !== 0 || !/^git version /m.test(gitCollected.stdout)) {
         const detail = (gitCollected.stderr || gitCollected.stdout).trim().slice(-1000);
         throw new Error(

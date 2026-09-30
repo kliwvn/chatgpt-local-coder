@@ -26,14 +26,17 @@ try {
   const noisyCommand = `node -e "process.stdout.write('x'.repeat(100000)); process.stderr.write('y'.repeat(50000))"`;
   await fs.writeFile(config, JSON.stringify({
     enabled: true,
-    hooks: [{ glob: "**/*.txt", command: noisyCommand, timeout_ms: 5000 }],
+    // This case validates output truncation, not timeout behavior. Leave enough
+    // headroom for Windows/AppContainer cold-start pressure in the full suite;
+    // timeout behavior is exercised explicitly below with a 100ms hook.
+    hooks: [{ glob: "**/*.txt", command: noisyCommand, timeout_ms: 15000 }],
   }), "utf8");
   process.env.POST_EDIT_HOOKS_CONFIG = config;
   const { runPostEditHooks } = await import("../dist/lib/post-edit-hooks.js");
   const result = await runPostEditHooks([target]);
   const hook = result?.post_edit_hooks?.[0];
   assert.ok(hook, "matching post-edit hook did not run");
-  assert.equal(hook.exit_code, 0);
+  assert.equal(hook.exit_code, 0, JSON.stringify(hook));
   assert.equal(hook.stdout_truncated, true, "large hook stdout was not marked truncated");
   assert.equal(hook.stderr_truncated, true, "large hook stderr was not marked truncated");
   assert.ok(hook.stdout.length <= 2000, "hook stdout result exceeded response cap");

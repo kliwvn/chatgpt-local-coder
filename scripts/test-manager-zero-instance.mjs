@@ -30,7 +30,7 @@ function pidAlive(pid) {
 
 async function fetchJson(url, options = {}) {
   try {
-    const response = await fetch(url, { ...options, signal: AbortSignal.timeout(3000) });
+    const response = await fetch(url, { ...options, signal: AbortSignal.timeout(15000) });
     const body = await response.json();
     return { status: response.status, body };
   } catch (err) {

@@ -280,6 +280,10 @@
       <input id="add-admin-port" class="input mono" inputmode="numeric" placeholder="3003" />
       <p class="hint">Mỗi workspace chạy đồng thời phải có PORT và ADMIN_PORT riêng.</p>
     </div>
+    <div class="field">
+      <label class="chk"><input id="add-full-disk" type="checkbox" /> FULL_DISK_ACCESS</label>
+      <p class="hint">Bật ngay lúc tạo nếu instance cần native trusted full-machine access; mặc định tắt.</p>
+    </div>
     <div class="actions">
       <label class="chk"><input id="add-autostart" type="checkbox" checked /> Tự khởi động khi mở app</label>
       <button id="add-create" class="btn btn-primary">Tạo Workspace</button>

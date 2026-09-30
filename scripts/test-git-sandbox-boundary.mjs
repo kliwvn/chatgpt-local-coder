@@ -18,11 +18,13 @@ import {
 import { registerGitTools } from "../dist/tools/git.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// Strict-mode fixture base derives from the repo itself: os.tmpdir() lives
-// under C:\Users, which the sandbox cannot traverse, so git worktrees there
-// fail with "Invalid path 'C:/Users'". C:\AI_Home is covered by the
-// setup:sandbox traverse grant (ancestors of the workspace root).
-const testBase = path.resolve(repoRoot, "..");
+// Mirror production topology: when WORKSPACE_PATH is an absolute configured
+// root, place strict-mode fixtures there. This avoids making a nested runtime
+// checkout's restricted ancestors part of the behavior under test.
+const configuredWorkspace = process.env.WORKSPACE_PATH?.trim();
+const testBase = configuredWorkspace && path.isAbsolute(configuredWorkspace)
+  ? path.resolve(configuredWorkspace)
+  : path.resolve(repoRoot, "..");
 const root = await fs.mkdtemp(path.join(testBase, "clc-git-sandbox-"));
 const repo = path.join(root, "repo");
 const outside = await fs.mkdtemp(path.join(testBase, "clc-git-outside-"));

@@ -12,10 +12,15 @@ import {
   type ProjectMemoryBundle,
 } from "./project-memory.js";
 import { appendAutoMemory, formatAutoMemoryForInstructions, loadAutoMemory } from "./auto-memory.js";
-import { formatSkillsForInstructions, loadProjectSkills } from "./skills-loader.js";
+import {
+  formatSkillsForInstructions,
+  loadSkillDiscovery,
+  type SkillDiscovery,
+} from "./skills-loader.js";
 import { getChatGptToolProfile } from "./tool-profile.js";
 import { getFullDiskAccess } from "./path-security.js";
 import { buildServerInstructions } from "./quickstart.js";
+import { discoverRepoCatalog, formatRepoCatalogForInstructions, type RepoCatalog } from "./repo-catalog.js";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -30,6 +35,8 @@ export interface InstructionContextOptions {
 export interface InstructionContext {
   projectMemory: ProjectMemoryBundle;
   git: GitSnapshot;
+  skillDiscovery: SkillDiscovery;
+  repoCatalog: RepoCatalog;
   instructionsText: string;
   instructionBytes: number;
 }
@@ -129,10 +136,11 @@ export function inspectGlobalHarnessFreshness(projectMemory: ProjectMemoryBundle
 export async function buildInstructionContext(
   opts: InstructionContextOptions
 ): Promise<InstructionContext> {
-  const [projectMemory, git, skills] = await Promise.all([
+  const [projectMemory, git, skillDiscovery, repoCatalog] = await Promise.all([
     loadProjectMemory(opts.workspaceRoot, { workspaceRoots: opts.workspaceRoots }),
     collectGitSnapshot(opts.workspaceRoot),
-    loadProjectSkills(opts.workspaceRoot),
+    loadSkillDiscovery(opts.workspaceRoot),
+    discoverRepoCatalog(opts.workspaceRoots),
   ]);
   // Global Harness Memory/project continuity is the canonical owner when its
   // bootstrap is present. Do not inject Local Coder's legacy host-local auto
@@ -156,7 +164,8 @@ export async function buildInstructionContext(
     formatGitSnapshotForInstructions(git),
     formatAutoMemoryForInstructions(autoMemory),
     formatProjectMemoryForInstructions(projectMemory),
-    formatSkillsForInstructions(skills),
+    formatSkillsForInstructions(skillDiscovery),
+    formatRepoCatalogForInstructions(repoCatalog),
   ].filter(Boolean);
 
   const projectMemoryBlock = blocks.join("\n\n");
@@ -170,6 +179,8 @@ export async function buildInstructionContext(
   return {
     projectMemory,
     git,
+    skillDiscovery,
+    repoCatalog,
     instructionsText,
     instructionBytes: Buffer.byteLength(instructionsText, "utf-8"),
   };
@@ -190,6 +201,8 @@ export function summarizeInstructionContext(ctx: InstructionContext): Record<str
     instruction_bytes: ctx.instructionBytes,
     instruction_sha256: sha256(ctx.instructionsText),
     global_harness: inspectGlobalHarnessFreshness(ctx.projectMemory),
+    bootstrap_discovery: ctx.skillDiscovery,
+    repo_catalog: ctx.repoCatalog,
     git: ctx.git.is_repo
       ? { branch: ctx.git.branch, commits: ctx.git.recent_commits?.length ?? 0 }
       : { is_repo: false },

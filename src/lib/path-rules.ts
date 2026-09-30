@@ -1,6 +1,6 @@
 import fs from "fs/promises";
 import path from "path";
-import { validatePath } from "./path-security.js";
+import { validatePathWithinRoots } from "./path-security.js";
 import { readUtf8FilePrefix } from "./bounded-file.js";
 
 const MAX_RULE_FILES = 128;
@@ -17,12 +17,15 @@ function parseFrontmatter(content: string): { paths?: string[] } {
 
 function globToRegex(glob: string): RegExp {
   const escaped = glob
+    .replace(/\\/g, "/")
     .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+    .replace(/\*\*\//g, "{{GLOBSTAR_DIR}}")
     .replace(/\*\*/g, "{{GLOBSTAR}}")
-    .replace(/\*/g, "[^/\\\\]*")
+    .replace(/\*/g, "[^/]*")
+    .replace(/\?/g, ".")
+    .replace(/{{GLOBSTAR_DIR}}/g, "(?:.*/)?")
     .replace(/{{GLOBSTAR}}/g, ".*")
-    .replace(/\{([^}]+)\}/g, (_, inner) => `(${inner.split(",").map((s: string) => s.trim()).join("|")})`)
-    .replace(/\?/g, ".");
+    .replace(/\{([^}]+)\}/g, (_, inner) => `(${inner.split(",").map((s: string) => s.trim()).join("|")})`);
   return new RegExp(`^${escaped}$`, "i");
 }
 
@@ -68,20 +71,23 @@ export async function loadPathRulesForFile(
   filePath: string
 ): Promise<Array<{ path: string; content: string }>> {
   const matched: Array<{ path: string; content: string }> = [];
+  const relativeFilePath = path.relative(workspaceRoot, filePath);
   let rulesDir: string;
   try {
-    rulesDir = await validatePath(path.join(workspaceRoot, ".claude", "rules"));
+    // Path-rule loading is automatic project context, not an explicit arbitrary
+    // filesystem read. Enforce the inferred project root even in trusted mode.
+    rulesDir = await validatePathWithinRoots(path.join(workspaceRoot, ".claude", "rules"), [workspaceRoot]);
   } catch {
     return matched;
   }
 
   for (const ruleFile of await listRuleFiles(rulesDir)) {
     try {
-      const safeRuleFile = await validatePath(ruleFile);
+      const safeRuleFile = await validatePathWithinRoots(ruleFile, [workspaceRoot]);
       const raw = (await readUtf8FilePrefix(safeRuleFile, MAX_RULE_SOURCE_BYTES)).text;
       const fm = parseFrontmatter(raw);
       if (!fm.paths?.length) continue;
-      if (!matchesAny(filePath, fm.paths)) continue;
+      if (!matchesAny(relativeFilePath, fm.paths) && !matchesAny(filePath, fm.paths)) continue;
       const body = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
       if (body) matched.push({ path: safeRuleFile, content: body.slice(0, 4000) });
     } catch {}

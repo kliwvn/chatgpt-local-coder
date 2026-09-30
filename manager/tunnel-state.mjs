@@ -8,6 +8,144 @@ function normalizedPort(value) {
 }
 
 /**
+ * Evaluate whether tunnel-client has successfully completed a control-plane
+ * poll recently enough to be considered operationally connected. This is
+ * deliberately independent from /healthz + /readyz: those endpoints prove
+ * local liveness/readiness, not that the long-poll loop is still receiving
+ * control-plane responses.
+ *
+ * Older tunnel-client builds may not expose the freshness gauge. Treat that
+ * as compatibility-unknown instead of unhealthy so an upgrade cannot
+ * accidentally authorize disruptive recovery without supported evidence.
+ */
+export function evaluateOpenAiTunnelControlPlaneFreshness(metricsText, {
+  nowMs = Date.now(),
+  staleAfterMs = 36000,
+  maxFutureSkewMs = 5000,
+} = {}) {
+  const now = Number(nowMs);
+  const staleAfter = Number(staleAfterMs);
+  const maxFutureSkew = Number(maxFutureSkewMs);
+  if (!Number.isFinite(now) || now < 0) throw new Error("nowMs must be a finite non-negative number");
+  if (!Number.isFinite(staleAfter) || staleAfter <= 0) {
+    throw new Error("staleAfterMs must be a finite positive number");
+  }
+  if (!Number.isFinite(maxFutureSkew) || maxFutureSkew < 0) {
+    throw new Error("maxFutureSkewMs must be a finite non-negative number");
+  }
+
+  const text = String(metricsText || "");
+  const lineMatch = text.match(
+    /^commands_poll_last_successful_timestamp_seconds(?:\{[^}]*\})?\s+(\S+)\s*$/m
+  );
+  if (!lineMatch) {
+    const metricMentioned = /(?:^|\n)commands_poll_last_successful_timestamp_seconds(?:\{|\s|$)/m.test(text);
+    return {
+      supported: metricMentioned,
+      fresh: metricMentioned ? false : null,
+      lastSuccessfulAt: null,
+      ageMs: null,
+      staleAfterMs: staleAfter,
+      reason: metricMentioned ? "metric-invalid" : "metric-missing",
+    };
+  }
+
+  const timestampSeconds = Number(lineMatch[1]);
+  if (!Number.isFinite(timestampSeconds) || timestampSeconds <= 0) {
+    return {
+      supported: true,
+      fresh: false,
+      lastSuccessfulAt: null,
+      ageMs: null,
+      staleAfterMs: staleAfter,
+      reason: "metric-invalid",
+    };
+  }
+
+  const timestampMs = timestampSeconds * 1000;
+  if (!Number.isFinite(timestampMs)) {
+    return {
+      supported: true,
+      fresh: false,
+      lastSuccessfulAt: null,
+      ageMs: null,
+      staleAfterMs: staleAfter,
+      reason: "metric-invalid",
+    };
+  }
+
+  // The gauge and Date.now() originate on the same host. A small positive skew
+  // can happen around clock adjustments, but a timestamp materially in the
+  // future is not valid freshness evidence. Do not clamp a corrupted/future
+  // sample to age=0 and accidentally keep a wedged control-plane loop green.
+  if (timestampMs - now > maxFutureSkew) {
+    return {
+      supported: true,
+      fresh: false,
+      lastSuccessfulAt: new Date(timestampMs).toISOString(),
+      ageMs: null,
+      staleAfterMs: staleAfter,
+      reason: "metric-future",
+    };
+  }
+
+  const ageMs = Math.max(0, Math.round(now - timestampMs));
+  const fresh = ageMs <= staleAfter;
+  return {
+    supported: true,
+    fresh,
+    lastSuccessfulAt: new Date(timestampMs).toISOString(),
+    ageMs,
+    staleAfterMs: staleAfter,
+    reason: fresh ? "fresh" : "stale",
+  };
+}
+
+/**
+ * Decide whether an already-running OpenAI tunnel has enough exact authority
+ * and telemetry evidence to permit an automatic recovery restart.
+ *
+ * This helper is intentionally narrower than healthDrift. Local health failure,
+ * missing/legacy telemetry, malformed telemetry, launch drift, ambiguity, or
+ * unowned processes are observation-only states. Automatic disruption is
+ * authorized only for an exact-owned current OpenAI generation whose local
+ * tunnel remains healthy while the supported control-plane freshness gauge is
+ * explicitly stale.
+ */
+export function evaluateOpenAiTunnelRecoveryCandidate(status) {
+  if (!status?.running) return { recover: false, reason: "not-running" };
+  if (
+    status.owned !== true
+    || status.kind !== "openai"
+    || status.configDrift === true
+    || status.ambiguous === true
+    || status.duplicateProcesses === true
+    || status.launchPidMatch !== true
+    || status.launchProcessStartedAtMatch !== true
+    || status.launchFingerprintMatch !== true
+    || status.runtimePathMatches !== true
+  ) {
+    return { recover: false, reason: "authority-not-exact" };
+  }
+  if (status.localHealthy !== true) {
+    return { recover: false, reason: "local-unhealthy" };
+  }
+  if (status.controlPlaneFreshnessSupported !== true) {
+    return { recover: false, reason: "freshness-unsupported" };
+  }
+  if (
+    status.controlPlaneFreshnessReason !== "stale"
+    || status.controlPlaneFresh !== false
+  ) {
+    return { recover: false, reason: "freshness-not-stale" };
+  }
+  if (status.healthDrift !== true) {
+    return { recover: false, reason: "not-health-drift" };
+  }
+  return { recover: true, reason: "control-plane-stale" };
+}
+
+/**
  * Persistable, secret-safe evidence for the exact OpenAI tunnel launch config.
  * The API key participates in the digest but is never stored in plaintext.
  */

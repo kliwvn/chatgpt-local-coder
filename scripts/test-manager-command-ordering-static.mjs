@@ -58,6 +58,42 @@ assert.match(startServer, /serverStartInFlight\.set\(name, pending\)[\s\S]{0,700
 const startTunnel = section("async function startTunnel(name)", "async function stopTunnel(name)");
 assert.match(startTunnel, /intent\.consecutiveSameType \? tunnelStartInFlight\.get\(name\) : null/,
   "Tunnel Start may coalesce only consecutive duplicate Start intents");
+const stopTunnelUnlocked = section("async function stopTunnelUnlocked(name)", "async function finishTunnelDisruptionAdmission");
+assert.match(stopTunnelUnlocked, /exactProcessIdentityForAuthorityAsync\(pid\)/,
+  "Tunnel Stop must use bounded fresh exact-PID retries before receiving destructive authority");
+assert.match(stopTunnelUnlocked, /savedPid !== pid[\s\S]{0,1500}?identity\.startedAt === savedStartedAt/,
+  "Tunnel Stop must re-check the live PID ledger and exact CreationDate before kill");
+assert.match(stopTunnelUnlocked, /freshAuthority = await verifyFreshOwnedTarget[\s\S]{0,800}?staleProcessAuthority:\s*true/,
+  "Tunnel Stop must fail closed when fresh process identity no longer matches cached ownership");
+assert.ok(
+  stopTunnelUnlocked.indexOf("verifyFreshOwnedTarget") < stopTunnelUnlocked.indexOf("killPidTree(pid)"),
+  "fresh tunnel process identity must be verified before any destructive kill"
+);
+const stopServerUnlocked = section("async function stopServerUnlocked(name", "async function restartServerUnlockedCurrent");
+assert.match(stopServerUnlocked, /stopProcessIdentity = IS_WIN[\s\S]{0,240}?exactProcessIdentityForAuthorityAsync\(st\.pid\)/,
+  "Gateway Stop must capture a freshly re-queried Windows process generation before draining traffic");
+assert.match(stopServerUnlocked, /currentProcessIdentity = IS_WIN[\s\S]{0,260}?exactProcessIdentityForAuthorityAsync\(st\.pid\)[\s\S]{0,800}?currentProcessIdentity\.startedAt === stopProcessIdentity\.startedAt/,
+  "Gateway hard-stop must re-prove the same Windows CreationDate after traffic drain");
+assert.match(stopServerUnlocked, /if \(!exactGenerationStillOwned\)[\s\S]{0,500}?resumeServerTrafficAdmission\(name, st\)[\s\S]{0,500}?staleProcessAuthority:\s*true/,
+  "Gateway Stop must fail closed and resume admission when destructive process authority changes");
+assert.ok(
+  stopServerUnlocked.indexOf("currentProcessIdentity = IS_WIN") < stopServerUnlocked.indexOf("killPidTree(pidFile)"),
+  "Gateway process generation must be revalidated immediately before hard kill"
+);
+const startServerUnlocked = section("async function startServerUnlocked(name)", "async function stopServerUnlocked(name");
+const startupIdentityCapturePos = startServerUnlocked.indexOf("tryExactProcessIdentityAsync(pid, { force: true })");
+const startupIdentityRecheckPos = startServerUnlocked.indexOf("exactProcessIdentityForAuthorityAsync(pid)");
+const startupCreationDateComparePos = startServerUnlocked.indexOf("currentIdentity.startedAt === spawnedServerIdentity.startedAt");
+const startupKillPos = startServerUnlocked.indexOf("killPidTree(pid)");
+assert.ok(startupIdentityCapturePos >= 0 && startupIdentityRecheckPos > startupIdentityCapturePos,
+  "failed Gateway startup cleanup must capture then freshly re-query the exact spawned Windows generation");
+assert.ok(startupCreationDateComparePos > startupIdentityRecheckPos && startupKillPos > startupCreationDateComparePos,
+  "failed Gateway startup must compare CreationDate before destructive cleanup");
+const tunnelRecoveryObserver = section("async function observeUnexpectedTunnelRecoveryOnce()", "function startUnexpectedTunnelRecoverySupervisor");
+assert.match(tunnelRecoveryObserver, /processesWithCmdLineAsync\("tunnel-client\.exe", inst\.profile\)[\s\S]{0,900}?quickCandidates\[0\]\.pid === savedPid[\s\S]{0,500}?quickCandidates\[0\]\.startedAt === savedStartedAt/,
+  "Tunnel recovery fast path must prove cached same-profile PID+CreationDate identity before trusting fresh metrics");
+assert.match(tunnelRecoveryObserver, /if \(!quickIdentityExact\)[\s\S]{0,180}?requiresFullStatus = true/,
+  "Tunnel recovery must fall back to exact full status when cheap process identity is not proven");
 const restartTunnel = section("async function restartTunnel(name)", "async function downloadCloudflared");
 assert.match(restartTunnel, /intent\.consecutiveSameType \? tunnelRestartInFlight\.get\(name\) : null/,
   "Tunnel Restart may coalesce only consecutive duplicate restart intents");
@@ -123,10 +159,10 @@ assert.match(source, /const dname = instanceAdmission\?\.legacyDefault === true[
   "legacy handlers must keep the frozen admission target and reject stale authority before command registration");
 for (const call of [
   "saveInstanceEnv(dname, body)",
-  "startServer(dname)",
+  "startServerExplicit(dname)",
   "stopServer(dname)",
   "restartServer(dname)",
-  "startTunnel(dname)",
+  "startTunnelExplicit(dname)",
   "stopTunnel(dname)",
   "restartTunnel(dname)",
 ]) {

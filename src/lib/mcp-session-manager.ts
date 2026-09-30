@@ -718,6 +718,16 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
             );
           }
         }
+        // Reservation leak guard: an initialize whose handleRequest settled
+        // without onsessioninitialized firing (aborted client, drain-reject
+        // raced mid-build, SDK early return) leaves the build reservation
+        // held forever on an unpublished transport — no later callback is
+        // guaranteed to run for it (the createNew catch only covers throws).
+        // The transport can never publish after its initialize response has
+        // settled, so dispose it to release the slot deterministically.
+        if (wasUninitialized && !session.transport.sessionId) {
+          await disposePendingSession(session).catch(() => undefined);
+        }
       };
 
       try {

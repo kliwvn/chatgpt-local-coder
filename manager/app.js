@@ -77,6 +77,23 @@ const FIELD_ENV = {
   "f-mem-lines": "PROJECT_MEMORY_MAX_LINES",
 };
 
+const FIELD_DEFAULTS = {
+  "f-workspace": "",
+  "f-port": "",
+  "f-admin-port": "",
+  "f-profile": "slim",
+  "f-timeout": "120",
+  "f-sync-budget": "100000",
+  "f-session-ttl": "120000",
+  "f-session-max": "64",
+  "f-tunnel-id": "",
+  "f-tunnel-health-port": "8080",
+  "f-full-disk": "false",
+  "f-extra-ws": "",
+  "f-mem-bytes": "0",
+  "f-mem-lines": "0",
+};
+
 let rawDirty = false;
 
 function parseRawEnvEditor(text) {
@@ -142,8 +159,17 @@ function currentEditorPayload() {
 }
 
 function fillForm(values, keySet) {
+  // Reset every structured field before applying one instance's persisted
+  // values. New/legacy instances may omit newer keys; carrying the previous
+  // instance's DOM value makes the UI lie and can persist cross-instance state
+  // on the next Save.
   for (const [id, key] of Object.entries(FIELD_ENV)) {
-    if (values[key] !== undefined) $(id).value = values[key];
+    const el = $(id);
+    const fallback = FIELD_DEFAULTS[id] ?? "";
+    if (el.tagName !== "SELECT" || Array.from(el.options).some((option) => option.value === fallback)) {
+      el.value = fallback;
+    }
+    if (values[key] !== undefined) el.value = values[key];
   }
   if (keySet) {
     $("f-tunnel-key").value = "";
@@ -828,6 +854,7 @@ async function doAddInstance() {
       port: parsedPort,
       adminPort: parsedAdminPort,
       autoStart: $("add-autostart").checked,
+      fullDiskAccess: $("add-full-disk").checked,
     });
     if (!r.ok) {
       toast("Lỗi: " + (r.error || ""), "err");
@@ -839,6 +866,7 @@ async function doAddInstance() {
     $("add-workspace").value = "";
     $("add-port").value = "";
     $("add-admin-port").value = "";
+    $("add-full-disk").checked = false;
     await loadInstances(false);
     await selectInstance(r.name);
   } catch (err) {

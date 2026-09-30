@@ -4,9 +4,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-// Temp base derives from the repo itself, never WORKSPACE_PATH: that env value
-// can be a placeholder or point outside the test's control.
-const testBase = path.resolve(repoRoot, "..");
+// Prefer the configured workspace root for the AppContainer fixture. The
+// ServiceHub runtime mirror lives under several restricted ancestor levels;
+// placing the fixture beside that nested mirror can fail ancestor traversal
+// before the sandbox reaches the directory ACL this test is meant to exercise.
+// Standalone/upstream runs without an absolute configured workspace retain the
+// repo-parent fallback.
+const configuredWorkspace = process.env.WORKSPACE_PATH?.trim();
+const testBase = configuredWorkspace && path.isAbsolute(configuredWorkspace)
+  ? path.resolve(configuredWorkspace)
+  : path.resolve(repoRoot, "..");
 const root = await fs.mkdtemp(path.join(testBase, "clc-start-sandbox-"));
 const outside = await fs.mkdtemp(path.join(testBase, "clc-start-outside-"));
 const outsideSecret = path.join(outside, "secret.txt");
@@ -83,7 +90,11 @@ try {
   assert.equal(started.sandboxed, true);
   assert.equal(started.sandbox_backend, "windows_appcontainer");
 
-  const deadline = Date.now() + 10_000;
+  // The AppContainer launch can be materially slower when this test follows
+  // the full sandbox/security suite (Windows AV + profile/ACL work). This is a
+  // readiness poll, not a product SLA; keep enough headroom to avoid a false
+  // RED while still failing boundedly if the child never becomes usable.
+  const deadline = Date.now() + 30_000;
   let output = "";
   while (Date.now() < deadline) {
     const current = data(await call("process_output", { id: started.id, tail_chars: 20_000 }));
@@ -96,10 +107,22 @@ try {
   const pids = JSON.parse(await fs.readFile(pidsFile, "utf8"));
   const parentProbe = JSON.parse(await fs.readFile(parentResult, "utf8"));
   const childDeadline = Date.now() + 5000;
+  let childProbe = null;
+  let childProbeText = "";
   while (Date.now() < childDeadline) {
-    try { await fs.access(childResult); break; } catch { await new Promise((resolve) => setTimeout(resolve, 50)); }
+    try {
+      childProbeText = await fs.readFile(childResult, "utf8");
+      if (childProbeText.trim()) {
+        childProbe = JSON.parse(childProbeText);
+        break;
+      }
+    } catch {
+      // Creation and content publication are not atomic on Windows. The child
+      // may have created the result file but not finished writing JSON yet.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  const childProbe = JSON.parse(await fs.readFile(childResult, "utf8"));
+  assert.ok(childProbe, `child probe JSON was not ready before deadline: ${JSON.stringify(childProbeText)}`);
   assert.deepEqual(parentProbe, { r: "denied", w: "denied" });
   assert.deepEqual(childProbe, { r: "denied", w: "denied" });
   await assert.rejects(fs.stat(outsideWrite));

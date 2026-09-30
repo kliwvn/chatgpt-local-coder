@@ -35,12 +35,15 @@ const oldInstanceId = process.env.LOCAL_CODER_INSTANCE_ID;
 const oldSandboxProfile = process.env.CLC_SANDBOX_PROFILE_NAME;
 const oldSandboxStateDir = process.env.CLC_SANDBOX_STATE_DIR;
 const oldSandboxNetworkMode = process.env.SANDBOX_NETWORK_MODE;
-// Strict-mode fixture base derives from the repo itself: os.tmpdir() lives
-// under C:\Users, which the sandbox cannot traverse, so git worktrees there
-// fail with "Invalid path 'C:/Users'". C:\AI_Home is covered by the
-// setup:sandbox traverse grant (ancestors of the workspace root).
+// Strict-mode fixtures should live under the configured workspace when one is
+// available. The ServiceHub runtime mirror is nested under restricted ancestor
+// directories that AppContainer must not be required to traverse merely to run
+// this integration fixture.
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const testBase = path.resolve(repoRoot, "..");
+const configuredWorkspace = process.env.WORKSPACE_PATH?.trim();
+const testBase = configuredWorkspace && path.isAbsolute(configuredWorkspace)
+  ? path.resolve(configuredWorkspace)
+  : path.resolve(repoRoot, "..");
 const root = await fs.mkdtemp(path.join(testBase, "clc-git-safety-"));
 const repo = path.join(root, "repo");
 

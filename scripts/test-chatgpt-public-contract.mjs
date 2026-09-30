@@ -82,6 +82,13 @@ try {
   process.env.MCP_SHELL_STATE_DIR = path.join(temp, ".shell-state");
   setDefaultCwd(temp);
   setWorkspaceRoots([temp]);
+  const contractSkillDir = path.join(temp, ".claude", "skills", "contract-fixture");
+  await fs.mkdir(contractSkillDir, { recursive: true });
+  await fs.writeFile(
+    path.join(contractSkillDir, "SKILL.md"),
+    "---\nname: contract-fixture\ndescription: MCP status projection fixture\n---\n\n# Contract Fixture\nBODY_MUST_NOT_BE_NEEDED_FOR_STATUS\n",
+    "utf8"
+  );
   process.env.CHATGPT_TOOL_PROFILE = "slim";
   const { createMcpServer } = await import("../dist/server-factory.js");
 
@@ -127,6 +134,38 @@ try {
   );
   check("mcp_tools errors cleanly without manager", Boolean(toolsRes.isError));
   check("mcp_call errors cleanly without manager", Boolean(callRes.isError));
+  const statusRes = await callTool(noMgr, "agent_status", {});
+  const bootstrapDiscovery = statusRes.structuredContent?.data?.bootstrap_discovery;
+  const repoCatalog = statusRes.structuredContent?.data?.repo_catalog;
+  const projectedFixture = bootstrapDiscovery?.project_skills?.find(
+    (skill) => skill?.name === "contract-fixture"
+  );
+  check(
+    "agent_status projects structured bootstrap discovery metadata",
+    bootstrapDiscovery &&
+      Array.isArray(bootstrapDiscovery.global_skills) &&
+      Array.isArray(bootstrapDiscovery.project_skills) &&
+      typeof bootstrapDiscovery.project_skills_root === "string" &&
+      projectedFixture?.description === "MCP status projection fixture" &&
+      projectedFixture?.scope === "project" &&
+      path.normalize(projectedFixture?.path || "") === path.normalize(path.join(contractSkillDir, "SKILL.md")),
+    JSON.stringify(bootstrapDiscovery)
+  );
+  check(
+    "agent_status projects bounded repository catalog metadata",
+    repoCatalog &&
+      Array.isArray(repoCatalog.roots) &&
+      Array.isArray(repoCatalog.repos) &&
+      Number.isInteger(repoCatalog.repo_count) &&
+      Number.isInteger(repoCatalog.scanned_directories) &&
+      typeof repoCatalog.truncated === "boolean" &&
+      Number.isInteger(repoCatalog.limits?.max_depth) &&
+      Number.isInteger(repoCatalog.limits?.max_directories) &&
+      Number.isInteger(repoCatalog.limits?.max_repos) &&
+      Number.isInteger(repoCatalog.limits?.scan_concurrency) &&
+      /narrowest matching repo path/i.test(repoCatalog.guidance || ""),
+    JSON.stringify(repoCatalog)
+  );
 
   // The public remember tool stays in the frozen ABI, but when the canonical
   // Global Harness bootstrap is active its legacy Local Coder memory write plane

@@ -6,12 +6,15 @@ import path from "node:path";
 
 import {
   appendBoundedTail,
+  atomicWriteSecretFile,
   enqueueKeyedMutation,
   extractSingleZipEntryBoundedWindows,
   fingerprintRuntimeSources,
   isRuntimeArtifactStale,
   inspectRuntimeBuildFreshness,
+  hardenSecretFilePermissions,
   pruneExpiredCache,
+  readResponseLineByPrefixBounded,
   readResponseTextBounded,
   readUtf8FileBounded,
   retryTransientFsMutation,
@@ -19,6 +22,82 @@ import {
 } from "../manager/fs-utils.mjs";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+async function writeStoredZip(zipFile, entries) {
+  const localParts = [];
+  const centralParts = [];
+  let localOffset = 0;
+
+  for (const entry of entries) {
+    const name = Buffer.from(String(entry.name).replaceAll("\\", "/"), "utf8");
+    const data = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data);
+    assert.ok(name.length > 0 && name.length <= 0xffff, "ZIP fixture entry name must fit the classic ZIP header");
+    assert.ok(data.length <= 0xffffffff, "ZIP fixture entry data must fit the classic ZIP header");
+    const checksum = crc32(data);
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(0, 10);
+    local.writeUInt16LE(0x0021, 12);
+    local.writeUInt32LE(checksum, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    localParts.push(local, name, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(0, 12);
+    central.writeUInt16LE(0x0021, 14);
+    central.writeUInt32LE(checksum, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(localOffset, 42);
+    centralParts.push(central, name);
+
+    localOffset += local.length + name.length + data.length;
+  }
+
+  assert.ok(entries.length <= 0xffff, "ZIP fixture must fit the classic ZIP entry-count limit");
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(entries.length, 8);
+  end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(localOffset, 16);
+  end.writeUInt16LE(0, 20);
+
+  await fs.writeFile(zipFile, Buffer.concat([...localParts, centralDirectory, end]));
+}
+
 const managerFsUtilsSource = await fs.readFile(path.resolve("manager", "fs-utils.mjs"), "utf8");
 
 assert.match(
@@ -146,6 +225,61 @@ assert.equal(rollbackEscalations.length, 2, "both streamed-download and atomic c
       /exceeds 5 bytes/
     );
 
+    const secretFile = path.join(dir, "managed-secret.env");
+    await atomicWriteSecretFile(secretFile, "TOKEN=test-placeholder\n", "utf8");
+    assert.equal(await fs.readFile(secretFile, "utf8"), "TOKEN=test-placeholder\n");
+    if (process.platform === "win32") {
+      const acl = spawnSync("icacls.exe", [secretFile], {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 10_000,
+      });
+      assert.equal(acl.status, 0, acl.stderr || acl.stdout);
+      assert.doesNotMatch(acl.stdout, /Everyone/i, "secret authority must not grant Everyone access");
+      assert.doesNotMatch(acl.stdout, /\(I\)/, "secret authority must not retain inherited ACEs");
+      assert.match(acl.stdout, /SYSTEM/i, "secret authority must preserve SYSTEM recovery access");
+      assert.match(acl.stdout, /Administrators/i, "secret authority must preserve Administrators recovery access");
+    } else {
+      const mode = (await fs.stat(secretFile)).mode & 0o777;
+      assert.equal(mode, 0o600, "secret authority must be owner-only on POSIX");
+    }
+
+    const existingSecret = path.join(dir, "legacy-secret.env");
+    await fs.writeFile(existingSecret, "TOKEN=legacy-placeholder\n", "utf8");
+    const beforeSecretBytes = await fs.readFile(existingSecret);
+    await hardenSecretFilePermissions(existingSecret);
+    assert.deepEqual(await fs.readFile(existingSecret), beforeSecretBytes);
+
+    const largeMetricsPrefix = [
+      "# HELP noisy_metric noisy",
+      "# TYPE noisy_metric gauge",
+      `noisy_metric{blob="${"x".repeat(320 * 1024)}"} 1`,
+    ].join("\n");
+    const freshnessLine = 'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1.79073889e+09';
+    const largeMetricsResponse = new Response(
+      `${largeMetricsPrefix}\n${freshnessLine}\ntrailing_metric 1\n`
+    );
+    assert.equal(
+      await readResponseLineByPrefixBounded(
+        largeMetricsResponse,
+        "commands_poll_last_successful_timestamp_seconds",
+        512 * 1024,
+        "test metrics"
+      ),
+      freshnessLine,
+      "streaming metric lookup must find a target after the old 256 KiB whole-body ceiling without buffering the full body"
+    );
+    await assert.rejects(
+      () => readResponseLineByPrefixBounded(
+        new Response(`${"x".repeat(2048)}\ntarget_metric 1\n`),
+        "target_metric",
+        1024,
+        "test metrics"
+      ),
+      /exceeds 1024 bytes/,
+      "streaming lookup must remain byte bounded when the target is too late"
+    );
+
     const download = path.join(dir, "download.bin");
     const bytes = await streamResponseToFileBounded(
       new Response(new TextEncoder().encode("hello"), { headers: { "content-length": "5" } }),
@@ -165,44 +299,18 @@ assert.equal(rollbackEscalations.length, 2, "both streamed-download and atomic c
     assert.equal(await fs.readFile(oversizedDownload, "utf8"), "known-good", "oversized download replaced the prior file");
 
     if (process.platform === "win32") {
-      const zipDirectory = async (sourceDir, zipFile) => {
-        await fs.rm(zipFile, { force: true });
-        const zipped = spawnSync(
-          "powershell.exe",
-          [
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Compress-Archive -Path (Join-Path $env:CLC_ZIP_SRC '*') -DestinationPath $env:CLC_ZIP_FILE -Force",
-          ],
-          {
-            encoding: "utf8",
-            windowsHide: true,
-            timeout: 30000,
-            maxBuffer: 64 * 1024,
-            env: { ...process.env, CLC_ZIP_SRC: sourceDir, CLC_ZIP_FILE: zipFile },
-          }
-        );
-        assert.equal(zipped.status, 0, `fixture ZIP creation failed: ${zipped.stderr || zipped.stdout}`);
-      };
-
-      const zipSrc = path.join(dir, "zip-src");
       const zipFile = path.join(dir, "fixture.zip");
       const extracted = path.join(dir, "extracted.exe");
 
-      await fs.mkdir(path.join(zipSrc, "pkg"), { recursive: true });
-      await fs.writeFile(path.join(zipSrc, "pkg", "tunnel-client.exe"), "fixture-client", "utf8");
-      await zipDirectory(zipSrc, zipFile);
+      await writeStoredZip(zipFile, [{ name: "pkg/tunnel-client.exe", data: "fixture-client" }]);
       const goodZip = extractSingleZipEntryBoundedWindows(zipFile, extracted, "tunnel-client.exe", 1024);
       assert.equal(goodZip.bytes, Buffer.byteLength("fixture-client"));
       assert.equal(await fs.readFile(extracted, "utf8"), "fixture-client");
 
-      await fs.rm(zipSrc, { recursive: true, force: true });
-      await fs.mkdir(path.join(zipSrc, "a"), { recursive: true });
-      await fs.mkdir(path.join(zipSrc, "b"), { recursive: true });
-      await fs.writeFile(path.join(zipSrc, "a", "tunnel-client.exe"), "one", "utf8");
-      await fs.writeFile(path.join(zipSrc, "b", "tunnel-client.exe"), "two", "utf8");
-      await zipDirectory(zipSrc, zipFile);
+      await writeStoredZip(zipFile, [
+        { name: "a/tunnel-client.exe", data: "one" },
+        { name: "b/tunnel-client.exe", data: "two" },
+      ]);
       await fs.writeFile(extracted, "known-good", "utf8");
       assert.throws(
         () => extractSingleZipEntryBoundedWindows(zipFile, extracted, "tunnel-client.exe", 1024),
@@ -210,10 +318,7 @@ assert.equal(rollbackEscalations.length, 2, "both streamed-download and atomic c
       );
       assert.equal(await fs.readFile(extracted, "utf8"), "known-good", "duplicate ZIP replaced the prior output");
 
-      await fs.rm(zipSrc, { recursive: true, force: true });
-      await fs.mkdir(zipSrc, { recursive: true });
-      await fs.writeFile(path.join(zipSrc, "tunnel-client.exe"), "x".repeat(64), "utf8");
-      await zipDirectory(zipSrc, zipFile);
+      await writeStoredZip(zipFile, [{ name: "tunnel-client.exe", data: "x".repeat(64) }]);
       await fs.writeFile(extracted, "known-good", "utf8");
       assert.throws(
         () => extractSingleZipEntryBoundedWindows(zipFile, extracted, "tunnel-client.exe", 16),

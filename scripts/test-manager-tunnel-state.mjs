@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import {
   evaluateOpenAiTunnelLaunchState,
+  evaluateOpenAiTunnelControlPlaneFreshness,
+  evaluateOpenAiTunnelRecoveryCandidate,
   legacyOpenAiTunnelLaunchFingerprintV1,
   legacyPidFileMatchesProcessStart,
   openAiTunnelLaunchFingerprint,
@@ -114,6 +116,120 @@ assert.equal(duplicate.healthDrift, false);
 assert.equal(duplicate.ambiguous, true);
 assert.equal(duplicate.duplicateProcesses, true);
 assert.deepEqual(duplicate.pids, [1234, 5678]);
+
+const freshnessNowMs = 1_790_738_900_000;
+const freshMetrics = [
+  'commands_poll_cycles_total{otel_scope_name="controlplane"} 42',
+  'commands_poll_last_successful_timestamp_seconds{otel_scope_name="controlplane"} 1.79073889e+09',
+].join("\n");
+const freshControlPlane = evaluateOpenAiTunnelControlPlaneFreshness(freshMetrics, {
+  nowMs: freshnessNowMs,
+  staleAfterMs: 36000,
+});
+assert.equal(freshControlPlane.supported, true);
+assert.equal(freshControlPlane.fresh, true);
+assert.equal(freshControlPlane.ageMs, 10000);
+assert.equal(freshControlPlane.lastSuccessfulAt, "2026-09-30T03:28:10.000Z");
+
+const staleControlPlane = evaluateOpenAiTunnelControlPlaneFreshness(
+  'commands_poll_last_successful_timestamp_seconds 1.7907388e+09',
+  { nowMs: freshnessNowMs, staleAfterMs: 36000 }
+);
+assert.equal(staleControlPlane.supported, true);
+assert.equal(staleControlPlane.fresh, false);
+assert.equal(staleControlPlane.ageMs, 100000);
+assert.equal(staleControlPlane.reason, "stale");
+
+const missingControlPlane = evaluateOpenAiTunnelControlPlaneFreshness(
+  'commands_poll_cycles_total 42',
+  { nowMs: freshnessNowMs, staleAfterMs: 36000 }
+);
+assert.equal(missingControlPlane.supported, false, "older tunnel-client metrics without freshness gauge must remain compatibility-unknown");
+assert.equal(missingControlPlane.fresh, null);
+assert.equal(missingControlPlane.reason, "metric-missing");
+
+const malformedControlPlane = evaluateOpenAiTunnelControlPlaneFreshness(
+  'commands_poll_last_successful_timestamp_seconds not-a-number',
+  { nowMs: freshnessNowMs, staleAfterMs: 36000 }
+);
+assert.equal(malformedControlPlane.supported, true);
+assert.equal(malformedControlPlane.fresh, false, "present-but-malformed freshness evidence must fail closed");
+assert.equal(malformedControlPlane.reason, "metric-invalid");
+
+const toleratedFutureSkew = evaluateOpenAiTunnelControlPlaneFreshness(
+  `commands_poll_last_successful_timestamp_seconds ${(freshnessNowMs + 3000) / 1000}`,
+  { nowMs: freshnessNowMs, staleAfterMs: 36000 }
+);
+assert.equal(toleratedFutureSkew.supported, true);
+assert.equal(toleratedFutureSkew.fresh, true, "small same-host clock skew must not flap freshness");
+assert.equal(toleratedFutureSkew.ageMs, 0);
+
+const invalidFutureControlPlane = evaluateOpenAiTunnelControlPlaneFreshness(
+  `commands_poll_last_successful_timestamp_seconds ${(freshnessNowMs + 60000) / 1000}`,
+  { nowMs: freshnessNowMs, staleAfterMs: 36000 }
+);
+assert.equal(invalidFutureControlPlane.supported, true);
+assert.equal(invalidFutureControlPlane.fresh, false, "far-future timestamps must not be clamped to fresh age=0");
+assert.equal(invalidFutureControlPlane.ageMs, null);
+assert.equal(invalidFutureControlPlane.reason, "metric-future");
+
+const recoverableTunnel = {
+  running: true,
+  owned: true,
+  kind: "openai",
+  configDrift: false,
+  healthDrift: true,
+  ambiguous: false,
+  duplicateProcesses: false,
+  launchPidMatch: true,
+  launchProcessStartedAtMatch: true,
+  launchFingerprintMatch: true,
+  runtimePathMatches: true,
+  localHealthy: true,
+  controlPlaneFreshnessSupported: true,
+  controlPlaneFresh: false,
+  controlPlaneFreshnessReason: "stale",
+};
+assert.deepEqual(
+  evaluateOpenAiTunnelRecoveryCandidate(recoverableTunnel),
+  { recover: true, reason: "control-plane-stale" }
+);
+assert.equal(
+  evaluateOpenAiTunnelRecoveryCandidate({ ...recoverableTunnel, owned: false }).recover,
+  false,
+  "unowned transport must never be auto-restarted"
+);
+assert.equal(
+  evaluateOpenAiTunnelRecoveryCandidate({ ...recoverableTunnel, ambiguous: true }).recover,
+  false,
+  "ambiguous transport must never be auto-restarted"
+);
+assert.deepEqual(
+  evaluateOpenAiTunnelRecoveryCandidate({
+    ...recoverableTunnel,
+    controlPlaneFreshnessSupported: false,
+    controlPlaneFresh: null,
+    controlPlaneFreshnessReason: "metric-missing",
+  }),
+  { recover: false, reason: "freshness-unsupported" },
+  "unknown/legacy freshness evidence must preserve the serving tunnel"
+);
+assert.deepEqual(
+  evaluateOpenAiTunnelRecoveryCandidate({
+    ...recoverableTunnel,
+    controlPlaneFreshnessReason: "metric-invalid",
+  }),
+  { recover: false, reason: "freshness-not-stale" },
+  "malformed telemetry must not authorize automatic disruption"
+);
+assert.deepEqual(
+  evaluateOpenAiTunnelRecoveryCandidate({
+    ...recoverableTunnel,
+    controlPlaneFreshnessReason: "metric-future",
+  }),
+  { recover: false, reason: "freshness-not-stale" },
+  "future-skewed telemetry must fail closed without authorizing an automatic restart"
+);
 
 const processStartedAtMs = Date.parse(processStartedAt);
 assert.equal(legacyPidFileMatchesProcessStart({

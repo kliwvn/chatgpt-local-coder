@@ -30,6 +30,7 @@ import {
 } from "./lib/instruction-context.js";
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
 import { envIntegerOrThrow } from "./lib/env-utils.js";
+import { redactSensitiveText } from "./lib/redaction.js";
 import { getManagedProcessStats, shutdownManagedProcesses } from "./tools/shell.js";
 import { ensureShellBootstrap, flushShellPersistence } from "./lib/persistent-shell.js";
 import {
@@ -644,6 +645,20 @@ server.on("error", (err: NodeJS.ErrnoException) => {
 });
 
 let shutdownStarted = false;
+
+// Preserve a self-originated fatal signature in server.log without changing
+// the default uncaught-exception behavior. If the process later disappears
+// without this marker and without [DUNG], Manager can classify it as an external
+// hard termination rather than a normal/self-reported lifecycle exit.
+process.on("uncaughtExceptionMonitor", (err, origin) => {
+  const name = err instanceof Error ? err.name : "UnknownError";
+  const message = redactSensitiveText(err instanceof Error ? err.message : String(err)).slice(0, 800);
+  console.error("[FATAL] uncaughtException origin=" + origin + " name=" + name + " message=" + message);
+});
+
+process.on("exit", (code) => {
+  console.error("[EXIT] pid=" + process.pid + " code=" + code + " graceful=" + shutdownStarted);
+});
 
 function closeHttpServerBounded(target: HttpServer, forceAfterMs = 2000, settleAfterMs = 4000): Promise<void> {
   return new Promise((resolve) => {
