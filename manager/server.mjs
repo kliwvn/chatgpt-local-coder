@@ -1862,11 +1862,13 @@ function processIdentityScanKey(imageName) {
 }
 
 function processIdentityPowerShellArgs(imageName) {
-  const processName = String(imageName || "").replace(/\.exe$/i, "").replace(/'/g, "''");
+  const processImage = String(imageName || "").trim().replace(/^.*[\\/]/, "");
+  const normalizedImage = /\.exe$/i.test(processImage) ? processImage : `${processImage}.exe`;
+  const escapedImage = normalizedImage.replace(/'/g, "''");
   return [
     "-NoProfile",
     "-Command",
-    `$ErrorActionPreference='Stop'; $candidates=@(Get-Process -Name '${processName}' -ErrorAction SilentlyContinue); if ($candidates.Count -eq 0) { exit 0 }; $candidates | ForEach-Object { $processId=[int]$_.Id; $p=Get-CimInstance Win32_Process -Filter ("ProcessId=" + $processId) -ErrorAction Stop; if ($null -ne $p) { $exe=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.ExecutablePath)); $cmd=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine)); [string]$p.ProcessId + '|' + $p.CreationDate.ToUniversalTime().ToString('o') + '|' + $exe + '|' + $cmd } }`,
+    `$ErrorActionPreference='Stop'; $candidates=@(Get-CimInstance Win32_Process -Filter "Name='${escapedImage}'" -ErrorAction Stop); if ($candidates.Count -eq 0) { exit 0 }; $candidates | ForEach-Object { $p=$_; $exe=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.ExecutablePath)); $cmd=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$p.CommandLine)); [string]$p.ProcessId + '|' + $p.CreationDate.ToUniversalTime().ToString('o') + '|' + $exe + '|' + $cmd }`,
   ];
 }
 

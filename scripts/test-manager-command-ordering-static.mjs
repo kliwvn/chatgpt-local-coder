@@ -32,6 +32,17 @@ for (const intent of [
   assert.ok(source.includes(`beginInstanceIntent(name, "${intent}")`), `missing intent barrier: ${intent}`);
 }
 
+const imageIdentityScan = section("function processIdentityPowerShellArgs(imageName)", "function parseProcessIdentityScanOutput");
+assert.ok(imageIdentityScan.includes(`Get-CimInstance Win32_Process -Filter "Name='\${escapedImage}'"`),
+  "image process identity discovery must use one filtered CIM snapshot");
+assert.doesNotMatch(imageIdentityScan, /Get-Process -Name/,
+  "image process identity discovery must not enumerate Get-Process before CIM");
+assert.doesNotMatch(imageIdentityScan, /ProcessId=.*processId/,
+  "image process identity discovery must not issue one CIM query per candidate PID");
+const exactPidIdentityScan = section("function exactProcessIdentityPowerShellArgs(pid)", "async function exactProcessIdentityAsync");
+assert.ok(exactPidIdentityScan.includes(`Get-CimInstance Win32_Process -Filter "ProcessId=\${processId}"`),
+  "destructive authority must retain a separate exact-PID CIM query");
+
 const serverCommand = section("function enqueueServerCommand(name, operation)", "function enqueueServerLifecycle");
 assert.match(serverCommand, /enqueueInstanceCommand\(name, operation\)/,
   "Gateway public commands must participate in the shared instance queue");
